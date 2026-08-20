@@ -207,12 +207,21 @@ class Signal:
 
 @dataclass(frozen=True)
 class UniverseEntry:
-    """ユニバースに含まれる銘柄と、その日のスコア。"""
+    """ユニバースに含まれる銘柄と、その日のスコア。
+
+    ``gap_pct`` と ``premarket_volume_ratio`` は寄り前気配が必要なため
+    Stage A（口座なし）では ``None`` になる（docs/09-data-sources.md §5）。
+    """
 
     symbol: Symbol
     trade_date: date
     price_tier: PriceTier
     score: float
     atr_pct: float
-    gap_pct: float
-    premarket_volume_ratio: float
+    prev_volume_ratio: float
+    prev_range_pct: float
+    prev_close_position: float
+    gap_pct: float | None = None
+    """寄り前ギャップ率。Stage B のみ"""
+    premarket_volume_ratio: float | None = None
+    """寄り前出来高比。Stage B のみ"""

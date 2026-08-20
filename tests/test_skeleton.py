@@ -78,3 +78,20 @@ def test_Strategyは抽象クラス() -> None:
 
 def test_Strategyが必要なメソッドを定義している() -> None:
     assert {"generate", "should_close"} <= Strategy.__abstractmethods__
+
+
+def test_StageAのモジュールがimportできる() -> None:
+    """口座なしで動かす経路のモジュールが揃っていること。"""
+    for name in ["autotrader.data.yahoo", "autotrader.broker.replay"]:
+        __import__(name)
+
+
+def test_yfinanceの期間制限が定義されている() -> None:
+    """取得可能期間を超える指定を黙って切り詰めると、欠損に気づけない。
+
+    制限値を定数として持ち、超過をエラーにできるようにしておく。
+    """
+    from autotrader.data.yahoo import MAX_LOOKBACK_DAYS
+
+    assert MAX_LOOKBACK_DAYS["1m"] == 7
+    assert MAX_LOOKBACK_DAYS["5m"] == 60

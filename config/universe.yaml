@@ -35,8 +35,15 @@ layer1:
     premium_max: 3000  # ここまでがプレミアム枠。超過は除外(資金の60%超で分散不能)
 
   # D. 信用区分: ショートを使うため売建可能であることが必須
+  #
+  # 【Stage A の制約】一般信用(デイトレ)の売建可能銘柄リストは
+  # 証券会社のログインが必要で、口座なしでは取得できない。
+  # Stage A では流動性上位であることで代理し、Stage B で実データに差し替える。
+  # 代理である以上、Stage A のショート成績は実際には売建できない銘柄を
+  # 含みうる。Stage B での差し替え後に成績が落ちうることを織り込んでおく。
   margin:
-    require_daytrade_shortable: true   # 一般信用(デイトレ)売建可能銘柄のみ
+    require_daytrade_shortable: true   # Stage B で有効
+    stage_a_proxy: "liquidity_top"     # Stage A の代理: 流動性上位で近似
 
   # E. 空売り価格規制がかかっている銘柄を除外
   exclude_short_sale_restricted: true
@@ -57,19 +64,35 @@ layer1:
 # Layer 2: 日次銘柄選定 (寄り前 8:00-8:55)
 # ------------------------------------------------------------
 layer2:
-  # WebSocket のリアルタイム配信上限が50銘柄。これが枠を規定する。
+  # 上限50は Stage B の WebSocket 配信制限に由来する。
+  # Stage A(ヒストリカル検証)に技術的制約はないが、同じ50に揃える。
+  # 銘柄数を変えると成績が変わり、Stage A の検証結果を Stage B に引き継げなくなる。
   max_watchlist: 50
 
-  # ATR% が往復コスト(スリッページ0.1〜0.2%)の5倍以上ないとコスト負けする
+  # ATR% が往復コスト(スリッページ)の5倍以上ないとコスト負けする
   min_atr_pct: 0.02        # 14日ATR ÷ 株価 が 2% 以上
-
-  # スコア指標の重み（順位を正規化して加重合計）
-  score_weights:
-    atr_pct: 0.5           # 日中値幅の期待値
-    gap_pct: 0.3           # 寄り前気配 vs 前日終値
-    premarket_volume: 0.2  # 寄り前の板の厚み ÷ 20日平均出来高
-
   atr_period: 14
+
+  # --- Stage A: 前日引け時点の情報のみ (口座なしで計算できる) ---
+  # 寄り前気配は kabuステーションAPI が必要なため Stage A では使えない。
+  stage_a_weights:
+    atr_pct: 0.40             # 日中値幅の期待値
+    prev_volume_ratio: 0.25   # 前日出来高 ÷ 20日平均
+    prev_range_pct: 0.20      # (前日高値 - 前日安値) ÷ 前日終値
+    prev_close_position: 0.15 # (終値 - 安値) ÷ (高値 - 安値)
+
+  # --- Stage B: 寄り前気配を追加 (口座が必要) ---
+  # 【重要】Stage B で指標を追加するとき、stage_a_weights をそのまま流用しない。
+  #         指標が変われば最適な重みも変わる。ウォークフォワード検証をやり直すこと。
+  #         そもそも寄り前気配が予測力を持つかを、あり/なしの比較で先に検証する。
+  stage_b_enabled: false
+  stage_b_weights:
+    atr_pct: 0.30
+    prev_volume_ratio: 0.15
+    prev_range_pct: 0.15
+    prev_close_position: 0.10
+    gap_pct: 0.20                # 寄り前気配 vs 前日終値
+    premarket_volume_ratio: 0.10 # 寄り前の板の厚み ÷ 20日平均出来高
 
   # プレミアム枠(2,000〜3,000円)の採用条件
   # 1単元が資金の40〜60%を占め、同時保有数が減り、リスク管理の粒度も粗くなる。
@@ -77,7 +100,7 @@ layer2:
   premium_tier:
     enabled: true
     # 通常枠で採用された銘柄のスコア中央値に対する倍率のハードル
-    # 【暫定値】Phase 4 で「プレミアム枠あり/なし」の成績を比較して検証・調整する。
+    # 【暫定値】Phase 3 で「プレミアム枠あり/なし」の成績を比較して検証・調整する。
     #          寄与しないことが分かったら enabled: false にする。
     score_multiplier: 1.3
     max_concurrent: 1      # 同時採用は1銘柄まで（集中リスクの上限）

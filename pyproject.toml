@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.6",        # 設定とAPIレスポンスのバリデーション
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
+    "yfinance>=0.2.40",    # Stage A の分足入手経路（口座不要）
 ]
 
 [project.optional-dependencies]

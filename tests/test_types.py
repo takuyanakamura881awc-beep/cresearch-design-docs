@@ -122,3 +122,46 @@ class TestQuoteSpread:
             ask_size=100,
         )
         assert quote.spread == 2.0
+
+
+class TestUniverseEntryStage:
+    def test_StageAでは寄り前気配がNoneでよい(self) -> None:
+        """口座なしの Stage A では寄り前気配が取れない。
+
+        必須にすると Stage A で UniverseEntry を作れなくなる。
+        """
+        from datetime import date
+
+        from autotrader.types import PriceTier, Symbol, UniverseEntry
+
+        entry = UniverseEntry(
+            symbol=Symbol(code="7203", name="トヨタ"),
+            trade_date=date(2026, 8, 20),
+            price_tier=PriceTier.NORMAL,
+            score=0.8,
+            atr_pct=0.025,
+            prev_volume_ratio=1.4,
+            prev_range_pct=0.03,
+            prev_close_position=0.7,
+        )
+        assert entry.gap_pct is None
+        assert entry.premarket_volume_ratio is None
+
+    def test_StageBでは寄り前気配を持てる(self) -> None:
+        from datetime import date
+
+        from autotrader.types import PriceTier, Symbol, UniverseEntry
+
+        entry = UniverseEntry(
+            symbol=Symbol(code="7203", name="トヨタ"),
+            trade_date=date(2026, 8, 20),
+            price_tier=PriceTier.NORMAL,
+            score=0.8,
+            atr_pct=0.025,
+            prev_volume_ratio=1.4,
+            prev_range_pct=0.03,
+            prev_close_position=0.7,
+            gap_pct=0.012,
+            premarket_volume_ratio=2.1,
+        )
+        assert entry.gap_pct == 0.012
