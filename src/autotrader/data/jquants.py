@@ -11,10 +11,26 @@
 まず Free で始め、``scripts/verify_data_sources.py`` で yfinance との
 乖離を実測してから有料化を判断する。推測で課金しない。
 
-【認証】
+【V2 仕様（V1 は 2026年6月1日に終了済み）】
 
-V2 は API キー方式（V1 のリフレッシュトークン方式は廃止済み）。
+============  ==============================  ==============================
+項目          V1（廃止）                      V2（現行）
+============  ==============================  ==============================
+銘柄一覧      ``/listed/info``                ``/equities/master``
+日足          ``/prices/daily_quotes``        ``/equities/bars/daily``
+レスポンス    ``{"daily_quotes": [...]}``     ``{"data": [...]}``
+項目名        ``Open`` ``AdjustmentClose``    短縮形 ``O`` ``AdjC`` など
+============  ==============================  ==============================
+
+認証は API キー方式（``x-api-key`` ヘッダ）。V1 のリフレッシュトークン方式は廃止。
 キーは ``.env`` の ``JQUANTS_API_KEY`` から読む。コードに書かない。
+
+【項目名は候補リストで解決する】
+
+V2 の短縮形の正確な綴りは、公開情報からの推定を含む。
+そのため ``_pick`` で**候補キーを順に試す**方式にしてある。
+実際の項目名は ``scripts/verify_data_sources.py`` が実データから出力するので、
+確定したら ``_FIELD_CANDIDATES`` を整理する。
 
 【本モジュールが担う代替不可能な役割】
 
@@ -40,6 +56,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.jquants.com/v2"
 
+ENDPOINT_MASTER = "equities/master"
+"""上場銘柄一覧（V1 の ``listed/info``）。"""
+
+ENDPOINT_DAILY_BARS = "equities/bars/daily"
+"""日足四本値（V1 の ``prices/daily_quotes``）。"""
+
+RESPONSE_DATA_KEYS = ("data", "daily_quotes", "info")
+"""レスポンスの配列を包むキーの候補。V2 は ``data``。
+
+V1 形式が返ってきても動くよう、旧キーも候補に残す。
+"""
+
 FREE_PLAN_REQUESTS_PER_MINUTE = 5
 """Free プランのレート制限。Light は 60。"""
 
@@ -49,6 +77,38 @@ FREE_PLAN_DELAY_DAYS = 84
 **この遅延により、Free の日足は yfinance の5分足（直近60日）と期間が重ならない。**
 直近84日の日足は yfinance で補完する必要がある（docs/09-data-sources.md）。
 """
+
+_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "code": ("Code", "code"),
+    "date": ("Date", "date"),
+    # 調整済みの値を優先する。未調整だと分割の前後で価格が不連続になり、
+    # ATR% や売買代金の計算が壊れて架空の急騰を誤検出する。
+    "open": ("AdjO", "AdjustmentOpen", "O", "Open", "open"),
+    "high": ("AdjH", "AdjustmentHigh", "H", "High", "high"),
+    "low": ("AdjL", "AdjustmentLow", "L", "Low", "low"),
+    "close": ("AdjC", "AdjustmentClose", "C", "Close", "close"),
+    "volume": ("AdjVo", "AdjustmentVolume", "Vo", "Volume", "volume"),
+    "name": ("CompanyName", "Name", "name"),
+}
+"""レスポンス項目名の候補。左から順に試し、最初に見つかった値を使う。
+
+V2 の短縮形（``AdjC`` 等）を優先し、V1 形式と小文字形も候補に含める。
+非公式APIの財務データで有効だったパターンと同じ考え方
+（銘柄によって項目名が違っても壊れない）。
+"""
+
+
+def _pick(record: dict[str, Any], field: str) -> Any:
+    """レコードから項目を取り出す。候補キーを順に試す。
+
+    Returns:
+        最初に見つかった非 ``None`` の値。どれも無ければ ``None``。
+    """
+    for key in _FIELD_CANDIDATES[field]:
+        value = record.get(key)
+        if value is not None:
+            return value
+    return None
 
 
 class RateLimiter:
@@ -83,7 +143,7 @@ class RateLimiter:
 
 
 class JQuantsDataSource(BarDataSource):
-    """J-Quants API クライアント。"""
+    """J-Quants API（V2）クライアント。"""
 
     def __init__(
         self,
@@ -111,6 +171,14 @@ class JQuantsDataSource(BarDataSource):
     # HTTP
     # ------------------------------------------------------------------
 
+    def get_raw(self, path: str, params: dict[str, str]) -> dict[str, Any]:
+        """生のレスポンスを返す。
+
+        検証スクリプトが**実際の項目名を確認する**ために使う公開経路。
+        推測でコードを書かず、実データで確かめるための入口。
+        """
+        return self._get(path, params)
+
     def _get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         import httpx
 
@@ -124,27 +192,47 @@ class JQuantsDataSource(BarDataSource):
                 timeout=self._timeout,
             )
         except Exception as exc:  # noqa: BLE001
-            raise DataSourceError(f"J-Quants への接続に失敗した: {exc}") from exc
+            raise DataSourceError(f"J-Quants への接続に失敗した ({url}): {exc}") from exc
 
         if response.status_code == 401:
             raise DataSourceError(
-                "J-Quants の認証に失敗した（401）。APIキーを確認すること。"
+                f"J-Quants の認証に失敗した（401 / {url}）。APIキーを確認すること。"
                 "ユーザー登録だけでは使えず、Freeプランへの登録が別途必要"
+            )
+        if response.status_code == 403:
+            raise DataSourceError(
+                f"J-Quants にアクセス権がない（403 / {url}）。"
+                "プランで利用できないエンドポイントの可能性"
+            )
+        if response.status_code == 404:
+            raise DataSourceError(
+                f"J-Quants のエンドポイントが見つからない（404 / {url}）。"
+                "V2 でパスが変更されている可能性（V1 は2026年6月1日に終了）"
             )
         if response.status_code == 429:
             raise DataSourceError(
-                "J-Quants のレート制限に達した（429）。"
+                f"J-Quants のレート制限に達した（429 / {url}）。"
                 "requests_per_minute の設定を確認すること"
             )
         if response.status_code >= 400:
             raise DataSourceError(
-                f"J-Quants が {response.status_code} を返した: {response.text[:200]}"
+                f"J-Quants が {response.status_code} を返した（{url}）: "
+                f"{response.text[:300]}"
             )
 
         data: dict[str, Any] = response.json()
         return data
 
-    def _get_paginated(self, path: str, params: dict[str, str], key: str) -> list[Any]:
+    @staticmethod
+    def _extract(payload: dict[str, Any]) -> list[Any]:
+        """レスポンスから配列を取り出す。包むキーは V2 で ``data`` に変わった。"""
+        for key in RESPONSE_DATA_KEYS:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+
+    def _get_paginated(self, path: str, params: dict[str, str]) -> list[Any]:
         """``pagination_key`` を辿って全件を取得する。
 
         1営業日分の全銘柄（約4,000件）は複数ページに分かれる。
@@ -155,7 +243,7 @@ class JQuantsDataSource(BarDataSource):
 
         while True:
             payload = self._get(path, page_params)
-            items.extend(payload.get(key, []))
+            items.extend(self._extract(payload))
             pages += 1
 
             next_key = payload.get("pagination_key")
@@ -176,9 +264,7 @@ class JQuantsDataSource(BarDataSource):
         **``as_of`` を必ず渡す。** 現在の一覧を過去に適用してはならない
         （サバイバーシップバイアス。docs/03-universe.md §4.2）。
         """
-        items = self._get_paginated(
-            "listed/info", {"date": as_of.isoformat()}, "info"
-        )
+        items = self._get_paginated(ENDPOINT_MASTER, {"date": as_of.isoformat()})
         if not items:
             raise EmptyResponseError(
                 f"J-Quants が {as_of} の銘柄一覧について空の応答を返した。"
@@ -187,18 +273,11 @@ class JQuantsDataSource(BarDataSource):
 
         symbols: list[Symbol] = []
         for item in items:
-            code = str(item.get("Code", "")).strip()
+            code = _normalize_code(_pick(item, "code"))
             if not code:
                 continue
-            # J-Quants の Code は5桁（末尾0）で返ることがある
-            if len(code) == 5 and code.endswith("0"):
-                code = code[:4]
             symbols.append(
-                Symbol(
-                    code=code,
-                    name=str(item.get("CompanyName", "")),
-                    lot_size=100,
-                )
+                Symbol(code=code, name=str(_pick(item, "name") or ""), lot_size=100)
             )
         return tuple(symbols)
 
@@ -225,9 +304,8 @@ class JQuantsDataSource(BarDataSource):
             )
 
         items = self._get_paginated(
-            "prices/daily_quotes",
+            ENDPOINT_DAILY_BARS,
             {"code": symbol, "from": start.isoformat(), "to": end.isoformat()},
-            "daily_quotes",
         )
         if not items:
             raise EmptyResponseError(
@@ -237,7 +315,9 @@ class JQuantsDataSource(BarDataSource):
         bars = [b for b in (_to_bar(i) for i in items) if b is not None]
         if not bars:
             raise EmptyResponseError(
-                f"J-Quants の {symbol} の応答に有効なバーが含まれていない"
+                f"J-Quants の {symbol} の応答に有効なバーが含まれていない。"
+                f"項目名が想定と違う可能性がある（先頭レコードのキー: "
+                f"{sorted(items[0].keys()) if isinstance(items[0], dict) else '不明'}）"
             )
         return tuple(sorted(bars, key=lambda b: b.timestamp))
 
@@ -253,7 +333,7 @@ class JQuantsDataSource(BarDataSource):
             銘柄コード → その日のバー（1本）。
         """
         items = self._get_paginated(
-            "prices/daily_quotes", {"date": trade_date.isoformat()}, "daily_quotes"
+            ENDPOINT_DAILY_BARS, {"date": trade_date.isoformat()}
         )
         if not items:
             raise EmptyResponseError(
@@ -266,36 +346,45 @@ class JQuantsDataSource(BarDataSource):
             bar = _to_bar(item)
             if bar is not None:
                 out[bar.symbol] = (bar,)
+
+        if not out:
+            raise EmptyResponseError(
+                f"J-Quants の {trade_date} の応答に有効なバーが含まれていない。"
+                f"項目名が想定と違う可能性がある（先頭レコードのキー: "
+                f"{sorted(items[0].keys()) if isinstance(items[0], dict) else '不明'}）"
+            )
         return out
 
 
-def _to_bar(item: dict[str, Any]) -> Bar | None:
+def _normalize_code(raw: Any) -> str:
+    """銘柄コードを4桁に正規化する。
+
+    J-Quants は5桁（末尾0）で返すことがある（``72030`` → ``7203``）。
+    """
+    code = str(raw or "").strip()
+    if len(code) == 5 and code.endswith("0"):
+        return code[:4]
+    return code
+
+
+def _to_bar(item: Any) -> Bar | None:
     """J-Quants の1レコードを ``Bar`` に変換する。欠損なら ``None``。
 
-    調整済みの値（``AdjustmentOpen`` など）を優先する。
-    未調整の値を使うと、分割の前後で価格が不連続になる。
+    項目名は ``_FIELD_CANDIDATES`` の候補を順に試す（V2 の短縮形・V1 形式の両対応）。
     """
-    code = str(item.get("Code", "")).strip()
-    if len(code) == 5 and code.endswith("0"):
-        code = code[:4]
+    if not isinstance(item, dict):
+        return None
 
-    raw_date = item.get("Date")
+    code = _normalize_code(_pick(item, "code"))
+    raw_date = _pick(item, "date")
     if not code or not raw_date:
         return None
 
-    def pick(adjusted: str, plain: str) -> Any:
-        value = item.get(adjusted)
-        return value if value is not None else item.get(plain)
-
-    o = pick("AdjustmentOpen", "Open")
-    h = pick("AdjustmentHigh", "High")
-    low = pick("AdjustmentLow", "Low")
-    c = pick("AdjustmentClose", "Close")
-    v = pick("AdjustmentVolume", "Volume")
-
-    if any(x is None for x in (o, h, low, c, v)):
+    values = [_pick(item, f) for f in ("open", "high", "low", "close", "volume")]
+    if any(v is None for v in values):
         return None
 
+    o, h, low, c, v = values
     try:
         return Bar(
             symbol=code,

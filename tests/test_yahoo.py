@@ -195,6 +195,91 @@ class TestTzCache:
         assert "py-yfinance-" in fake_yf.tz_cache_location
 
 
+def _multiindex_frame(
+    tickers: tuple[str, ...], rows: int = 3, ticker_level: int = 0
+) -> pd.DataFrame:
+    """yfinance が返す MultiIndex 列の DataFrame。
+
+    Args:
+        ticker_level: ティッカーを置く階層。0 なら (ticker, field)、1 なら (field, ticker)。
+            ``group_by`` の指定や yfinance のバージョンで順序が変わるため両方を再現する。
+    """
+    data: dict[tuple[str, str], list[float]] = {}
+    for t in tickers:
+        for field, base in (
+            ("Open", 100.0),
+            ("High", 101.0),
+            ("Low", 99.0),
+            ("Close", 100.5),
+            ("Volume", 1000.0),
+        ):
+            key = (t, field) if ticker_level == 0 else (field, t)
+            data[key] = [base + i for i in range(rows)]
+
+    index = pd.to_datetime([datetime(2026, 6, 1, 9 + i) for i in range(rows)])
+    return pd.DataFrame(data, index=index)
+
+
+class TestSingleTickerMultiIndex:
+    """**単一銘柄でも MultiIndex が返る**ケースの回帰テスト。
+
+    Phase 1 の実測で、1銘柄の取得だけが全滅する不具合を踏んだ。
+    原因は `_parse` が銘柄数で分岐し、単一時にフラットな列を前提していたこと。
+    yfinance は単一ティッカーでも MultiIndex を返すのが既定に変わっている。
+
+    それまでのテストが3銘柄のケースしか見ていなかったため素通りした。
+    """
+
+    def test_単一銘柄でMultiIndexが返っても解釈できる(
+        self, fake_yf: _FakeYFinance
+    ) -> None:
+        fake_yf.frame = _multiindex_frame(("7203.T",))
+        source = YahooDataSource()
+        result = source.get_bars_batch(
+            ("7203",), "1d", date(2026, 6, 1), date(2026, 6, 10)
+        )
+        assert len(result["7203"]) == 3
+        assert result["7203"][0].close == 100.5
+
+    def test_ティッカーが第2階層にあっても解釈できる(
+        self, fake_yf: _FakeYFinance
+    ) -> None:
+        """group_by の指定やバージョンで (field, ticker) の順になる場合。"""
+        fake_yf.frame = _multiindex_frame(("7203.T",), ticker_level=1)
+        source = YahooDataSource()
+        result = source.get_bars_batch(
+            ("7203",), "1d", date(2026, 6, 1), date(2026, 6, 10)
+        )
+        assert len(result["7203"]) == 3
+
+    def test_複数銘柄のMultiIndexも解釈できる(self, fake_yf: _FakeYFinance) -> None:
+        fake_yf.frame = _multiindex_frame(("7203.T", "8306.T"))
+        source = YahooDataSource()
+        result = source.get_bars_batch(
+            ("7203", "8306"), "1d", date(2026, 6, 1), date(2026, 6, 10)
+        )
+        assert set(result) == {"7203", "8306"}
+
+    def test_単一銘柄取得の経路でも空にならない(self, fake_yf: _FakeYFinance) -> None:
+        """get_bars（単一銘柄用）が EmptyResponseError を誤って投げないこと。"""
+        fake_yf.frame = _multiindex_frame(("7203.T",))
+        bars = YahooDataSource().get_bars(
+            "7203", "1d", date(2026, 6, 1), date(2026, 6, 10)
+        )
+        assert len(bars) == 3
+
+    def test_含まれない銘柄は取得できない扱いになる(
+        self, fake_yf: _FakeYFinance
+    ) -> None:
+        fake_yf.frame = _multiindex_frame(("7203.T",))
+        source = YahooDataSource()
+        result = source.get_bars_batch(
+            ("7203", "9999"), "1d", date(2026, 6, 1), date(2026, 6, 10)
+        )
+        assert "7203" in result
+        assert "9999" not in result
+
+
 class TestInterval:
     def test_対応する足を正しく判定する(self) -> None:
         source = YahooDataSource()

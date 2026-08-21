@@ -12,6 +12,8 @@ import pytest
 
 from autotrader.data.base import DataSourceError, EmptyResponseError
 from autotrader.data.jquants import (
+    ENDPOINT_DAILY_BARS,
+    ENDPOINT_MASTER,
     FREE_PLAN_DELAY_DAYS,
     JQuantsDataSource,
     RateLimiter,
@@ -45,6 +47,20 @@ class _FakeHttpx(SimpleNamespace):
 
 
 def _quote(code: str, day: str, close: float = 100.0) -> dict[str, Any]:
+    """V2 形式のレコード（短縮された項目名）。"""
+    return {
+        "Code": code,
+        "Date": day,
+        "AdjO": close - 1,
+        "AdjH": close + 1,
+        "AdjL": close - 2,
+        "AdjC": close,
+        "AdjVo": 10000,
+    }
+
+
+def _v1_quote(code: str, day: str, close: float = 100.0) -> dict[str, Any]:
+    """V1 形式のレコード。候補キー方式が旧形式でも動くことの確認用。"""
     return {
         "Code": code,
         "Date": day,
@@ -106,11 +122,11 @@ class TestPagination:
             [
                 _Response(
                     {
-                        "daily_quotes": [_quote("7203", "2026-06-01")],
+                        "data": [_quote("7203", "2026-06-01")],
                         "pagination_key": "p2",
                     }
                 ),
-                _Response({"daily_quotes": [_quote("8306", "2026-06-01")]}),
+                _Response({"data": [_quote("8306", "2026-06-01")]}),
             ],
         )
         source = JQuantsDataSource("key")
@@ -120,11 +136,37 @@ class TestPagination:
         assert len(fake.calls) == 2
         assert fake.calls[1]["params"]["pagination_key"] == "p2"
 
+    def test_V2のエンドポイントを叩く(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """V1 のパス(prices/daily_quotes)は2026年6月1日に終了済み。
+
+        実測で J-Quants が何も返さなかった原因がこれだった。
+        """
+        fake = _install(
+            monkeypatch,
+            [_Response({"data": [_quote("7203", "2026-06-01")]})],
+        )
+        JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+
+        assert fake.calls[0]["url"].endswith(ENDPOINT_DAILY_BARS)
+        assert "prices/daily_quotes" not in fake.calls[0]["url"]
+
+    def test_銘柄一覧もV2のエンドポイントを叩く(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = _install(
+            monkeypatch,
+            [_Response({"data": [{"Code": "7203", "CompanyName": "トヨタ"}]})],
+        )
+        JQuantsDataSource("key").list_symbols(date(2026, 6, 1))
+
+        assert fake.calls[0]["url"].endswith(ENDPOINT_MASTER)
+        assert "listed/info" not in fake.calls[0]["url"]
+
     def test_日付指定で全銘柄を取る(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """code= の銘柄ループより約4倍少ないリクエストで済む経路。"""
         fake = _install(
             monkeypatch,
-            [_Response({"daily_quotes": [_quote("7203", "2026-06-01")]})],
+            [_Response({"data": [_quote("7203", "2026-06-01")]})],
         )
         source = JQuantsDataSource("key")
         source.get_bars_for_date(date(2026, 6, 1))
@@ -137,7 +179,7 @@ class TestAuth:
     def test_APIキーをヘッダに載せる(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _install(
             monkeypatch,
-            [_Response({"daily_quotes": [_quote("7203", "2026-06-01")]})],
+            [_Response({"data": [_quote("7203", "2026-06-01")]})],
         )
         JQuantsDataSource("secret-key").get_bars_for_date(date(2026, 6, 1))
         assert fake.calls[0]["headers"]["x-api-key"] == "secret-key"
@@ -162,7 +204,7 @@ class TestEmptyResponse:
     def test_空応答は遅延の可能性を示して例外にする(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _install(monkeypatch, [_Response({"daily_quotes": []})])
+        _install(monkeypatch, [_Response({"data": []})])
         source = JQuantsDataSource("key")
         with pytest.raises(EmptyResponseError, match=str(FREE_PLAN_DELAY_DAYS)):
             source.get_bars_for_date(date(2026, 6, 1))
@@ -176,7 +218,7 @@ class TestSymbols:
             [
                 _Response(
                     {
-                        "info": [
+                        "data": [
                             {"Code": "72030", "CompanyName": "トヨタ自動車"},
                             {"Code": "8306", "CompanyName": "三菱UFJ"},
                         ]
@@ -203,7 +245,7 @@ class TestBarConversion:
             [
                 _Response(
                     {
-                        "daily_quotes": [
+                        "data": [
                             {
                                 "Code": "7203",
                                 "Date": "2026-06-01",
@@ -226,13 +268,46 @@ class TestBarConversion:
         bars = JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
         assert bars["7203"][0].close == 100.5  # 調整済みの値
 
+    def test_V2の短縮項目名を解釈できる(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """V2 は項目名が短縮された（Open→O、Close→C、調整済みは AdjC 等）。"""
+        _install(monkeypatch, [_Response({"data": [_quote("7203", "2026-06-01")]})])
+        bars = JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+        assert bars["7203"][0].close == 100.0
+
+    def test_V1形式が返っても解釈できる(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """候補キー方式なので旧形式でも壊れない。
+
+        V2 の短縮形の正確な綴りは公開情報からの推定を含むため、
+        取りこぼしても動くようにしてある。
+        """
+        _install(monkeypatch, [_Response({"data": [_v1_quote("7203", "2026-06-01")]})])
+        bars = JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+        assert bars["7203"][0].close == 100.0
+
+    def test_項目名が全く違えば実際のキーを添えて例外にする(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """推測が外れたときに、実データの項目名が分かるようにする。"""
+        _install(
+            monkeypatch,
+            [_Response({"data": [{"Unknown1": 1, "Unknown2": 2}]})],
+        )
+        with pytest.raises(EmptyResponseError, match="Unknown1"):
+            JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+
+    def test_404はパス変更の可能性を示す(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """失敗理由を握り潰さず、原因の切り分けができるようにする。"""
+        _install(monkeypatch, [_Response({}, status_code=404)])
+        with pytest.raises(DataSourceError, match="V2"):
+            JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+
     def test_欠損を含むレコードは落とす(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install(
             monkeypatch,
             [
                 _Response(
                     {
-                        "daily_quotes": [
+                        "data": [
                             {"Code": "7203", "Date": "2026-06-01", "Close": None},
                             _quote("8306", "2026-06-01"),
                         ]

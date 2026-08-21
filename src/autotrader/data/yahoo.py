@@ -292,19 +292,16 @@ class YahooDataSource(BarDataSource):
 
         欠損は ``None`` ではなく ``NaN`` で返るため ``pd.notna()`` で判定する。
         ``if value is None`` では検出できない。
+
+        列の取り出しは ``_select_ticker`` に委ねる。**銘柄数で分岐してはならない**
+        （yfinance は単一ティッカーでも MultiIndex を返す。§`_select_ticker` 参照）。
         """
         import pandas as pd
 
         out: dict[str, tuple[Bar, ...]] = {}
-        multi = len(symbols) > 1
 
         for code in symbols:
-            ticker = to_ticker(code)
-            try:
-                sub = frame[ticker] if multi else frame
-            except KeyError:
-                continue
-
+            sub = _select_ticker(frame, to_ticker(code))
             if sub is None or sub.empty:
                 continue
 
@@ -330,6 +327,40 @@ class YahooDataSource(BarDataSource):
                 out[code] = tuple(bars)
 
         return out
+
+
+def _select_ticker(frame: Any, ticker: str) -> Any | None:
+    """DataFrame から1銘柄ぶんの列を取り出す。
+
+    **銘柄数で分岐してはならない。** yfinance は
+    **単一ティッカーでも多階層インデックス（MultiIndex）を返すのが既定**に変わっており、
+    「1銘柄だからフラットなはず」と仮定すると列名が `("7203.T", "Open")` のタプルのため
+    `row.get("Open")` が `None` を返し、**全行が欠損として捨てられて空になる**。
+
+    実際にこの不具合を踏んだ（Phase 1 の実測で、1銘柄の取得だけが全滅した）。
+    列構造そのものを見て判定する。
+
+    level の順序は ``group_by`` の指定や yfinance のバージョンで変わりうるため、
+    ticker が level 0 にある場合と level 1 にある場合の**両方に対応する**。
+
+    Returns:
+        その銘柄の OHLCV を列に持つ DataFrame。見つからなければ ``None``。
+    """
+    import pandas as pd
+
+    columns = getattr(frame, "columns", None)
+    if columns is None:
+        return None
+
+    if isinstance(columns, pd.MultiIndex):
+        if ticker in columns.get_level_values(0):
+            return frame[ticker]
+        if ticker in columns.get_level_values(1):
+            return frame.xs(ticker, axis=1, level=1)
+        return None
+
+    # フラットな列（単一ティッカーで MultiIndex を返さない構成）
+    return frame
 
 
 def _to_datetime(value: Any) -> datetime:
