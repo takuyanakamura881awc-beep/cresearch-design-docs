@@ -18,11 +18,32 @@ mode: replay
 
 # データ源（docs/09-data-sources.md）
 data_source:
-  daily: "jquants"      # J-Quants 無料（メール登録のみ・証券口座不要）
-  intraday: "yahoo"     # yfinance（何も不要）。Stage B では "kabus" に切り替える
-  intraday_interval: "5m"
+  # 【重要】日足は単一ソースではない。
+  # J-Quants Free は12週(84日)遅延するため、5分足(直近60日)のある期間の日足が取れない。
+  # 直近84日は yfinance で補完する。実装は data/base.py の FallbackDataSource。
+  daily:
+    primary: "jquants"    # JPX公式。分割調整が信頼できる（2年前〜84日前）
+    fallback: "yahoo"     # 直近84日の穴を埋める。auto_adjust=True 必須
+    # 重複期間(2年前〜84日前)で両者を突合し、乖離を実測する。
+    # scripts/verify_data_sources.py が実行し、Light(1,650円/月)課金の判断材料にする。
+    cross_check: true
+
+  # 分足。J-Quants に分足は存在せず、フォールバック先がない単一障害点。
+  intraday:
+    primary: "yahoo"      # Stage B では "kabus" を追加する
+    interval: "5m"
   # 5分足は過去60日分まとめて取れる。1分足は直近7日のみで日次ローリング回収が必要。
   # オープニングレンジ・ブレイクアウト(30分レンジ)の検証には5分足で十分。
+
+  # yfinance のレート制限対策（docs/09 §2.5 落とし穴1）
+  yahoo:
+    batch_size: 20              # 1回のdownloadに渡す銘柄数
+    batch_interval_seconds: 1.0 # バッチ間の待機
+  jquants:
+    requests_per_minute: 5      # Freeプラン。Light は 60
+
+  cache:
+    ttl_days: 1                 # 価格データのTTL。API障害時の緩衝材も兼ねる
 
 # ------------------------------------------------------------
 # 約定コストのモデル
@@ -82,6 +103,20 @@ take_intraday:
   #         同一銘柄で両方が同時発火したらエントリーを見送る
   #         （矛盾するシグナルは情報がない状態と扱う）。
   skip_on_conflicting_signals: true
+
+  # --- 板情報によるエントリー品質フィルタ（Stage B・docs/04「板情報の扱い」）---
+  #
+  # 【方針】板はシグナルの主役にはしない。竹の保有期間(数十分〜大引け)に対し、
+  #         板の情報は数秒〜数分で陳腐化するため時間軸が合わない。
+  #         板を主シグナルにするなら保有も数分にすべきで、それは松(スキャルピング)。
+  #
+  # ただし「エントリーの品質フィルタ」としてなら竹の時間軸でも効きうる。
+  # Stage B で有効化し、足して成績が上がるかを実データで比較検証する。
+  # 上がらなければ足さない（寄り前気配・プレミアム枠と同じ検証構造）。
+  orderbook_filter:
+    enabled: false              # Stage A では板が取れない。Stage B で true にして検証
+    min_book_depth_ratio: 0.5   # 自注文サイズに対する最良気配の厚みの下限
+    max_opposite_depth_ratio: 2.0  # 反対側の板が厚すぎたら見送る
 
   # --- 手仕舞い規律 ---
   exits:

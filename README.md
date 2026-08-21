@@ -57,7 +57,7 @@ kabuステーションAPI を通じて発注する。
 | Phase | 内容 | 状態 |
 |---|---|---|
 | 0 | 設計ドキュメント | ✅ 完了 |
-| 1 | データ基盤（J-Quants 日足 + yfinance 分足） | 未着手 |
+| 1 | データ基盤（J-Quants 日足 + yfinance 分足） | ✅ 完了 |
 | 2 | ユニバース構築 + バックテストエンジン | 未着手 |
 | 3 | 竹の実装 + ヒストリカル検証 | 未着手 |
 
@@ -131,26 +131,65 @@ Claude Code で開発するためのロールを `.claude/agents/` に定義し�
 
 **Stage A（Phase 1〜3）で必要なのはこれだけ:**
 
-1. **J-Quants の無料登録** — メールアドレスのみ。**証券口座は不要**。
-   ダッシュボードで V2 の API キーを発行する
+1. **J-Quants の無料登録** — メールアドレスのみ。**証券口座は不要**
+2. **Freeプランへの登録** — ログイン後、プラン選択画面で `Get started`。
+   **ユーザー登録しただけでは API が使えない**（ここでつまずきやすい）
+3. ダッシュボード →「API Keys」でキーを発行
 
 **Stage B（Phase 4〜）に入る時点で追加:**
 
-2. 三菱UFJ eスマート証券の**口座開設 + 信用取引口座の開設**
-3. **kabuステーションAPI の利用申込** — ログイン後画面の
-   「ピックアップサービス」→「kabuステーション®」→「kabuステーション®API」から設定（書面・捺印不要）
-4. **Professionalプラン条件の充足** — API 利用の前提
-5. Windows PC の**スリープ無効化**と kabuステーションの自動起動設定
+4. 三菱UFJ eスマート証券の**口座開設 + 信用取引口座の開設**
+5. **kabuステーションAPI の利用申込** — メンバーサイト →「設定・申込」→「らくらく電子契約」
+   → 取引ツール欄の kabuステーションAPI設定（書面・捺印不要）
+6. Windows PC の**スリープ無効化**と kabuステーションの自動起動設定
 
-### インストール
+### セットアップ（Windows）
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate      # Windows
-pip install -e ".[dev]"
-
-cp .env.example .env        # 認証情報を記入する
+```powershell
+mkdir C:\PrivateTule -Force
+cd C:\PrivateTule
+git clone https://github.com/takuyanakamura881awc-beep/cresearch-design-docs.git jp-autotrader
+cd jp-autotrader
+git checkout claude/japan-stock-trading-tool-6evhcd
 ```
+
+**認証情報を設定する**（`<キー>` を発行した APIキーに置き換え）:
+
+```powershell
+Copy-Item .env.example .env
+(Get-Content .env) -replace '^JQUANTS_API_KEY=.*', 'JQUANTS_API_KEY=<キー>' | Set-Content .env -Encoding UTF8
+git status    # .env が出てこないこと（.gitignore 済み）
+```
+
+> メモ帳は使わないこと。拡張子が `.env.txt` になる。
+
+**依存をインストールする:**
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e ".[dev]"
+```
+
+### データ源の実測（Phase 1 の最初にやること）
+
+```powershell
+python scripts\verify_data_sources.py
+```
+
+設計時の想定（yfinance は1分足7日/5分足60日、J-Quants Free は12週遅延）は
+**公開仕様に基づく未検証の値**。実測して確認してから Phase 2 に進む。
+
+このスクリプトが出力するもの:
+
+| # | 内容 | 使いみち |
+|---|---|---|
+| 1 | J-Quants の疎通 | APIキーが有効か |
+| 2 | yfinance の実際の取得可能期間 | 想定と違えば `MAX_LOOKBACK_DAYS` を修正 |
+| 3 | J-Quants Free の実際のデータ終端日 | 12週遅延の実測 |
+| 4 | 期間ズレ | 5分足と日足の間に何日の穴があるか |
+| 5 | **日足の突合（J-Quants vs yfinance）** | **Light（1,650円/月）課金の判断材料** |
+| 6 | yfinance のレート制限の挙動 | ブロックされていないか |
 
 ### 動作確認
 
