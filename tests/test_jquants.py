@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from autotrader.data.base import DataSourceError, EmptyResponseError
+from autotrader.data.base import DataSourceError, EmptyResponseError, RateLimitError
 from autotrader.data.jquants import (
     ENDPOINT_DAILY_BARS,
     ENDPOINT_MASTER,
@@ -78,15 +78,44 @@ def _install(monkeypatch: pytest.MonkeyPatch, responses: list[_Response]) -> _Fa
     return fake
 
 
-class TestRateLimiter:
-    """API側の制限に当てず、こちらで待つこと。"""
+def _source(api_key: str = "key", **kwargs: Any) -> JQuantsDataSource:
+    """テスト用のクライアント。
 
-    def test_上限内なら待たない(self) -> None:
-        limiter = RateLimiter(per_minute=5)
+    **実時間で待たせない。** 本番は 5件/分（12秒間隔）だが、テストで実際に待つと
+    スイート全体が分単位になる。ペース制御そのものは TestRateLimiter で検証する。
+    """
+    kwargs.setdefault("requests_per_minute", 60_000)  # 1ms 間隔
+    return JQuantsDataSource(api_key, **kwargs)
+
+
+class TestRateLimiter:
+    """**バーストせず均等な間隔で送ること。**
+
+    「直近60秒で5件まで」のスライディングウィンドウだと、5件を一気に送って
+    58秒待ち、また5件を一気に送る挙動になる。サーバ側のウィンドウがずれていると
+    境界で9件が観測されて 429 になる。実際にこれを踏んだ。
+    """
+
+    def test_間隔は毎分の上限から決まる(self) -> None:
+        assert RateLimiter(per_minute=5).interval_seconds == 12.0
+        assert RateLimiter(per_minute=60).interval_seconds == 1.0
+
+    def test_初回は待たない(self) -> None:
+        limiter = RateLimiter(per_minute=60)  # 1秒間隔
+        started = time.monotonic()
+        limiter.acquire()
+        assert time.monotonic() - started < 0.5
+
+    def test_連続要求はバーストせず間隔を空ける(self) -> None:
+        """5件を連続要求したら 4×間隔ぶん待つこと（バーストなら一瞬で終わる）。"""
+        limiter = RateLimiter(per_minute=1200)  # 0.05秒間隔
         started = time.monotonic()
         for _ in range(5):
             limiter.acquire()
-        assert time.monotonic() - started < 0.5
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= 0.05 * 4 * 0.9  # 多少の誤差を許容
+        assert elapsed < 1.0  # 待ちすぎてもいない
 
     def test_ゼロ以下の上限は拒否する(self) -> None:
         with pytest.raises(ValueError):
@@ -96,14 +125,14 @@ class TestRateLimiter:
 class TestInterval:
     def test_日足のみ対応する(self) -> None:
         """J-Quants に分足は存在しない。"""
-        source = JQuantsDataSource("key")
+        source = _source()
         assert source.supports_interval("1d")
         assert not source.supports_interval("5m")
         assert not source.supports_interval("1m")
 
     def test_分足を要求されたらエラーにする(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install(monkeypatch, [])
-        source = JQuantsDataSource("key")
+        source = _source()
         with pytest.raises(DataSourceError, match="日足のみ"):
             source.get_bars("7203", "5m", date(2026, 1, 1), date(2026, 1, 10))
 
@@ -129,7 +158,7 @@ class TestPagination:
                 _Response({"data": [_quote("8306", "2026-06-01")]}),
             ],
         )
-        source = JQuantsDataSource("key")
+        source = _source()
         bars = source.get_bars_for_date(date(2026, 6, 1))
 
         assert set(bars) == {"7203", "8306"}
@@ -145,7 +174,7 @@ class TestPagination:
             monkeypatch,
             [_Response({"data": [_quote("7203", "2026-06-01")]})],
         )
-        JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+        _source().get_bars_for_date(date(2026, 6, 1))
 
         assert fake.calls[0]["url"].endswith(ENDPOINT_DAILY_BARS)
         assert "prices/daily_quotes" not in fake.calls[0]["url"]
@@ -157,7 +186,7 @@ class TestPagination:
             monkeypatch,
             [_Response({"data": [{"Code": "7203", "CompanyName": "トヨタ"}]})],
         )
-        JQuantsDataSource("key").list_symbols(date(2026, 6, 1))
+        _source().list_symbols(date(2026, 6, 1))
 
         assert fake.calls[0]["url"].endswith(ENDPOINT_MASTER)
         assert "listed/info" not in fake.calls[0]["url"]
@@ -168,7 +197,7 @@ class TestPagination:
             monkeypatch,
             [_Response({"data": [_quote("7203", "2026-06-01")]})],
         )
-        source = JQuantsDataSource("key")
+        source = _source()
         source.get_bars_for_date(date(2026, 6, 1))
 
         assert fake.calls[0]["params"]["date"] == "2026-06-01"
@@ -181,7 +210,7 @@ class TestAuth:
             monkeypatch,
             [_Response({"data": [_quote("7203", "2026-06-01")]})],
         )
-        JQuantsDataSource("secret-key").get_bars_for_date(date(2026, 6, 1))
+        _source("secret-key").get_bars_for_date(date(2026, 6, 1))
         assert fake.calls[0]["headers"]["x-api-key"] == "secret-key"
 
     def test_401はプラン登録の案内つきでエラーにする(
@@ -189,15 +218,46 @@ class TestAuth:
     ) -> None:
         """ユーザー登録だけでは使えず、Freeプランへの登録が別途必要。"""
         _install(monkeypatch, [_Response({}, status_code=401)])
-        source = JQuantsDataSource("key")
+        source = _source()
         with pytest.raises(DataSourceError, match="Freeプラン"):
             source.get_bars_for_date(date(2026, 6, 1))
 
-    def test_429はレート制限として区別する(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _install(monkeypatch, [_Response({}, status_code=429)])
-        source = JQuantsDataSource("key")
-        with pytest.raises(DataSourceError, match="レート制限"):
-            source.get_bars_for_date(date(2026, 6, 1))
+    def test_429はRateLimitErrorとして区別する(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """**「データなし」と混同してはならない。**
+
+        測定ループがこれを「その日はデータなし」として飛ばすと測定値が嘘になる。
+        実際に、データ終端日の実測が 84日から 88日にずれる事故を起こした。
+        """
+        _install(monkeypatch, [_Response({}, status_code=429)] * 5)
+        with pytest.raises(RateLimitError):
+            _source(max_rate_limit_retries=0).get_bars_for_date(date(2026, 6, 1))
+
+    def test_RateLimitErrorは空応答と別の型である(self) -> None:
+        """呼び出し側が両者を区別できること。"""
+        assert issubclass(RateLimitError, DataSourceError)
+        assert not issubclass(RateLimitError, EmptyResponseError)
+        assert not issubclass(EmptyResponseError, RateLimitError)
+
+    def test_429は再試行してから諦める(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """サーバ側の制限方式は公開されていないため、回復可能にしておく。"""
+        fake = _install(monkeypatch, [_Response({}, status_code=429)] * 5)
+        with pytest.raises(RateLimitError):
+            _source(max_rate_limit_retries=2).get_bars_for_date(date(2026, 6, 1))
+
+        assert len(fake.calls) == 3  # 初回 + 再試行2回
+
+    def test_再試行で回復すれば成功する(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install(
+            monkeypatch,
+            [
+                _Response({}, status_code=429),
+                _Response({"data": [_quote("7203", "2026-06-01")]}),
+            ],
+        )
+        bars = _source(max_rate_limit_retries=2).get_bars_for_date(date(2026, 6, 1))
+        assert "7203" in bars
 
 
 class TestEmptyResponse:
@@ -205,7 +265,7 @@ class TestEmptyResponse:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _install(monkeypatch, [_Response({"data": []})])
-        source = JQuantsDataSource("key")
+        source = _source()
         with pytest.raises(EmptyResponseError, match=str(FREE_PLAN_DELAY_DAYS)):
             source.get_bars_for_date(date(2026, 6, 1))
 
@@ -226,7 +286,7 @@ class TestSymbols:
                 )
             ],
         )
-        source = JQuantsDataSource("key")
+        source = _source()
         symbols = source.list_symbols(date(2026, 3, 31))
 
         assert symbols is not None
@@ -265,13 +325,13 @@ class TestBarConversion:
                 )
             ],
         )
-        bars = JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+        bars = _source().get_bars_for_date(date(2026, 6, 1))
         assert bars["7203"][0].close == 100.5  # 調整済みの値
 
     def test_V2の短縮項目名を解釈できる(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """V2 は項目名が短縮された（Open→O、Close→C、調整済みは AdjC 等）。"""
         _install(monkeypatch, [_Response({"data": [_quote("7203", "2026-06-01")]})])
-        bars = JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+        bars = _source().get_bars_for_date(date(2026, 6, 1))
         assert bars["7203"][0].close == 100.0
 
     def test_V1形式が返っても解釈できる(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -281,7 +341,7 @@ class TestBarConversion:
         取りこぼしても動くようにしてある。
         """
         _install(monkeypatch, [_Response({"data": [_v1_quote("7203", "2026-06-01")]})])
-        bars = JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+        bars = _source().get_bars_for_date(date(2026, 6, 1))
         assert bars["7203"][0].close == 100.0
 
     def test_項目名が全く違えば実際のキーを添えて例外にする(
@@ -293,13 +353,13 @@ class TestBarConversion:
             [_Response({"data": [{"Unknown1": 1, "Unknown2": 2}]})],
         )
         with pytest.raises(EmptyResponseError, match="Unknown1"):
-            JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+            _source().get_bars_for_date(date(2026, 6, 1))
 
     def test_404はパス変更の可能性を示す(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """失敗理由を握り潰さず、原因の切り分けができるようにする。"""
         _install(monkeypatch, [_Response({}, status_code=404)])
         with pytest.raises(DataSourceError, match="V2"):
-            JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+            _source().get_bars_for_date(date(2026, 6, 1))
 
     def test_欠損を含むレコードは落とす(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install(
@@ -315,5 +375,5 @@ class TestBarConversion:
                 )
             ],
         )
-        bars = JQuantsDataSource("key").get_bars_for_date(date(2026, 6, 1))
+        bars = _source().get_bars_for_date(date(2026, 6, 1))
         assert set(bars) == {"8306"}

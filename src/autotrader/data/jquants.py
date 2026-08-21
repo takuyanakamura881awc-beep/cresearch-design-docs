@@ -45,11 +45,15 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
 from datetime import date, datetime
 from typing import Any
 
-from autotrader.data.base import BarDataSource, DataSourceError, EmptyResponseError
+from autotrader.data.base import (
+    BarDataSource,
+    DataSourceError,
+    EmptyResponseError,
+    RateLimitError,
+)
 from autotrader.types import Bar, Symbol
 
 logger = logging.getLogger(__name__)
@@ -125,34 +129,47 @@ def _pick(record: dict[str, Any], field: str) -> Any:
 
 
 class RateLimiter:
-    """リクエスト数を毎分の上限内に収める。
+    """リクエストを**均等な間隔**で送る。
 
     API 側の制限に当てて弾かれるのではなく、**こちらで待つ**。
-    弾かれた場合のリトライは、成功したのか失敗したのか判断が難しくなる。
+
+    【なぜスライディングウィンドウではなく均等ペースなのか】
+
+    「直近60秒で5件まで」というスライディングウィンドウは、
+    **5件を一気に送って58秒待ち、また5件を一気に送る**挙動になる。
+    サーバ側のウィンドウが少しでもずれていると超過する::
+
+        自分の窓 [t=0,  t=60]  : 5件（自分の判定では OK）
+        自分の窓 [t=58, t=118] : 5件（自分の判定では OK）
+        サーバの窓 [t=1, t=61] : 1回目の残り4件 + 2回目の5件 = 9件 → 429
+
+    実際にこれで 429 を踏んだ。**バーストが原因。**
+
+    ``60 / per_minute`` 秒ごとに1件だけ送れば、どんなウィンドウの切り方でも
+    超過しない。最も保守的で、サーバ側の実装（固定窓・トークンバケット等）に
+    依存しない。
     """
 
     def __init__(self, per_minute: int) -> None:
         if per_minute <= 0:
             raise ValueError("per_minute は1以上")
-        self._per_minute = per_minute
-        self._timestamps: deque[float] = deque()
+        self._interval = 60.0 / per_minute
+        self._last: float | None = None
+
+    @property
+    def interval_seconds(self) -> float:
+        """リクエスト間隔（秒）。"""
+        return self._interval
 
     def acquire(self) -> None:
-        """上限を超えないよう、必要なら待つ。"""
-        now = time.monotonic()
-        while self._timestamps and now - self._timestamps[0] >= 60.0:
-            self._timestamps.popleft()
-
-        if len(self._timestamps) >= self._per_minute:
-            wait = 60.0 - (now - self._timestamps[0])
+        """前回から ``interval_seconds`` 経つまで待つ。"""
+        if self._last is not None:
+            elapsed = time.monotonic() - self._last
+            wait = self._interval - elapsed
             if wait > 0:
                 logger.debug("レート制限のため %.1f 秒待機する", wait)
                 time.sleep(wait)
-            now = time.monotonic()
-            while self._timestamps and now - self._timestamps[0] >= 60.0:
-                self._timestamps.popleft()
-
-        self._timestamps.append(time.monotonic())
+        self._last = time.monotonic()
 
 
 class JQuantsDataSource(BarDataSource):
@@ -164,6 +181,7 @@ class JQuantsDataSource(BarDataSource):
         base_url: str = DEFAULT_BASE_URL,
         requests_per_minute: int = FREE_PLAN_REQUESTS_PER_MINUTE,
         timeout_seconds: float = 30.0,
+        max_rate_limit_retries: int = 2,
     ) -> None:
         if not api_key:
             raise ValueError("api_key が空")
@@ -171,10 +189,16 @@ class JQuantsDataSource(BarDataSource):
         self._base_url = base_url.rstrip("/")
         self._limiter = RateLimiter(requests_per_minute)
         self._timeout = timeout_seconds
+        self._max_rate_limit_retries = max_rate_limit_retries
 
     @property
     def name(self) -> str:
         return "jquants"
+
+    @property
+    def limiter_interval_seconds(self) -> float:
+        """リクエスト間隔（秒）。診断スクリプトが所要時間を見積もるのに使う。"""
+        return self._limiter.interval_seconds
 
     def supports_interval(self, interval: str) -> bool:
         """日足のみ。**J-Quants に分足は存在しない。**"""
@@ -193,6 +217,38 @@ class JQuantsDataSource(BarDataSource):
         return self._get(path, params)
 
     def _get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
+        """レート制限に当たったら待って再試行する。
+
+        サーバ側の制限方式は公開されていないため、こちらのペース制御だけでは
+        取りこぼしうる。**予測しきれない前提で回復可能にしておく。**
+
+        Raises:
+            RateLimitError: 再試行しても解消しなかった場合。
+                **呼び出し側はこれを「データなし」と混同してはならない。**
+        """
+        delay = self._limiter.interval_seconds
+        last: RateLimitError | None = None
+
+        for attempt in range(self._max_rate_limit_retries + 1):
+            try:
+                return self._request(path, params)
+            except RateLimitError as exc:
+                last = exc
+                if attempt >= self._max_rate_limit_retries:
+                    break
+                logger.warning(
+                    "レート制限に達した。%.0f秒待って再試行する (%d/%d)",
+                    delay,
+                    attempt + 1,
+                    self._max_rate_limit_retries,
+                )
+                time.sleep(delay)
+                delay *= 2  # 指数バックオフ
+
+        assert last is not None
+        raise last
+
+    def _request(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         import httpx
 
         self._limiter.acquire()
@@ -223,9 +279,9 @@ class JQuantsDataSource(BarDataSource):
                 "V2 でパスが変更されている可能性（V1 は2026年6月1日に終了）"
             )
         if response.status_code == 429:
-            raise DataSourceError(
+            raise RateLimitError(
                 f"J-Quants のレート制限に達した（429 / {url}）。"
-                "requests_per_minute の設定を確認すること"
+                f"現在の間隔: {self._limiter.interval_seconds:.1f}秒/件"
             )
         if response.status_code >= 400:
             raise DataSourceError(

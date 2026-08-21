@@ -35,7 +35,7 @@ import traceback
 from datetime import date, timedelta
 
 from autotrader.config import load_credentials, mask
-from autotrader.data.base import DataSourceError
+from autotrader.data.base import DataSourceError, EmptyResponseError, RateLimitError
 from autotrader.data.jquants import (
     ENDPOINT_DAILY_BARS,
     ENDPOINT_MASTER,
@@ -83,16 +83,26 @@ def make_jquants(api_key: str) -> JQuantsDataSource:
 def probe_jquants(source: JQuantsDataSource) -> None:
     """疎通を単独で確認する。**失敗理由をそのまま表示する。**
 
-    以前は全ての失敗を同一視していたため、401（認証）と 404（パス誤り）と
-    空応答（遅延）が区別できず、誤った案内を出した。実際の原因は V1 の旧パスだった。
+    **``code=`` で1銘柄だけ取る。** ``date=`` は1営業日で約4,200銘柄が返り、
+    ページングで複数リクエストを消費する。5件/分の制約下では診断だけで枯渇する。
+    （``date=`` 一括取得は Phase 2 の本番収集では正しい。用途が違う。）
     """
     hr("2. J-Quants — 疎通確認")
-    probe = date.today() - timedelta(days=FREE_PLAN_DELAY_DAYS + 7)
+    end = date.today() - timedelta(days=FREE_PLAN_DELAY_DAYS + 7)
+    start = end - timedelta(days=7)
 
     print(f"  エンドポイント: {ENDPOINT_DAILY_BARS}")
-    print(f"  試行日: {probe}")
+    print(f"  銘柄: {PROBE_SYMBOLS[0]}  期間: {start} 〜 {end}")
+    print(f"  リクエスト間隔: {source.limiter_interval_seconds:.1f}秒/件")
     try:
-        payload = source.get_raw(ENDPOINT_DAILY_BARS, {"date": probe.isoformat()})
+        payload = source.get_raw(
+            ENDPOINT_DAILY_BARS,
+            {
+                "code": PROBE_SYMBOLS[0],
+                "from": start.isoformat(),
+                "to": end.isoformat(),
+            },
+        )
     except DataSourceError as exc:
         print(f"  NG: {exc}")
         return
@@ -122,34 +132,55 @@ def _dump_record_keys(payload: dict[str, object], label: str) -> None:
 def check_jquants(source: JQuantsDataSource) -> date | None:
     """Free プランの実際のデータ終端日を調べる。
 
+    【429 を「データなし」と混同しない】
+
+    以前は ``DataSourceError`` を一括で捕捉して次の日付へ進んでいたため、
+    レート制限で失敗した日を「その日はデータなし」と誤判定した。
+    結果、実測の遅延が 84日から 88日にずれた（**測定値が嘘になった**）。
+
+    ここでは ``RateLimitError`` を受けたら**測定を中断して測定不能と報告する**。
+    誤った値を返すより、測定できなかったと言う方が安全。
+
     Returns:
-        取得できた最新の営業日。失敗なら None。
+        取得できた最新の営業日。失敗・測定不能なら None。
     """
     hr("3. J-Quants — 実際のデータ終端日")
     expected = date.today() - timedelta(days=FREE_PLAN_DELAY_DAYS)
     print(f"  想定終端日（12週=84日遅延）: {expected}")
-    print("  実測中（直近から遡って最初に取れる営業日を探す）...")
+    print("  実測中（想定日から遡り、土日は飛ばす）...")
 
-    first_error: str | None = None
-    for back in range(FREE_PLAN_DELAY_DAYS - 10, FREE_PLAN_DELAY_DAYS + 25):
+    probes = 0
+    for back in range(FREE_PLAN_DELAY_DAYS - 3, FREE_PLAN_DELAY_DAYS + 15):
         probe = date.today() - timedelta(days=back)
+        if probe.weekday() >= 5:
+            continue  # 土日は必ず空振りする。リクエストの無駄
+
+        probes += 1
         try:
-            bars = source.get_bars_for_date(probe)
+            bars = source.get_bars(
+                PROBE_SYMBOLS[0], "1d", probe, probe
+            )
+        except RateLimitError as exc:
+            # データ不在と区別する。ここで continue すると測定が嘘になる
+            print(f"  測定不能: レート制限に達した（{probes}件目の照会で中断）")
+            print(f"    {exc}")
+            print("    → 時間をおいて再実行するか、リクエスト間隔を広げること")
+            return None
+        except EmptyResponseError:
+            continue  # この日はデータなし（正常な判定）
         except DataSourceError as exc:
-            if first_error is None:
-                first_error = f"{probe}: {exc}"
+            print(f"  {probe}: {exc}")
             continue
+
         if bars:
-            print(f"  OK: {probe} のデータを取得（{len(bars)}銘柄）")
             delay = (date.today() - probe).days
+            print(f"  OK: {probe} のデータを取得（{probes}件の照会）")
             print(f"  実測の遅延: {delay}日（想定 {FREE_PLAN_DELAY_DAYS}日）")
             if abs(delay - FREE_PLAN_DELAY_DAYS) > 7:
                 print("  ※ 想定と1週間以上ずれている。FREE_PLAN_DELAY_DAYS の見直しを検討")
             return probe
 
-    print("  NG: どの日付でもデータを取得できなかった")
-    if first_error:
-        print(f"  最初の失敗理由: {first_error}")
+    print(f"  NG: {probes}件照会したがデータを取得できなかった")
     return None
 
 
@@ -159,6 +190,10 @@ def check_jquants_symbols(source: JQuantsDataSource, as_of: date) -> None:
         raw = source.get_raw(ENDPOINT_MASTER, {"date": as_of.isoformat()})
         _dump_record_keys(raw, "銘柄一覧")
         symbols = source.list_symbols(as_of)
+    except RateLimitError as exc:
+        print(f"  測定不能: レート制限 — {exc}")
+        print("    → 銘柄一覧は全銘柄を返すためページングでリクエストを消費する")
+        return
     except DataSourceError as exc:
         print(f"  NG: {exc}")
         return
@@ -305,6 +340,9 @@ def compare_daily(source: JQuantsDataSource, jquants_end: date | None) -> None:
 
     try:
         jq_bars = source.get_bars(symbol, "1d", start, end)
+    except RateLimitError as exc:
+        print(f"  測定不能: レート制限 — {exc}")
+        return
     except DataSourceError as exc:
         print(f"  {symbol}: J-Quants 取得失敗 — {exc}")
         return
@@ -430,6 +468,9 @@ def main() -> int:
     hr("完了")
     print("  この出力を確認してから Phase 2（ユニバース構築）に進むこと。")
     print("  想定と食い違う値があれば、対応する定数を実測値に修正する。")
+    print()
+    print("  ※ 「測定不能: レート制限」が出た場合、その項目の値は不明であって")
+    print("     「データがない」ではない。時間をおいて再実行すること。")
     return 0
 
 
