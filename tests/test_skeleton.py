@@ -90,8 +90,9 @@ def test_yfinanceの期間制限が定義されている() -> None:
     """取得可能期間を超える指定を黙って切り詰めると、欠損に気づけない。
 
     制限値を定数として持ち、超過をエラーにできるようにしておく。
+    値は公称ではなく**実測値**（5m は公称60日だが60日ちょうどでは弾かれる）。
     """
     from autotrader.data.yahoo import MAX_LOOKBACK_DAYS
 
     assert MAX_LOOKBACK_DAYS["1m"] == 7
-    assert MAX_LOOKBACK_DAYS["5m"] == 60
+    assert MAX_LOOKBACK_DAYS["5m"] == 58

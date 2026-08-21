@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -101,29 +101,54 @@ class TestLookback:
         today = date(2026, 8, 21)
         check_lookback("1m", date(2026, 8, 18), today=today)
 
-    def test_5分足は60日を超えるとエラー(self) -> None:
+    def test_5分足は58日を超えるとエラー(self) -> None:
+        """実測で60日は失敗し58日は成功した。公称60日をそのまま使わない。"""
         today = date(2026, 8, 21)
         with pytest.raises(LookbackExceededError):
             check_lookback("5m", date(2026, 5, 1), today=today)
 
+    def test_5分足の実測上限ちょうどは通る(self) -> None:
+        today = date(2026, 8, 21)
+        check_lookback("5m", today - timedelta(days=58), today=today)
+
     def test_日足は制限がないので何年前でも通る(self) -> None:
         check_lookback("1d", date(2010, 1, 1), today=date(2026, 8, 21))
 
-    def test_定数が公開仕様と一致している(self) -> None:
-        """実機で異なった場合はこの定数を修正する（実測は verify スクリプト）。"""
-        assert MAX_LOOKBACK_DAYS["1m"] == 7
-        assert MAX_LOOKBACK_DAYS["5m"] == 60
+    def test_定数が実測値である(self) -> None:
+        """公称値ではなく実測値を使う。
 
-
-class TestAutoAdjust:
-    def test_auto_adjustが必ずTrueで渡される(self, fake_yf: _FakeYFinance) -> None:
-        """分割調整。無効化すると分割前後で価格が不連続になり、
-        ATR%や売買代金の計算が壊れて架空の急騰を誤検出する。
+        公称は 5m=60日 / 60m=730日 だが、その値ちょうどでは弾かれる。
+        公称のままだと上限ぎりぎりの取得がエラーなく空になる。
         """
+        assert MAX_LOOKBACK_DAYS["1m"] == 7
+        assert MAX_LOOKBACK_DAYS["5m"] == 58
+        assert MAX_LOOKBACK_DAYS["60m"] == 728
+
+
+class TestAdjustment:
+    """調整基準を J-Quants と揃える。
+
+    yfinance の auto_adjust は分割と配当の**両方**を調整するが、
+    J-Quants の AdjC は**分割のみ**。基準が違うと、日足を繋ぐ継ぎ目に
+    実在しない価格変化が生まれ、そこを跨ぐ ATR% や移動平均が汚染される。
+
+    実測（7203、118日）で中央値1.467%・最大1.467%の差が出た。
+    中央値と最大値が一致するのは一定オフセット＝配当調整の証拠。
+    """
+
+    def test_既定では配当調整をしない(self, fake_yf: _FakeYFinance) -> None:
+        """auto_adjust=False のとき Close は分割調整済み・配当未調整になる。"""
         source = YahooDataSource()
         source.get_bars_batch(("7203",), "1d", date(2026, 6, 1), date(2026, 6, 10))
 
         assert fake_yf.calls
+        assert all(c["auto_adjust"] is False for c in fake_yf.calls)
+
+    def test_明示すれば配当調整もできる(self, fake_yf: _FakeYFinance) -> None:
+        """突合検証で両基準を比較するために必要。"""
+        source = YahooDataSource(adjust_dividends=True)
+        source.get_bars_batch(("7203",), "1d", date(2026, 6, 1), date(2026, 6, 10))
+
         assert all(c["auto_adjust"] is True for c in fake_yf.calls)
 
 

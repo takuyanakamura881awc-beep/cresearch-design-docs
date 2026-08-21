@@ -83,18 +83,40 @@ class PriceTier(Enum):
 
 @dataclass(frozen=True)
 class Symbol:
-    """銘柄。"""
+    """銘柄。
+
+    市場区分と信用区分は J-Quants の銘柄一覧（``equities/master``）から取れる。
+    実測で確認済みで、**ユニバースのフィルタA・Dが代理指標なしに実装できる**
+    （docs/03-universe.md §1）。分足しかない Stage A でも使える。
+    """
 
     code: str
     """銘柄コード（例: "7203"）"""
     name: str
     lot_size: int = 100
     """単元株数。日本株は通常100株"""
+    market: str | None = None
+    """市場区分名（例: "プライム"）。フィルタA に使う。不明なら ``None``"""
+    margin_type: str | None = None
+    """信用区分名（例: "貸借" / "信用" / "-"）。
+
+    **"貸借" なら制度信用で売建できる。** フィルタD の判定に使う。
+
+    一般信用（デイトレ）の在庫は証券会社側の情報なので Stage A では取れないが、
+    貸借銘柄かどうかは分かる。流動性による代理よりはるかに正確
+    （docs/09-data-sources.md §3）。
+    """
+    sector: str | None = None
+    """33業種区分名。将来のセクター分散に使う"""
 
 
 @dataclass(frozen=True)
 class Bar:
-    """OHLCV バー（日足または分足）。"""
+    """OHLCV バー（日足または分足）。
+
+    ``turnover`` と値幅制限フラグは J-Quants の日足から取れる（実測で確認済み）。
+    yfinance にはないので、そちら由来のバーでは ``None`` になる。
+    """
 
     symbol: str
     timestamp: datetime
@@ -103,6 +125,28 @@ class Bar:
     low: float
     close: float
     volume: int
+    turnover: float | None = None
+    """売買代金（円）。J-Quants の ``Va``。
+
+    フィルタB（20日平均売買代金10億円以上）に使う。
+    ``close * volume`` で近似せず、**実値があるならそれを使う**
+    （寄与の大きい約定が偏った時間帯にあると近似が外れる）。
+    """
+    limit_up: bool | None = None
+    """ストップ高だったか。J-Quants の ``UL``。フィルタH に使う"""
+    limit_down: bool | None = None
+    """ストップ安だったか。J-Quants の ``LL``。フィルタH に使う"""
+
+    @property
+    def effective_turnover(self) -> float:
+        """売買代金。実値がなければ ``close * volume`` で近似する。
+
+        yfinance 由来のバーには実値がないため、近似にフォールバックする。
+        近似であることを呼び出し側が意識しなくて済むようにここで吸収する。
+        """
+        if self.turnover is not None:
+            return self.turnover
+        return self.close * self.volume
 
 
 @dataclass(frozen=True)

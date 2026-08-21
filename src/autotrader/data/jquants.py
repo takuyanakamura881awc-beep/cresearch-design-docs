@@ -88,13 +88,26 @@ _FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "low": ("AdjL", "AdjustmentLow", "L", "Low", "low"),
     "close": ("AdjC", "AdjustmentClose", "C", "Close", "close"),
     "volume": ("AdjVo", "AdjustmentVolume", "Vo", "Volume", "volume"),
-    "name": ("CompanyName", "Name", "name"),
+    "turnover": ("Va", "TurnoverValue", "turnover"),
+    "limit_up": ("UL", "UpperLimit"),
+    "limit_down": ("LL", "LowerLimit"),
+    # 会社名は CoName。CompanyName と推測して外し、銘柄名が空になった実績がある。
+    "name": ("CoName", "CompanyName", "Name", "name"),
+    "market": ("MktNm", "MarketCodeName", "MarketName"),
+    "margin": ("MrgnNm", "MarginCodeName"),
+    "sector": ("S33Nm", "Sector33CodeName"),
 }
 """レスポンス項目名の候補。左から順に試し、最初に見つかった値を使う。
 
-V2 の短縮形（``AdjC`` 等）を優先し、V1 形式と小文字形も候補に含める。
-非公式APIの財務データで有効だったパターンと同じ考え方
-（銘柄によって項目名が違っても壊れない）。
+**先頭の候補は実データで確認済み**（scripts/verify_data_sources.py の出力）。
+後続は V1 形式などの保険で、非公式APIで項目名が揺れても壊れないようにしてある。
+
+実測で確認した項目（2026-08-21）::
+
+    日足      AdjC AdjFactor AdjH AdjL AdjO AdjVo C Code Date
+              ExRT H L LL MktCap O UL Va Vo
+    銘柄一覧  CoName CoNameEn Code Date Mkt MktNm Mrgn MrgnNm
+              ProdCat S17 S17Nm S33 S33Nm ScaleCat
 """
 
 
@@ -277,7 +290,14 @@ class JQuantsDataSource(BarDataSource):
             if not code:
                 continue
             symbols.append(
-                Symbol(code=code, name=str(_pick(item, "name") or ""), lot_size=100)
+                Symbol(
+                    code=code,
+                    name=str(_pick(item, "name") or ""),
+                    lot_size=100,
+                    market=_as_text(_pick(item, "market")),
+                    margin_type=_as_text(_pick(item, "margin")),
+                    sector=_as_text(_pick(item, "sector")),
+                )
             )
         return tuple(symbols)
 
@@ -356,6 +376,14 @@ class JQuantsDataSource(BarDataSource):
         return out
 
 
+def _as_text(value: Any) -> str | None:
+    """文字列に変換する。空なら ``None``。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _normalize_code(raw: Any) -> str:
     """銘柄コードを4桁に正規化する。
 
@@ -394,6 +422,35 @@ def _to_bar(item: Any) -> Bar | None:
             low=float(low),
             close=float(c),
             volume=int(float(v)),
+            turnover=_as_float(_pick(item, "turnover")),
+            limit_up=_as_flag(_pick(item, "limit_up")),
+            limit_down=_as_flag(_pick(item, "limit_down")),
         )
     except (TypeError, ValueError):
         return None
+
+
+def _as_float(value: Any) -> float | None:
+    """数値に変換する。変換できなければ ``None``（欠損として扱う）。"""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_flag(value: Any) -> bool | None:
+    """値幅制限フラグを解釈する。
+
+    J-Quants は ``UL`` / ``LL`` を文字列の ``"0"`` / ``"1"`` で返す（実測で確認）。
+    ``bool("0")`` は True になってしまうため、**文字列をそのまま真偽値にしない**。
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text in ("0", "", "-"):
+        return False
+    if text == "1":
+        return True
+    return None

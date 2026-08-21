@@ -14,7 +14,7 @@
 #       落とし穴                                            本モジュールでの対処
 ======  ==================================================  ==============================
 1       ブロックされても例外が飛ばず空 DataFrame が返る     ``EmptyResponseError`` を送出
-2       ``auto_adjust`` 未指定だと分割前後で価格が不連続    ``auto_adjust=True`` を強制
+2       分割の調整漏れで価格が不連続になる                  分割調整済みの列を使う（配当調整は除く）
 2b      欠損は ``None`` ではなく ``NaN``                    ``pd.notna()`` で判定
 3       tzキャッシュ(SQLite)の同時アクセスで落ちる          プロセス固有ディレクトリへ隔離
 4       仕様変更で数日間データが取れない                    ``base.FallbackDataSource``
@@ -49,20 +49,32 @@ logger = logging.getLogger(__name__)
 
 MAX_LOOKBACK_DAYS: dict[str, int] = {
     "1m": 7,
-    "2m": 60,
-    "5m": 60,
-    "15m": 60,
-    "30m": 60,
-    "60m": 730,
-    "90m": 60,
+    "2m": 58,
+    "5m": 58,
+    "15m": 58,
+    "30m": 58,
+    "60m": 728,
+    "90m": 58,
 }
-"""足ごとに遡れる日数。Yahoo Finance API の制限。
+"""足ごとに遡れる日数。**実測値**（2026-08-21、7203.T で確認）。
 
 日足（``1d``）は制限がないため含めない。
 
-**Phase 1 の最初に、実機で ``scripts/verify_data_sources.py`` により実測すること。**
-サンドボックスではネットワークポリシーにより検証できていない。
-実測値が異なった場合はこの定数を修正する。
+======  ==========  ==========  ==================================
+足      公称        実測        備考
+======  ==========  ==========  ==================================
+1m      7日         7日成功     9日は失敗
+5m      60日        58日成功    **60日は失敗**
+60m     730日       728日成功   **730日は失敗**
+======  ==========  ==========  ==================================
+
+**公称値より2日少ない値を採用している。** Yahoo の「直近60日以内」という判定は
+境界を含まず、``today - 60日`` を指定すると弾かれる::
+
+    5m data not available ... The requested range must be within the last 60 days.
+
+公称値をそのまま定数にすると、上限ぎりぎりの取得が**エラーなく空になる**。
+安全側（少なめ）に倒して、確実に取れる範囲だけを許可する。
 """
 
 DEFAULT_BATCH_SIZE = 20
@@ -73,6 +85,26 @@ DEFAULT_BATCH_SIZE = 20
 
 DEFAULT_BATCH_INTERVAL_SECONDS = 1.0
 """バッチ間の待機秒数。レート制限対策の実績値。"""
+
+DEFAULT_ADJUST_DIVIDENDS = False
+"""配当調整を行うか。**既定は False。**
+
+yfinance の ``auto_adjust=True`` は**分割と配当の両方**を調整する（トータルリターン基準）。
+一方 J-Quants の ``AdjC`` は**分割のみ**調整する。基準が違うと2つの問題が起きる：
+
+1. **継ぎ目の段差** — 日足は「2年前〜84日前は J-Quants、直近84日は yfinance」で繋ぐ。
+   基準が違うと継ぎ目に**実在しない価格変化**が生まれ、その期間を跨ぐ
+   14日ATR や 20日平均が汚染されて架空のシグナルになる。
+
+   実測（7203、118日）で **中央値1.467%・最大1.467%** の差が出た。
+   中央値と最大値が一致するのはランダムなノイズではなく**一定のオフセット**の証拠で、
+   トヨタの半期配当の水準と一致する。
+
+2. **株価レンジフィルタのずれ** — 配当調整済み価格は実際の約定価格ではないため、
+   300〜3,000円の判定が実態とずれる。
+
+**私たちに必要なのは「実際に約定する価格」**なので、分割のみ調整が正しい基準。
+"""
 
 _tz_cache_initialized = False
 
@@ -149,9 +181,16 @@ class YahooDataSource(BarDataSource):
         self,
         batch_size: int = DEFAULT_BATCH_SIZE,
         batch_interval_seconds: float = DEFAULT_BATCH_INTERVAL_SECONDS,
+        adjust_dividends: bool = DEFAULT_ADJUST_DIVIDENDS,
     ) -> None:
+        """
+        Args:
+            adjust_dividends: 配当調整を行うか。**既定は False**（§``DEFAULT_ADJUST_DIVIDENDS``）。
+                J-Quants の ``AdjC`` と基準を揃えるため。
+        """
         self._batch_size = batch_size
         self._batch_interval = batch_interval_seconds
+        self._adjust_dividends = adjust_dividends
 
     @property
     def name(self) -> str:
@@ -257,9 +296,13 @@ class YahooDataSource(BarDataSource):
     ) -> Any | None:
         """yfinance を呼ぶ。空の DataFrame なら ``None`` を返す。
 
-        ``auto_adjust=True`` を**必ず**渡す。指定しないと株式分割の前後で価格が
-        不連続になり、ATR% や売買代金の計算が壊れる。架空の急騰・暴落が
-        シグナルとして誤検出される。**引数で無効化できないようにしている。**
+        ``auto_adjust`` は**分割と配当の両方**を調整する。
+        分割調整は必須（無効だと分割前後で価格が不連続になり、ATR% や売買代金が
+        壊れて架空の急騰を誤検出する）が、**配当調整は入れてはならない**
+        （``DEFAULT_ADJUST_DIVIDENDS`` の説明を参照）。
+
+        ``auto_adjust=False`` のとき ``Close`` は分割調整済み・配当未調整、
+        ``Adj Close`` が配当も調整した値になる。前者を使う。
         """
         import yfinance as yf
 
@@ -270,7 +313,7 @@ class YahooDataSource(BarDataSource):
                 interval=interval,
                 start=start.isoformat(),
                 end=end.isoformat(),
-                auto_adjust=True,  # 分割調整。無効化してはならない
+                auto_adjust=self._adjust_dividends,
                 progress=False,
                 group_by="ticker",
                 threads=False,  # tzキャッシュの競合を避ける

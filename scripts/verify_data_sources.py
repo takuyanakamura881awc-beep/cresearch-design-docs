@@ -70,14 +70,23 @@ def check_credentials() -> str | None:
     return creds.jquants_api_key
 
 
-def probe_jquants(api_key: str) -> None:
+def make_jquants(api_key: str) -> JQuantsDataSource:
+    """**スクリプト全体で1つだけ作る。**
+
+    以前は関数ごとに作り直していたため、インスタンスごとに別のレートリミッタを
+    持ち「自分はまだ1回も呼んでいない」と誤認して一斉に叩き、429 で弾かれた
+    （突合検証の2銘柄目以降が失敗した原因）。
+    """
+    return JQuantsDataSource(api_key, requests_per_minute=FREE_PLAN_REQUESTS_PER_MINUTE)
+
+
+def probe_jquants(source: JQuantsDataSource) -> None:
     """疎通を単独で確認する。**失敗理由をそのまま表示する。**
 
     以前は全ての失敗を同一視していたため、401（認証）と 404（パス誤り）と
     空応答（遅延）が区別できず、誤った案内を出した。実際の原因は V1 の旧パスだった。
     """
     hr("2. J-Quants — 疎通確認")
-    source = JQuantsDataSource(api_key)
     probe = date.today() - timedelta(days=FREE_PLAN_DELAY_DAYS + 7)
 
     print(f"  エンドポイント: {ENDPOINT_DAILY_BARS}")
@@ -110,15 +119,13 @@ def _dump_record_keys(payload: dict[str, object], label: str) -> None:
     print(f"  ※ {label}のレコードが空だった（配列にデータなし）")
 
 
-def check_jquants(api_key: str) -> date | None:
+def check_jquants(source: JQuantsDataSource) -> date | None:
     """Free プランの実際のデータ終端日を調べる。
 
     Returns:
         取得できた最新の営業日。失敗なら None。
     """
     hr("3. J-Quants — 実際のデータ終端日")
-    source = JQuantsDataSource(api_key, requests_per_minute=FREE_PLAN_REQUESTS_PER_MINUTE)
-
     expected = date.today() - timedelta(days=FREE_PLAN_DELAY_DAYS)
     print(f"  想定終端日（12週=84日遅延）: {expected}")
     print("  実測中（直近から遡って最初に取れる営業日を探す）...")
@@ -146,9 +153,8 @@ def check_jquants(api_key: str) -> date | None:
     return None
 
 
-def check_jquants_symbols(api_key: str, as_of: date) -> None:
+def check_jquants_symbols(source: JQuantsDataSource, as_of: date) -> None:
     hr("4. J-Quants — 日付指定の上場銘柄一覧（サバイバーシップ回避の要）")
-    source = JQuantsDataSource(api_key)
     try:
         raw = source.get_raw(ENDPOINT_MASTER, {"date": as_of.isoformat()})
         _dump_record_keys(raw, "銘柄一覧")
@@ -160,7 +166,20 @@ def check_jquants_symbols(api_key: str, as_of: date) -> None:
         print("  NG: 空だった")
         return
     print(f"  OK: {as_of} 時点で {len(symbols)}銘柄")
-    print(f"  例: {', '.join(f'{s.code}({s.name})' for s in symbols[:3])}")
+    for sym in symbols[:3]:
+        print(
+            f"    {sym.code} {sym.name} / 市場={sym.market}"
+            f" / 信用={sym.margin_type} / 業種={sym.sector}"
+        )
+
+    # ユニバース構築のフィルタが代理指標なしで実装できるかを確認する
+    prime = [s for s in symbols if s.market == "プライム"]
+    loanable = [s for s in symbols if s.margin_type == "貸借"]
+    both = [s for s in symbols if s.market == "プライム" and s.margin_type == "貸借"]
+    print()
+    print(f"  プライム            : {len(prime)}銘柄  （フィルタA）")
+    print(f"  貸借銘柄（売建可）  : {len(loanable)}銘柄  （フィルタD）")
+    print(f"  両方を満たす        : {len(both)}銘柄  ← Layer 1 の出発点")
 
 
 def check_yahoo_lookback() -> dict[str, int]:
@@ -258,13 +277,23 @@ def check_gap(jquants_end: date | None, yahoo_5m_days: int) -> None:
         print(f"  → {-gap}日ぶん重なっている。J-Quants の日足だけで賄える")
 
 
-def compare_daily(api_key: str, jquants_end: date | None) -> None:
-    """J-Quants と yfinance の日足を突き合わせ、乖離率を出す。
+def compare_daily(source: JQuantsDataSource, jquants_end: date | None) -> None:
+    """J-Quants と yfinance の日足を突き合わせ、**調整基準の違いを切り分ける**。
 
-    **Light（1,650円/月）へ課金すべきかの判断材料。**
-    yfinance の日足が信用できるなら Free のままでよい。
+    前回の実測で 7203 の乖離が「中央値1.467% / 最大1.467%」と一致した。
+    中央値と最大値が同じなのはランダムなノイズではなく**一定のオフセット**の証拠で、
+    配当調整の有無が原因と考えられる（yfinance の auto_adjust は配当も調整する）。
+
+    ここでは3通りを並べて、どれが J-Quants の AdjC と一致するかを実データで確定させる:
+
+    - yfinance 配当調整なし（既定。分割のみ調整）← これが一致するはず
+    - yfinance 配当調整あり（auto_adjust=True）
+    - J-Quants の生値 C（無調整）
+
+    **Light（1,650円/月）へ課金すべきかの判断は、この切り分けの後で行う。**
+    基準の違いによる差を「品質の差」と誤認して課金しない。
     """
-    hr("7. 日足の突合検証 — J-Quants vs yfinance（課金判断の材料）")
+    hr("7. 日足の突合検証 — 調整基準の切り分け")
 
     if jquants_end is None:
         print("  判定不能（J-Quants のデータ終端日が取れていない）")
@@ -272,40 +301,59 @@ def compare_daily(api_key: str, jquants_end: date | None) -> None:
 
     end = jquants_end
     start = end - timedelta(days=180)
-    jq = JQuantsDataSource(api_key)
-    yh = YahooDataSource()
+    symbol = PROBE_SYMBOLS[0]  # レート制限を使い切らないよう1銘柄に絞る
 
-    for symbol in PROBE_SYMBOLS:
+    try:
+        jq_bars = source.get_bars(symbol, "1d", start, end)
+    except DataSourceError as exc:
+        print(f"  {symbol}: J-Quants 取得失敗 — {exc}")
+        return
+
+    jq_adj = {b.timestamp.date(): b.close for b in jq_bars}
+
+    variants: list[tuple[str, dict[date, float]]] = []
+    for label, adjust in (("配当調整なし", False), ("配当調整あり", True)):
         try:
-            jq_bars = jq.get_bars(symbol, "1d", start, end)
-            yh_bars = yh.get_bars(symbol, "1d", start, end)
+            yh_bars = YahooDataSource(adjust_dividends=adjust).get_bars(
+                symbol, "1d", start, end
+            )
         except DataSourceError as exc:
-            print(f"  {symbol}: 取得失敗 — {exc}")
+            print(f"  yfinance({label}): 取得失敗 — {exc}")
             continue
+        variants.append((label, {b.timestamp.date(): b.close for b in yh_bars}))
 
-        jq_map = {b.timestamp.date(): b.close for b in jq_bars}
-        yh_map = {b.timestamp.date(): b.close for b in yh_bars}
-        common = sorted(set(jq_map) & set(yh_map))
-        if not common:
-            print(f"  {symbol}: 共通する日付がない（比較不能）")
-            continue
-
-        diffs = [abs(jq_map[d] - yh_map[d]) / jq_map[d] for d in common if jq_map[d]]
-        diffs.sort()
-        worst = max(diffs)
-        median = diffs[len(diffs) // 2]
-        over_1pct = sum(1 for d in diffs if d > 0.01)
-
-        print(
-            f"  {symbol}: 共通{len(common)}日  "
-            f"中央値 {median * 100:.3f}%  最大 {worst * 100:.3f}%  "
-            f"1%超 {over_1pct}日"
-        )
+    print(f"  銘柄: {symbol}  期間: {start} 〜 {end}")
+    print()
+    for label, yh_map in variants:
+        _report_deviation(f"J-Quants AdjC vs yfinance {label}", jq_adj, yh_map)
 
     print()
-    print("  【判断の目安】")
-    print("   中央値が 0.01% 未満・1%超がゼロ → yfinance の日足は信用できる。Free のままでよい")
-    print("   1%超が散発する → 分割調整のズレの可能性。Light（1,650円/月）を検討")
+    print("  【読み方】")
+    print("   配当調整なしの乖離が十分小さい → 基準が揃った。Free のままでよい")
+    print("   どちらも乖離が大きい → 分割調整そのものがずれている。Light を検討")
+
+
+def _report_deviation(
+    label: str, base: dict[date, float], other: dict[date, float]
+) -> None:
+    """2系列の乖離率を要約する。"""
+    common = sorted(set(base) & set(other))
+    if not common:
+        print(f"  {label}: 共通する日付がない（比較不能）")
+        return
+
+    diffs = sorted(abs(base[d] - other[d]) / base[d] for d in common if base[d])
+    if not diffs:
+        print(f"  {label}: 比較可能な値がない")
+        return
+
+    median = diffs[len(diffs) // 2]
+    over_1pct = sum(1 for d in diffs if d > 0.01)
+    print(
+        f"  {label}:\n"
+        f"    共通{len(common)}日  中央値 {median * 100:.4f}%  "
+        f"最大 {diffs[-1] * 100:.4f}%  1%超 {over_1pct}日"
+    )
 
 
 def check_yahoo_rate_limit() -> None:
@@ -341,16 +389,19 @@ def main() -> int:
         print("\n認証情報がないため中断する。.env を設定すること")
         return 1
 
+    # レートリミッタを共有するため、スクリプト全体で1つだけ作る
+    jq = make_jquants(api_key)
+
     try:
-        probe_jquants(api_key)
+        probe_jquants(jq)
     except Exception:  # noqa: BLE001 - 実測スクリプトなので握らず全部見せる
         traceback.print_exc()
 
     jquants_end: date | None = None
     try:
-        jquants_end = check_jquants(api_key)
+        jquants_end = check_jquants(jq)
         if jquants_end is not None:
-            check_jquants_symbols(api_key, jquants_end)
+            check_jquants_symbols(jq, jquants_end)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
 
@@ -365,9 +416,9 @@ def main() -> int:
     except Exception:  # noqa: BLE001
         traceback.print_exc()
 
-    if api_key and jquants_end:
+    if jquants_end:
         try:
-            compare_daily(api_key, jquants_end)
+            compare_daily(jq, jquants_end)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
