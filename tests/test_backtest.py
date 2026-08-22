@@ -7,18 +7,23 @@ backtest-validator は、注意で防いでいるだけの実装を不合格と�
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 
 import pytest
 
+from autotrader.data.calendar import TradingCalendar
 from autotrader.engine.backtest import (
     STAGE_A_SLIPPAGE_BPS,
+    BacktestConfig,
     BacktestResult,
     CostModel,
     PointInTimeView,
-    Trade,
+    run,
+    walk_forward,
 )
-from autotrader.types import Bar, Side
+from autotrader.strategy.base import Strategy
+from autotrader.types import Bar, Position, Side, Signal, Trade
 
 
 def _bar(code: str, minute: int, close: float = 1000.0) -> Bar:
@@ -181,3 +186,250 @@ class TestBacktestResult:
             [500_000.0], [], initial_cash=500_000.0, rejected_by_leverage=7
         )
         assert result.rejected_by_leverage == 7
+
+
+# ---------------------------------------------------------------------------
+# run() のエンドツーエンド
+# ---------------------------------------------------------------------------
+
+
+class _BuyOnceStrategy(Strategy):
+    """最初に見えたバーで1銘柄だけロングし、あとは放置する検証用の戦略。
+
+    手仕舞いを一切要求しないので、**当日クローズが戦略の判断と独立に
+    走ることの確認**に使える。
+    """
+
+    def __init__(self, symbol: str = "7203", stop_price: float | None = None) -> None:
+        self.symbol = symbol
+        self.stop_price = stop_price
+        self.seen_bar_counts: list[int] = []
+
+    def generate(
+        self,
+        now: datetime,
+        bars: dict[str, tuple[Bar, ...]],
+        positions: tuple[Position, ...],
+    ) -> tuple[Signal, ...]:
+        self.seen_bar_counts.append(len(bars.get(self.symbol, ())))
+        if positions or not bars.get(self.symbol):
+            return ()
+        return (
+            Signal(
+                symbol=self.symbol,
+                side=Side.LONG,
+                strength=1.0,
+                reason="test",
+                stop_price=self.stop_price,
+            ),
+        )
+
+    def should_close(
+        self, now: datetime, position: Position, bars: tuple[Bar, ...]
+    ) -> tuple[bool, str]:
+        return False, "hold"
+
+
+def _session(day: int, prices: list[float], symbol: str = "7203") -> list[Bar]:
+    """9:00 から5分刻みのバー列を1日ぶん作る。"""
+    return [
+        Bar(
+            symbol=symbol,
+            timestamp=datetime(2026, 6, day, 9, 0) + timedelta(minutes=5 * i),
+            open=p,
+            high=p * 1.01,
+            low=p * 0.99,
+            close=p,
+            volume=10_000,
+            turnover=2_000_000_000.0,
+        )
+        for i, p in enumerate(prices)
+    ]
+
+
+class TestRun:
+    def test_バーがなければ空の結果を返す(self) -> None:
+        result = run(_BuyOnceStrategy(), {})
+        assert result.n_trades == 0
+        assert result.equity_curve == ()
+
+    def test_建てて当日中に閉じる(self) -> None:
+        """**デイトレ信用は当日決済必須。** 持ち越すと1注文2,200円。"""
+        bars = {"7203": tuple(_session(1, [1000.0] * 4))}
+        config = BacktestConfig(close_time=time(9, 15))
+        result = run(_BuyOnceStrategy(), bars, config)
+
+        assert result.n_trades == 1
+        assert result.trades[0].exit_reason == "close_all"
+        assert result.trades[0].exit_time.time() == time(9, 15)
+
+    def test_当日クローズは戦略の判断より優先する(self) -> None:
+        """戦略が should_close で False を返し続けても関係なく閉じる。"""
+        strategy = _BuyOnceStrategy()
+        bars = {"7203": tuple(_session(1, [1000.0] * 4))}
+        result = run(strategy, bars, BacktestConfig(close_time=time(9, 10)))
+        assert result.n_trades == 1
+
+    def test_日をまたいで建玉を持ち越さない(self) -> None:
+        bars = {"7203": tuple(_session(1, [1000.0] * 4) + _session(2, [1000.0] * 4))}
+        result = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(9, 15)))
+        # 各日で1往復
+        assert result.n_trades == 2
+        assert {t.exit_time.day for t in result.trades} == {1, 2}
+
+    def test_値動きがなければ必ず負ける(self) -> None:
+        """往復コストが引かれている証拠。ここが正なら約定モデルが甘い。"""
+        bars = {"7203": tuple(_session(1, [1000.0] * 4))}
+        result = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(9, 15)))
+        assert result.trades[0].pnl < 0
+        assert result.total_return < 0
+
+    def test_エクイティカーブは日次で出る(self) -> None:
+        """**バーごとではなく日次。**
+
+        シャープの年率換算（252営業日）と単位を揃える。バーごとに記録すると
+        5分足では約54倍に膨らんだシャープが出る。
+        """
+        bars = {"7203": tuple(_session(1, [1000.0] * 4) + _session(2, [1000.0] * 4))}
+        result = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(9, 15)))
+        assert len(result.equity_curve) == 2
+
+    def test_ストップのないショートは無視する(self) -> None:
+        """安全装置 #3。シグナルが来ても建てない。"""
+
+        class ShortStrategy(_BuyOnceStrategy):
+            def generate(
+                self,
+                now: datetime,
+                bars: dict[str, tuple[Bar, ...]],
+                positions: tuple[Position, ...],
+            ) -> tuple[Signal, ...]:
+                if positions or not bars.get(self.symbol):
+                    return ()
+                return (Signal(self.symbol, Side.SHORT, 1.0, "test"),)
+
+        bars = {"7203": tuple(_session(1, [1000.0] * 4))}
+        result = run(ShortStrategy(), bars, BacktestConfig(close_time=time(9, 15)))
+        assert result.n_trades == 0
+
+    def test_1単元も買えない株価では建てない(self) -> None:
+        """25%上限（12.5万円）を超える1単元は建てられない。
+
+        **エラーにせず見送る。** 選定とサイジングの食い違いは
+        ユニバース側で直すべきで、ここで例外にしても直らない。
+        """
+        bars = {"7203": tuple(_session(1, [2000.0] * 4))}  # 1単元20万円
+        result = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(9, 15)))
+        assert result.n_trades == 0
+
+
+class TestRunLookahead:
+    """**ルックアヘッドは構造で防ぐ。** 起こせないことを確認する。"""
+
+    def test_戦略に渡るバーは常に確定済み(self) -> None:
+        """時刻 t で見えるのは t より前に閉じたバーだけ。
+
+        1本目の時刻では0本、2本目では1本…と増える。
+        同じ本数のまま先の値が見えていたら、判断と約定が同じバーになっている。
+        """
+        strategy = _BuyOnceStrategy()
+        bars = {"7203": tuple(_session(1, [1000.0] * 4))}
+        run(strategy, bars, BacktestConfig(close_time=time(23, 0)))
+        assert strategy.seen_bar_counts == [0, 1, 2, 3]
+
+    def test_将来のバーを足しても過去区間の成績が変わらない(self) -> None:
+        """**同じ期間の結果は、その後に何が起きたかに依存してはならない。**
+
+        `test_selector.py` の当日バー混入テストと同じ構造の担保。
+        """
+        day1 = _session(1, [1000.0, 1010.0, 1020.0, 1030.0])
+        short = {"7203": tuple(day1)}
+        # 2日目に大暴落を足す。1日目の成績が変わるなら未来が漏れている
+        crash = _session(2, [1000.0, 500.0, 250.0, 100.0])
+        long = {"7203": tuple(day1 + crash)}
+
+        config = BacktestConfig(close_time=time(9, 15))
+        a = run(_BuyOnceStrategy(), short, config)
+        b = run(_BuyOnceStrategy(), long, config)
+
+        assert a.n_trades == 1
+        assert b.n_trades == 2
+        assert a.trades[0] == b.trades[0]
+        assert a.equity_curve == b.equity_curve[: len(a.equity_curve)]
+        assert a.total_return == b.equity_curve[0] / float(a.initial_cash) - 1
+
+
+class TestWalkForward:
+    def _bars_and_calendar(
+        self, days: int
+    ) -> tuple[dict[str, tuple[Bar, ...]], TradingCalendar]:
+        series: list[Bar] = []
+        for d in range(1, days + 1):
+            series.extend(_session(d, [1000.0] * 4))
+        calendar = TradingCalendar.from_dates(
+            [date(2026, 6, d) for d in range(1, days + 1)]
+        )
+        return {"7203": tuple(series)}, calendar
+
+    def test_窓ごとに結果を返す(self) -> None:
+        bars, calendar = self._bars_and_calendar(10)
+        results = walk_forward(
+            _BuyOnceStrategy(),
+            bars,
+            calendar,
+            date(2026, 6, 1),
+            date(2026, 6, 10),
+            train_days=4,
+            test_days=3,
+            config=BacktestConfig(close_time=time(9, 15)),
+        )
+        # 営業日10 − 学習4 = 6 → 3日窓が2つ
+        assert len(results) == 2
+        assert all(r.n_trades == 3 for r in results)
+
+    def test_学習期間の成績は返さない(self) -> None:
+        """**in-sample の成績は成績として数えない。**
+
+        取り出す口を用意すると、良く見えるほうを報告してしまう。
+        """
+        bars, calendar = self._bars_and_calendar(10)
+        results = walk_forward(
+            _BuyOnceStrategy(), bars, calendar,
+            date(2026, 6, 1), date(2026, 6, 10),
+            train_days=7, test_days=3,
+            config=BacktestConfig(close_time=time(9, 15)),
+        )
+        assert len(results) == 1
+        # 6/8, 6/9, 6/10 のみ（学習期間の 6/1〜6/7 は含まれない）
+        assert {t.exit_time.day for t in results[0].trades} == {8, 9, 10}
+
+    def test_窓が取れなければ空を返す(self) -> None:
+        bars, calendar = self._bars_and_calendar(5)
+        results = walk_forward(
+            _BuyOnceStrategy(), bars, calendar,
+            date(2026, 6, 1), date(2026, 6, 5),
+            train_days=10, test_days=3,
+        )
+        assert results == ()
+
+    def test_不正な期間を拒否する(self) -> None:
+        bars, calendar = self._bars_and_calendar(5)
+        with pytest.raises(ValueError):
+            walk_forward(
+                _BuyOnceStrategy(), bars, calendar,
+                date(2026, 6, 1), date(2026, 6, 5), train_days=0,
+            )
+
+
+class TestBacktestConfig:
+    def test_既定はStageA(self) -> None:
+        config = BacktestConfig()
+        assert config.slippage_bps == STAGE_A_SLIPPAGE_BPS
+        assert config.close_time == time(14, 50)
+        assert config.max_weight_per_symbol == 0.25
+
+    def test_不正な設定を拒否する(self) -> None:
+        with pytest.raises(ValueError):
+            BacktestConfig(initial_cash=Decimal(0))
+        with pytest.raises(ValueError):
+            BacktestConfig(max_concurrent=0)

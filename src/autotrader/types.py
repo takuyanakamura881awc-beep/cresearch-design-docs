@@ -250,6 +250,44 @@ class Signal:
 
 
 @dataclass(frozen=True)
+class Trade:
+    """約定して手仕舞われた1トレード。
+
+    **コスト込みの約定価格を保持する。** 建値と手仕舞い値を「理論価格」で
+    持ってしまうと、集計のどこかでコストを引き忘れても気づけない。
+    ここに入る時点で既にスリッページを含んでいる。
+    """
+
+    symbol: str
+    side: Side
+    quantity: int
+    entry_time: datetime
+    entry_price: float
+    exit_time: datetime
+    exit_price: float
+    exit_reason: str
+    """手仕舞いの理由。監査とデバッグのため必須（例: "stop" / "close_all"）。"""
+
+    @property
+    def pnl(self) -> float:
+        """損益（円）。ショートは方向を反転する。"""
+        diff = self.exit_price - self.entry_price
+        if self.side is Side.SHORT:
+            diff = -diff
+        return diff * self.quantity
+
+    @property
+    def notional(self) -> float:
+        """建玉金額（円）。"""
+        return self.entry_price * self.quantity
+
+    @property
+    def return_pct(self) -> float:
+        """建玉金額に対する損益率。"""
+        return self.pnl / self.notional if self.notional else 0.0
+
+
+@dataclass(frozen=True)
 class UniverseEntry:
     """ユニバースに含まれる銘柄と、その日のスコア。
 

@@ -9,9 +9,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
 
-from autotrader.types import PriceTier
+from autotrader.types import Bar
 
 
 def calc_quantity(
@@ -58,15 +59,49 @@ def max_affordable_price(
     return capital * Decimal(str(max_weight_per_symbol)) / lot_size
 
 
-def target_notional_for_tier(
+def target_notional(
     capital: Decimal,
-    tier: PriceTier,
     max_weight_per_symbol: float = 0.25,
 ) -> Decimal:
-    """株価レンジの枠に応じた目標建玉額を返す。
+    """1銘柄あたりの目標建玉額。
 
-    PREMIUM は1単元が資金の40〜60%を占めるため、
-    ``max_weight_per_symbol`` の制約に抵触しやすい。
-    抵触する場合は採用しない（docs/03-universe.md §2）。
+    **枠（PriceTier）で額を変えない。** 当初の設計では
+    プレミアム枠（2,000〜3,000円）に別扱いを与える想定だったが、
+    実測の結果、上限25%のもとで買える最大株価は1,250円と分かり、
+    **どの銘柄も同じ上限の内側に収まる**ようになった
+    （docs/03-universe.md §2）。枠の役割はスコアのハードル
+    （`universe.selector`）に一本化してある。
+
+    Args:
+        capital: 判定の基準額。**現金残高を渡すこと。**
+            `risk.leverage.check` も現金を基準にしているので、
+            base を揃えないとサイジングとレバレッジ判定が食い違う。
+        max_weight_per_symbol: 1銘柄あたりの上限比率（安全装置 #7）。
+
+    Returns:
+        目標建玉額（円）。実際の株数は `calc_quantity` が単元に丸める。
     """
-    raise NotImplementedError("Phase 2 で実装する")
+    if max_weight_per_symbol <= 0:
+        raise ValueError(f"上限比率は正の値である必要がある: {max_weight_per_symbol}")
+    if capital <= 0:
+        return Decimal(0)
+    return capital * Decimal(str(max_weight_per_symbol))
+
+
+def average_turnover_of(bars: Sequence[Bar], lookback_days: int = 20) -> Decimal | None:
+    """直近 N 本の平均売買代金。約定モデルの厳しさを決めるのに使う。
+
+    `universe.filters.average_turnover` と同じ計算だが、あちらは
+    ユニバース判定用に「本数が足りなければ ``None``」という厳しい規約を持つ。
+    こちらは**あるだけのバーで概算する** — 約定モデルは判定ではなく
+    見積もりで、本数不足を理由に見積もりを放棄すると
+    薄い銘柄が逆に安いコストで約定してしまう。
+
+    Returns:
+        平均売買代金。バーが1本もなければ ``None``。
+    """
+    if not bars:
+        return None
+    recent = bars[-lookback_days:]
+    total = sum((Decimal(str(b.effective_turnover)) for b in recent), Decimal(0))
+    return total / len(recent)
