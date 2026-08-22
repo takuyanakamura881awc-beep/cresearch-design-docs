@@ -27,7 +27,35 @@ def calc_quantity(
     Returns:
         発注株数。1単元も買えない場合は 0。
     """
-    raise NotImplementedError("Phase 2 で実装する")
+    if price <= 0:
+        raise ValueError(f"株価は正の値である必要がある: {price}")
+    if lot_size < 1:
+        raise ValueError(f"単元株数は1以上である必要がある: {lot_size}")
+    if target_notional <= 0:
+        return 0
+
+    lot_cost = Decimal(str(price)) * lot_size
+    lots = int(target_notional // lot_cost)
+    return lots * lot_size
+
+
+def max_affordable_price(
+    capital: Decimal,
+    max_weight_per_symbol: float = 0.25,
+    lot_size: int = 100,
+) -> Decimal:
+    """1単元が上限比率に収まる最大株価。
+
+    **50万円 × 25% ÷ 100株 = 1,250円。**
+    つまり1銘柄あたり総資産25%（docs/05-risk-management.md #7）を守る限り、
+    株価1,250円を超える銘柄は1単元すら建てられない。
+
+    ユニバースの株価レンジ上限（300〜3,000円）とこの上限は独立に決まっており、
+    **食い違うと「選定は通るがサイジングで0株になる」銘柄が生まれる。**
+    その状態は静かに機会を失うだけで、ログにも異常として出ない。
+    値をここで明示的に計算できるようにして、突き合わせを可能にしておく。
+    """
+    return capital * Decimal(str(max_weight_per_symbol)) / lot_size
 
 
 def target_notional_for_tier(
