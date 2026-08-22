@@ -171,17 +171,17 @@ pytest
 
 ## 現在のステータス
 
-**Phase 1（Stage A のデータ基盤）完了。**
+**Phase 1（Stage A のデータ基盤）完了。全項目を実機で実測済み。**
 
-実装済み: `data/base.py`（DataSource抽象化・フォールバック）、`data/jquants.py`、
-`data/yahoo.py`、`data/store.py`（TTLキャッシュ）、`config.py`、
-`scripts/verify_data_sources.py`。
+確定した値（詳細は `docs/09-data-sources.md` §0）:
 
-**次にやること: 実機で `python scripts/verify_data_sources.py` を実行する。**
-設計時の想定（yfinance 1分足7日/5分足60日、J-Quants Free 12週遅延）は
-公開仕様に基づく未検証の値。**実測結果を見てから Phase 2 に進む。**
-想定と食い違えば対応する定数を実測値に修正する。
+- **yfinance の分割調整は J-Quants と完全一致**（乖離 0.0000%）→ **Light に課金しない**
+- 配当調整は必ずオフ（`DEFAULT_ADJUST_DIVIDENDS = False`）
+- Free の購読範囲: 2024-05-31 〜 2026-05-31（遅延84日）
+- yfinance: 1m=7日 / 5m=58日 / 60m=728日
+- **Layer 1 の出発点: プライム × 貸借 = 1,483銘柄**
 
 次は **Phase 2（ユニバース構築 + バックテストエンジン）**。
+流動性と株価レンジで絞った結果が想定の100〜200銘柄に収まるかを実測する。
 
 工程と各 Phase の完了条件は `docs/00-overview.md` を参照。

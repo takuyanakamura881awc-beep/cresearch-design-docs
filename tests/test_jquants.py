@@ -10,13 +10,19 @@ from typing import Any
 
 import pytest
 
-from autotrader.data.base import DataSourceError, EmptyResponseError, RateLimitError
+from autotrader.data.base import (
+    DataSourceError,
+    EmptyResponseError,
+    RateLimitError,
+    SubscriptionRangeError,
+)
 from autotrader.data.jquants import (
     ENDPOINT_DAILY_BARS,
     ENDPOINT_MASTER,
     FREE_PLAN_DELAY_DAYS,
     JQuantsDataSource,
     RateLimiter,
+    parse_subscription_range,
 )
 
 
@@ -377,3 +383,89 @@ class TestBarConversion:
         )
         bars = _source().get_bars_for_date(date(2026, 6, 1))
         assert set(bars) == {"8306"}
+
+
+# 実際に返ってきた 400 のメッセージ（2026-08-23 に確認）。
+# 推測した形式ではなく実物をテストデータに使う。
+_REAL_400_BODY = (
+    '{"message": "Your subscription covers the following dates: '
+    "2024-05-31 ~ 2026-05-31. If you want more data, please check other plans:"
+    'https://jpx-jquants.com/#dataset"}'
+)
+
+
+class TestSubscriptionRange:
+    """契約範囲外の照会を減らす。
+
+    5件/分の制約下では、範囲外を叩き続けるのは予算の無駄。
+    Phase 2 の一括収集（2年分の営業日ループ）では特に効く。
+    """
+
+    def test_実際のメッセージから範囲を抽出できる(self) -> None:
+        covered = parse_subscription_range(_REAL_400_BODY)
+        assert covered == (date(2024, 5, 31), date(2026, 5, 31))
+
+    def test_形式が違えばNoneを返す(self) -> None:
+        """抽出できないことを許容する。分からなければ都度リクエストするだけ。"""
+        assert parse_subscription_range('{"message": "Bad Request"}') is None
+
+    def test_400で範囲を学習しSubscriptionRangeErrorになる(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install(monkeypatch, [_Response(_REAL_400_BODY, status_code=400)])
+        source = _source()
+
+        with pytest.raises(SubscriptionRangeError) as exc_info:
+            source.get_bars_for_date(date(2026, 6, 3))
+
+        assert exc_info.value.has_range
+        assert exc_info.value.covered_to == date(2026, 5, 31)
+        assert source.subscription_range == (date(2024, 5, 31), date(2026, 5, 31))
+
+    def test_学習後は範囲外をリクエストせず弾く(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """**送信前に弾くこと。** これが予算節約の本体。"""
+        fake = _install(monkeypatch, [_Response(_REAL_400_BODY, status_code=400)])
+        source = _source()
+
+        with pytest.raises(SubscriptionRangeError):
+            source.get_bars_for_date(date(2026, 6, 3))
+        assert len(fake.calls) == 1
+
+        # 2回目以降は範囲外と分かっているので送らない
+        for day in (date(2026, 6, 2), date(2026, 6, 1)):
+            with pytest.raises(SubscriptionRangeError):
+                source.get_bars_for_date(day)
+        assert len(fake.calls) == 1  # 増えていない
+
+    def test_範囲内なら通常どおり照会する(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = _install(
+            monkeypatch,
+            [
+                _Response(_REAL_400_BODY, status_code=400),
+                _Response({"data": [_quote("7203", "2026-05-29")]}),
+            ],
+        )
+        source = _source()
+        with pytest.raises(SubscriptionRangeError):
+            source.get_bars_for_date(date(2026, 6, 3))
+
+        bars = source.get_bars_for_date(date(2026, 5, 29))
+        assert "7203" in bars
+        assert len(fake.calls) == 2
+
+    def test_範囲未判明なら弾かない(self) -> None:
+        """叩いてみないと分からない状態では通す。"""
+        source = _source()
+        assert source.subscription_range is None
+        assert source.covers(date(2020, 1, 1))
+
+    def test_範囲を知らない形式の400は汎用エラーにする(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install(monkeypatch, [_Response('{"message": "Bad Request"}', status_code=400)])
+        source = _source()
+        with pytest.raises(DataSourceError) as exc_info:
+            source.get_bars_for_date(date(2026, 6, 3))
+        assert not isinstance(exc_info.value, SubscriptionRangeError)

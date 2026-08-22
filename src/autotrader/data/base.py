@@ -71,6 +71,37 @@ class RateLimitError(DataSourceError):
     """
 
 
+class SubscriptionRangeError(DataSourceError):
+    """契約プランがカバーしていない期間を要求した。
+
+    J-Quants は範囲外の日付に対し 400 とともに**実際の購読範囲を返す**::
+
+        {"message": "Your subscription covers the following dates:
+                     2024-05-31 ~ 2026-05-31. ..."}
+
+    この範囲を保持しておけば、以降は**リクエストを送る前に範囲外を弾ける**。
+    5件/分の制約下では、範囲外を叩き続けるのは予算の無駄。
+
+    推測した定数（`FREE_PLAN_DELAY_DAYS`）ではなく **API が返す実際の範囲**を
+    使えるため、プランを変更しても自動で追随する。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        covered_from: date | None = None,
+        covered_to: date | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.covered_from = covered_from
+        self.covered_to = covered_to
+
+    @property
+    def has_range(self) -> bool:
+        """範囲を抽出できたか。"""
+        return self.covered_from is not None and self.covered_to is not None
+
+
 class LookbackExceededError(DataSourceError):
     """データソースが遡れる期間を超えた指定がされた。
 

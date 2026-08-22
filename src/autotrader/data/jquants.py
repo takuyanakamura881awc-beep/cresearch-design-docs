@@ -44,6 +44,7 @@ yfinance はティッカー指定のAPIで市場の構成銘柄を列挙でき�
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import date, datetime
 from typing import Any
@@ -53,6 +54,7 @@ from autotrader.data.base import (
     DataSourceError,
     EmptyResponseError,
     RateLimitError,
+    SubscriptionRangeError,
 )
 from autotrader.types import Bar, Symbol
 
@@ -113,6 +115,38 @@ _FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     銘柄一覧  CoName CoNameEn Code Date Mkt MktNm Mrgn MrgnNm
               ProdCat S17 S17Nm S33 S33Nm ScaleCat
 """
+
+
+_SUBSCRIPTION_RANGE_RE = re.compile(
+    r"subscription covers the following dates:\s*"
+    r"(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+"""400 のメッセージから購読範囲を抜き出す。
+
+実際に返ってきた文字列（2026-08-23 に確認）::
+
+    Your subscription covers the following dates: 2024-05-31 ~ 2026-05-31.
+    If you want more data, please check other plans:https://jpx-jquants.com/#dataset
+"""
+
+
+def parse_subscription_range(message: str) -> tuple[date, date] | None:
+    """購読範囲を抽出する。抽出できなければ ``None``。
+
+    形式が変わっても壊れないよう、**抽出できないことを許容する**
+    （範囲が分からなければ従来どおり都度リクエストするだけ）。
+    """
+    match = _SUBSCRIPTION_RANGE_RE.search(message)
+    if match is None:
+        return None
+    try:
+        return (
+            date.fromisoformat(match.group(1)),
+            date.fromisoformat(match.group(2)),
+        )
+    except ValueError:
+        return None
 
 
 def _pick(record: dict[str, Any], field: str) -> Any:
@@ -190,6 +224,7 @@ class JQuantsDataSource(BarDataSource):
         self._limiter = RateLimiter(requests_per_minute)
         self._timeout = timeout_seconds
         self._max_rate_limit_retries = max_rate_limit_retries
+        self._subscription_range: tuple[date, date] | None = None
 
     @property
     def name(self) -> str:
@@ -199,6 +234,42 @@ class JQuantsDataSource(BarDataSource):
     def limiter_interval_seconds(self) -> float:
         """リクエスト間隔（秒）。診断スクリプトが所要時間を見積もるのに使う。"""
         return self._limiter.interval_seconds
+
+    @property
+    def subscription_range(self) -> tuple[date, date] | None:
+        """判明している購読範囲。まだ範囲外を叩いていなければ ``None``。
+
+        400 応答から自動で学習する。推測した定数ではなく**実際の範囲**なので、
+        プランを変更しても追随する。
+        """
+        return self._subscription_range
+
+    def covers(self, day: date) -> bool:
+        """その日付が購読範囲内か。
+
+        範囲が未判明なら ``True``（叩いてみないと分からない）。
+        """
+        if self._subscription_range is None:
+            return True
+        start, end = self._subscription_range
+        return start <= day <= end
+
+    def _ensure_covered(self, *days: date) -> None:
+        """範囲外なら**リクエストを送らずに**例外にする。
+
+        5件/分の制約下では、範囲外を叩き続けるのは予算の無駄。
+        Phase 2 の一括収集（2年分の営業日ループ）では特に効く。
+        """
+        if self._subscription_range is None:
+            return
+        start, end = self._subscription_range
+        for day in days:
+            if not (start <= day <= end):
+                raise SubscriptionRangeError(
+                    f"契約プランの範囲外（{start} 〜 {end}）: {day} は範囲外のため照会しない",
+                    covered_from=start,
+                    covered_to=end,
+                )
 
     def supports_interval(self, interval: str) -> bool:
         """日足のみ。**J-Quants に分足は存在しない。**"""
@@ -283,6 +354,18 @@ class JQuantsDataSource(BarDataSource):
                 f"J-Quants のレート制限に達した（429 / {url}）。"
                 f"現在の間隔: {self._limiter.interval_seconds:.1f}秒/件"
             )
+        if response.status_code == 400:
+            covered = parse_subscription_range(response.text)
+            if covered is not None:
+                self._subscription_range = covered
+                raise SubscriptionRangeError(
+                    f"契約プランの範囲外（{covered[0]} 〜 {covered[1]}）: {url}",
+                    covered_from=covered[0],
+                    covered_to=covered[1],
+                )
+            raise DataSourceError(
+                f"J-Quants が 400 を返した（{url}）: {response.text[:300]}"
+            )
         if response.status_code >= 400:
             raise DataSourceError(
                 f"J-Quants が {response.status_code} を返した（{url}）: "
@@ -333,6 +416,7 @@ class JQuantsDataSource(BarDataSource):
         **``as_of`` を必ず渡す。** 現在の一覧を過去に適用してはならない
         （サバイバーシップバイアス。docs/03-universe.md §4.2）。
         """
+        self._ensure_covered(as_of)
         items = self._get_paginated(ENDPOINT_MASTER, {"date": as_of.isoformat()})
         if not items:
             raise EmptyResponseError(
@@ -379,6 +463,7 @@ class JQuantsDataSource(BarDataSource):
                 f"J-Quants は日足のみ対応（指定: {interval}）。分足は存在しない"
             )
 
+        self._ensure_covered(start, end)
         items = self._get_paginated(
             ENDPOINT_DAILY_BARS,
             {"code": symbol, "from": start.isoformat(), "to": end.isoformat()},
@@ -408,6 +493,7 @@ class JQuantsDataSource(BarDataSource):
         Returns:
             銘柄コード → その日のバー（1本）。
         """
+        self._ensure_covered(trade_date)
         items = self._get_paginated(
             ENDPOINT_DAILY_BARS, {"date": trade_date.isoformat()}
         )

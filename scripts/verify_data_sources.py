@@ -35,7 +35,12 @@ import traceback
 from datetime import date, timedelta
 
 from autotrader.config import load_credentials, mask
-from autotrader.data.base import DataSourceError, EmptyResponseError, RateLimitError
+from autotrader.data.base import (
+    DataSourceError,
+    EmptyResponseError,
+    RateLimitError,
+    SubscriptionRangeError,
+)
 from autotrader.data.jquants import (
     ENDPOINT_DAILY_BARS,
     ENDPOINT_MASTER,
@@ -50,6 +55,25 @@ PROBE_SYMBOLS = ("7203", "8306", "9432")
 
 トヨタ・三菱UFJ・NTT。データが取れないなら銘柄側ではなくAPI側の問題と判断できる。
 """
+
+
+_WEEKDAYS = "月火水木金土日"
+
+
+def fmt_date(d: date) -> str:
+    """曜日つきで日付を表示する（``2026-05-29(金)``）。
+
+    土日が絡む測定値は「ずれた」ように見えるため、曜日を明示して
+    誤解を防ぐ。実測の遅延が86日と出たのは 5/31 が日曜だったため。
+    """
+    return f"{d.isoformat()}({_WEEKDAYS[d.weekday()]})"
+
+
+def last_weekday(d: date) -> date:
+    """その日が土日なら直前の平日にずらす。"""
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
 
 
 def hr(title: str) -> None:
@@ -146,7 +170,7 @@ def check_jquants(source: JQuantsDataSource) -> date | None:
     """
     hr("3. J-Quants — 実際のデータ終端日")
     expected = date.today() - timedelta(days=FREE_PLAN_DELAY_DAYS)
-    print(f"  想定終端日（12週=84日遅延）: {expected}")
+    print(f"  想定終端日（12週=84日遅延）: {fmt_date(expected)}")
     print("  実測中（想定日から遡り、土日は飛ばす）...")
 
     probes = 0
@@ -160,6 +184,12 @@ def check_jquants(source: JQuantsDataSource) -> date | None:
             bars = source.get_bars(
                 PROBE_SYMBOLS[0], "1d", probe, probe
             )
+        except SubscriptionRangeError as exc:
+            # 契約範囲外。以降は送信前に弾かれるので照会は増えない
+            if exc.has_range:
+                print(f"  契約範囲: {fmt_date(exc.covered_from)} 〜 {fmt_date(exc.covered_to)}")
+                print("    （API が返した実際の範囲。以降は範囲外を照会しない）")
+            continue
         except RateLimitError as exc:
             # データ不在と区別する。ここで continue すると測定が嘘になる
             print(f"  測定不能: レート制限に達した（{probes}件目の照会で中断）")
@@ -174,10 +204,20 @@ def check_jquants(source: JQuantsDataSource) -> date | None:
 
         if bars:
             delay = (date.today() - probe).days
-            print(f"  OK: {probe} のデータを取得（{probes}件の照会）")
-            print(f"  実測の遅延: {delay}日（想定 {FREE_PLAN_DELAY_DAYS}日）")
-            if abs(delay - FREE_PLAN_DELAY_DAYS) > 7:
-                print("  ※ 想定と1週間以上ずれている。FREE_PLAN_DELAY_DAYS の見直しを検討")
+            print(f"  OK: {fmt_date(probe)} のデータを取得（{probes}件の照会）")
+
+            covered = source.subscription_range
+            if covered is not None:
+                print(f"  契約範囲の終端: {fmt_date(covered[1])}")
+                spec_delay = (date.today() - covered[1]).days
+                print(f"  仕様上の遅延  : {spec_delay}日（想定 {FREE_PLAN_DELAY_DAYS}日）")
+                print(f"  最終営業日    : {fmt_date(probe)} → 実測 {delay}日")
+                if covered[1].weekday() >= 5:
+                    print("    ※ 契約範囲の終端が土日のため、実測は仕様より数日大きく出る")
+            else:
+                print(f"  実測の遅延: {delay}日（想定 {FREE_PLAN_DELAY_DAYS}日）")
+                if abs(delay - FREE_PLAN_DELAY_DAYS) > 7:
+                    print("  ※ 想定と1週間以上ずれている。定数の見直しを検討")
             return probe
 
     print(f"  NG: {probes}件照会したがデータを取得できなかった")
@@ -190,6 +230,9 @@ def check_jquants_symbols(source: JQuantsDataSource, as_of: date) -> None:
         raw = source.get_raw(ENDPOINT_MASTER, {"date": as_of.isoformat()})
         _dump_record_keys(raw, "銘柄一覧")
         symbols = source.list_symbols(as_of)
+    except SubscriptionRangeError as exc:
+        print(f"  NG: {exc}")
+        return
     except RateLimitError as exc:
         print(f"  測定不能: レート制限 — {exc}")
         print("    → 銘柄一覧は全銘柄を返すためページングでリクエストを消費する")
@@ -248,11 +291,16 @@ def check_yahoo_lookback() -> dict[str, int]:
 
 
 def _try_fetch(source: YahooDataSource, interval: str, days: int) -> bool:
-    """指定日数ぶん遡って取得できるか試す。"""
-    today = date.today()
+    """指定日数ぶん遡って取得できるか試す。
+
+    **終端を直前の平日に寄せる。** 土日に実行すると、短い期間の照会が
+    market closed で空振りし、「1日は失敗」のような紛らわしい結果になる
+    （実際に日曜の実行で 1m の測定がそうなった）。
+    """
+    end = last_weekday(date.today())
     try:
         bars = source.get_bars_batch(
-            (PROBE_SYMBOLS[0],), interval, today - timedelta(days=days), today
+            (PROBE_SYMBOLS[0],), interval, end - timedelta(days=days), end
         )
     except DataSourceError:
         return False
@@ -298,8 +346,8 @@ def check_gap(jquants_end: date | None, yahoo_5m_days: int) -> None:
         return
 
     yahoo_5m_start = date.today() - timedelta(days=yahoo_5m_days or 60)
-    print(f"  J-Quants 日足の終端 : {jquants_end}")
-    print(f"  yfinance 5分足の始端: {yahoo_5m_start}")
+    print(f"  J-Quants 日足の終端 : {fmt_date(jquants_end)}")
+    print(f"  yfinance 5分足の始端: {fmt_date(yahoo_5m_start)}")
 
     gap = (yahoo_5m_start - jquants_end).days
     if gap > 0:
