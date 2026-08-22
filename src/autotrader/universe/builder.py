@@ -1,32 +1,151 @@
 """Layer 1: ユニバース構築（日次バッチ、寄り前 07:00 実行）。
 
-東証プライム約1,600銘柄から、取引対象になりうる母集団を機械的に絞る。
-想定通過数は100〜200銘柄（Phase 2 で実データ検証する）。
+東証プライムから、取引対象になりうる母集団を機械的に絞る。
 
-【重要】サバイバーシップバイアスの回避（docs/03-universe.md §4.2）
+実測（2026-08-23）の出発点::
+
+    全上場 4,451
+      → プライム              1,565   （フィルタA）
+      → かつ 貸借銘柄         1,483   （フィルタD）← ここから
+      → かつ 流動性・株価帯      ?     （フィルタB・C）Phase 2 で実測
+
+**サバイバーシップバイアスの回避（docs/03-universe.md §4.2）**
 
 「**現在**プライムに上場している銘柄」で過去を検証すると、
 上場廃止・降格した銘柄が母集団から抜け落ち、成績が構造的に過大評価される。
 
-``as_of`` を受け取り、**その時点の上場銘柄一覧**（J-Quants の日付指定取得）から
-ユニバースを再構成すること。現在の銘柄一覧を過去に適用してはならない。
+``as_of`` を受け取り、**その時点の上場銘柄一覧**（J-Quants の
+``equities/master`` は日付指定に対応）からユニバースを再構成する。
+現在の銘柄一覧を過去に適用してはならない。
 """
 
 from __future__ import annotations
 
-from datetime import date
+import logging
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import date, timedelta
 
-from autotrader.types import Symbol
+from autotrader.data.base import BarDataSource
+from autotrader.types import Bar, Symbol
+from autotrader.universe.filters import (
+    FilterConfig,
+    RejectReason,
+    ScreenResult,
+    screen,
+)
+
+logger = logging.getLogger(__name__)
 
 
-def build(as_of: date) -> tuple[Symbol, ...]:
+@dataclass(frozen=True)
+class UniverseSnapshot:
+    """ある時点のユニバースと、その絞り込みの内訳。
+
+    **内訳を持つのが要点。** 最終的な銘柄数が想定（100〜200）と食い違ったとき、
+    どのフィルタで落ちたかが分からないと打つ手を決められない
+    （流動性が厳しすぎるのか、株価レンジが狭すぎるのか）。
+    """
+
+    as_of: date
+    passed: tuple[ScreenResult, ...]
+    rejected: tuple[ScreenResult, ...]
+    total_listed: int
+    """``as_of`` 時点の全上場銘柄数"""
+    reject_counts: dict[RejectReason, int] = field(default_factory=dict)
+
+    @property
+    def symbols(self) -> tuple[str, ...]:
+        """通過した銘柄コード。"""
+        return tuple(r.symbol for r in self.passed)
+
+    @property
+    def size(self) -> int:
+        return len(self.passed)
+
+    def summary(self) -> str:
+        """内訳を人が読める形にする。実測スクリプトと日次ログで使う。"""
+        lines = [
+            f"ユニバース {self.as_of}: 全上場 {self.total_listed} → 通過 {self.size}"
+        ]
+        for reason, count in sorted(
+            self.reject_counts.items(), key=lambda kv: -kv[1]
+        ):
+            lines.append(f"  除外 {reason.value:<18} {count:>5}")
+        return "\n".join(lines)
+
+
+def build(
+    as_of: date,
+    source: BarDataSource,
+    config: FilterConfig | None = None,
+    *,
+    bars_by_symbol: dict[str, tuple[Bar, ...]] | None = None,
+    symbols: tuple[Symbol, ...] | None = None,
+) -> UniverseSnapshot:
     """指定日時点のユニバースを構築する。
 
     Args:
-        as_of: 基準日。**この日時点で知り得た情報だけを使うこと。**
+        as_of: 基準日。**この日時点で知り得た情報だけを使う。**
             未来のデータを参照するとバックテストだけ好成績になる。
+        source: 銘柄一覧の取得元（J-Quants）。
+        bars_by_symbol: 銘柄コード → ``as_of`` までの日足。
+            事前に一括取得したものを渡す（5件/分の制約下で銘柄ごとに
+            取りに行くのは非現実的）。省略した場合は日足判定をスキップし、
+            市場区分と信用区分だけで絞る。
+        symbols: 銘柄一覧を外から渡す場合（テストや再計算用）。
 
     Returns:
-        フィルタを通過した銘柄。想定は100〜200銘柄。
+        ユニバースと絞り込みの内訳。
     """
-    raise NotImplementedError("Phase 2 で実装する")
+    cfg = config or FilterConfig()
+
+    if symbols is None:
+        listed = source.list_symbols(as_of)
+        if listed is None:
+            raise ValueError(
+                f"データソース {source.name} は銘柄一覧を提供しない。"
+                "サバイバーシップバイアスの回避には日付指定の一覧が必須"
+            )
+        symbols = listed
+
+    bars_map = bars_by_symbol or {}
+    passed: list[ScreenResult] = []
+    rejected: list[ScreenResult] = []
+    counts: Counter[RejectReason] = Counter()
+
+    for symbol in symbols:
+        result = screen(symbol, bars_map.get(symbol.code, ()), cfg)
+        if result.passed:
+            passed.append(result)
+        else:
+            rejected.append(result)
+            if result.reason is not None:
+                counts[result.reason] += 1
+
+    snapshot = UniverseSnapshot(
+        as_of=as_of,
+        passed=tuple(passed),
+        rejected=tuple(rejected),
+        total_listed=len(symbols),
+        reject_counts=dict(counts),
+    )
+    logger.info("%s", snapshot.summary())
+    return snapshot
+
+
+def bars_lookback_start(
+    as_of: date, config: FilterConfig | None = None, *, margin: int = 10
+) -> date:
+    """判定に必要な日足の取得開始日。
+
+    20日平均売買代金には20営業日ぶんが要る。土日祝を考慮して暦日で余裕を持たせる
+    （営業日カレンダーが無くても足りるだけの幅を取る）。
+
+    Args:
+        margin: 祝日ぶんの追加余裕（暦日）。
+    """
+    cfg = config or FilterConfig()
+    # 20営業日 ≒ 28暦日。土日で約1.4倍になるので係数を掛ける
+    calendar_days = int(cfg.turnover_lookback_days * 1.5) + margin
+    return as_of - timedelta(days=calendar_days)

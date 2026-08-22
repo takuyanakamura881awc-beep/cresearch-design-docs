@@ -36,14 +36,14 @@ layer1:
 
   # D. 信用区分: ショートを使うため売建可能であることが必須
   #
-  # 【Stage A の制約】一般信用(デイトレ)の売建可能銘柄リストは
-  # 証券会社のログインが必要で、口座なしでは取得できない。
-  # Stage A では流動性上位であることで代理し、Stage B で実データに差し替える。
-  # 代理である以上、Stage A のショート成績は実際には売建できない銘柄を
-  # 含みうる。Stage B での差し替え後に成績が落ちうることを織り込んでおく。
+  # 【実測で代理が不要になった】J-Quants の銘柄一覧に MrgnNm があり、
+  # "貸借" なら制度信用で売建できると判定できる（2026-08-23 に確認）。
+  # プライム1,565銘柄のうち1,483銘柄(95%)が貸借銘柄で、
+  # 売建可否はボトルネックにならない。
+  #
+  # 一般信用(デイトレ)の在庫は証券会社側の情報なので Stage B で差し替える。
   margin:
-    require_daytrade_shortable: true   # Stage B で有効
-    stage_a_proxy: "liquidity_top"     # Stage A の代理: 流動性上位で近似
+    require_loanable: true             # MrgnNm == "貸借" のみ通す
 
   # E. 空売り価格規制がかかっている銘柄を除外
   exclude_short_sale_restricted: true
@@ -57,7 +57,10 @@ layer1:
     exclude_supervised: true     # 監理・整理銘柄
     corporate_action_buffer_days: 3   # 分割・併合の前後N営業日を除外
 
-  # 想定通過数（Phase 2 で実データ検証する）
+  # 通過数
+  #   実測(2026-08-23): 全上場 4,451 → プライム 1,565 → かつ貸借 1,483
+  #   流動性(B)と株価レンジ(C)を通した後は未実測。
+  #   scripts/measure_universe.py で確認してから Phase 3 に進む。
   expected_survivors: [100, 200]
 
 # ------------------------------------------------------------
