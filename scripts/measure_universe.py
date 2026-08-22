@@ -40,6 +40,20 @@ from autotrader.universe.filters import FilterConfig, RejectReason
 TURNOVER_DAYS = 20
 """流動性の判定に必要な営業日数。"""
 
+WATCHLIST_SLOTS = 50
+"""Layer 2 が日次で選ぶ監視銘柄数（Stage B の WebSocket 制限に由来）。"""
+
+DESIGN_ASSUMPTION = (100, 200)
+"""設計時の見込み（docs/03-universe.md）。**未検証の推定値。**"""
+
+ACCEPTABLE = (100, 500)
+"""合否の判定に使う範囲。**見込み値とは別に、目的から決める。**
+
+- 下限100 = 監視枠50の2倍。日々の出入りで枠が埋まらなくなるのを避ける
+- 上限500 = 出発点1,483の約1/3。これを超えると Layer 1 が
+  「取引できない銘柄を落とす」役割を果たしていない
+"""
+
 
 def hr(title: str) -> None:
     print()
@@ -152,17 +166,28 @@ def main() -> int:
     print(f"  **通過        : {snapshot.size:>5}銘柄**")
 
     hr("4. 判定")
-    low, high = 100, 200
-    if snapshot.size < low:
-        print(f"  少なすぎる（想定 {low}〜{high}）")
-        print("  → 日次50銘柄を選ぶ母集団として不足。竹が成立しない")
+    print(f"  設計時の想定: {DESIGN_ASSUMPTION[0]}〜{DESIGN_ASSUMPTION[1]}銘柄（未検証の見込み）")
+    print(f"  許容範囲    : {ACCEPTABLE[0]}〜{ACCEPTABLE[1]}銘柄")
+    print(f"  実測        : {snapshot.size}銘柄")
+    print()
+
+    if not DESIGN_ASSUMPTION[0] <= snapshot.size <= DESIGN_ASSUMPTION[1]:
+        print("  想定の範囲外。ただし想定は未検証の見込み値なので、")
+        print("  「実測が外れた」ではなく「想定が外れた」と読む。")
+        print()
+
+    if snapshot.size < ACCEPTABLE[0]:
+        print("  NG: 少なすぎる")
+        print(f"  → 日次{WATCHLIST_SLOTS}銘柄を選ぶ母集団として不足。竹が成立しない")
         print("     売買代金の閾値を下げるか、株価レンジの上限を上げることを検討")
-    elif snapshot.size > high * 2.5:
-        print(f"  多すぎる（想定 {low}〜{high}）")
+    elif snapshot.size > ACCEPTABLE[1]:
+        print("  NG: 多すぎる")
         print("  → 絞り込みが効いていない。選定の意味が薄い")
         print("     売買代金の閾値を上げることを検討")
     else:
-        print(f"  想定の範囲内（{low}〜{high}）。閾値の変更は不要")
+        print("  OK: 許容範囲内。閾値の変更は不要")
+        print(f"     日次{WATCHLIST_SLOTS}枠に対して母集団が"
+              f"{snapshot.size / WATCHLIST_SLOTS:.1f}倍あり、選定の余地がある")
 
     print()
     print("  この結果を config/universe.yaml と docs/03-universe.md に反映してから")

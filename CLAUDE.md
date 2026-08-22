@@ -171,17 +171,20 @@ pytest
 
 ## 現在のステータス
 
-**Phase 1（Stage A のデータ基盤）完了。全項目を実機で実測済み。**
+**Phase 1（Stage A のデータ基盤）完了。Phase 2 進行中。**
 
-確定した値（詳細は `docs/09-data-sources.md` §0）:
+Phase 1: `data/base.py`（DataSource抽象化・フォールバック）、`data/jquants.py`（V2）、
+`data/yahoo.py`、`data/store.py`（TTLキャッシュ）、`config.py`、
+`scripts/verify_data_sources.py`。**実機で全項目を実測済み。**
 
-- **yfinance の分割調整は J-Quants と完全一致**（乖離 0.0000%）→ **Light に課金しない**
-- 配当調整は必ずオフ（`DEFAULT_ADJUST_DIVIDENDS = False`）
-- Free の購読範囲: 2024-05-31 〜 2026-05-31（遅延84日）
-- yfinance: 1m=7日 / 5m=58日 / 60m=728日
-- **Layer 1 の出発点: プライム × 貸借 = 1,483銘柄**
+Phase 2 のうち完了:
 
-次は **Phase 2（ユニバース構築 + バックテストエンジン）**。
-流動性と株価レンジで絞った結果が想定の100〜200銘柄に収まるかを実測する。
+- `universe/filters.py` / `universe/builder.py` — Layer 1（ハードフィルタ）
+- `universe/selector.py` — Layer 2（順位変換スコアリング・プレミアム枠）
+- `scripts/measure_universe.py` — **実測: Layer 1 の通過は287銘柄**
+  （全上場4,451 → プライム1,565 → 貸借1,483 → 株価帯951 → 流動性287）
 
-工程と各 Phase の完了条件は `docs/00-overview.md` を参照。
+**残り: `engine/backtest.py`（`PointInTimeView` による時点データ制限）と
+`data/calendar.py`（営業日・決算日）。** そのあとバイアス検査。
+
+Phase 2 完了後は Phase 3（竹の実装）。工程は `docs/00-overview.md` を参照。
