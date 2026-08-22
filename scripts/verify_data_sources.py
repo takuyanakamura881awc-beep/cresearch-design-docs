@@ -69,13 +69,6 @@ def fmt_date(d: date) -> str:
     return f"{d.isoformat()}({_WEEKDAYS[d.weekday()]})"
 
 
-def last_weekday(d: date) -> date:
-    """その日が土日なら直前の平日にずらす。"""
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
-
-
 def hr(title: str) -> None:
     print()
     print("=" * 70)
@@ -174,6 +167,7 @@ def check_jquants(source: JQuantsDataSource) -> date | None:
     print("  実測中（想定日から遡り、土日は飛ばす）...")
 
     probes = 0
+    range_reported = False
     for back in range(FREE_PLAN_DELAY_DAYS - 3, FREE_PLAN_DELAY_DAYS + 15):
         probe = date.today() - timedelta(days=back)
         if probe.weekday() >= 5:
@@ -186,9 +180,13 @@ def check_jquants(source: JQuantsDataSource) -> date | None:
             )
         except SubscriptionRangeError as exc:
             # 契約範囲外。以降は送信前に弾かれるので照会は増えない
-            if exc.has_range:
-                print(f"  契約範囲: {fmt_date(exc.covered_from)} 〜 {fmt_date(exc.covered_to)}")
-                print("    （API が返した実際の範囲。以降は範囲外を照会しない）")
+            if exc.has_range and not range_reported:
+                print(
+                    f"  契約範囲: {fmt_date(exc.covered_from)} 〜 "
+                    f"{fmt_date(exc.covered_to)}"
+                )
+                print("    （API が返した実際の範囲。以降は送信前に弾く）")
+                range_reported = True
             continue
         except RateLimitError as exc:
             # データ不在と区別する。ここで continue すると測定が嘘になる
@@ -290,17 +288,36 @@ def check_yahoo_lookback() -> dict[str, int]:
     return measured
 
 
+def _spans_weekday(start: date, end: date) -> bool:
+    """期間内に平日が1日でもあるか。"""
+    day = start
+    while day <= end:
+        if day.weekday() < 5:
+            return True
+        day += timedelta(days=1)
+    return False
+
+
 def _try_fetch(source: YahooDataSource, interval: str, days: int) -> bool:
     """指定日数ぶん遡って取得できるか試す。
 
-    **終端を直前の平日に寄せる。** 土日に実行すると、短い期間の照会が
-    market closed で空振りし、「1日は失敗」のような紛らわしい結果になる
-    （実際に日曜の実行で 1m の測定がそうなった）。
+    **開始日は「今日」から数える。終端をずらしてはならない。**
+
+    Yahoo の「直近60日以内」という判定は**今日を基準**にしている。
+    終端を直前の平日に寄せると、同じ日数指定でも開始日がその分古くなり、
+    上限に引っかかって実測値が短く出る。
+
+    実際にこれを踏んだ。日曜に実行したところ 5m が 58日→56日、
+    60m が 728日→726日 と、すべて2日ぶん短く測定された
+    （終端を金曜に寄せたため開始日が2日古くなった）。
+
+    土日に短い期間を指定すると平日が1日も含まれず空振りするが、
+    それは上限とは無関係なので `_measure_lookback` 側で除外する。
     """
-    end = last_weekday(date.today())
+    today = date.today()
     try:
         bars = source.get_bars_batch(
-            (PROBE_SYMBOLS[0],), interval, end - timedelta(days=days), end
+            (PROBE_SYMBOLS[0],), interval, today - timedelta(days=days), today
         )
     except DataSourceError:
         return False
@@ -324,7 +341,12 @@ def _measure_lookback(
         (成功した最大日数, 失敗した最小日数)。後者は見つからなければ ``None``。
     """
     # 境界の内側から、少しずつ外へ
+    today = date.today()
     candidates = sorted({max(1, hint - 2), hint // 2, hint // 4, 5, hint, hint + 2})
+    # 平日を含まない期間は、上限とは無関係に空振りする（土日に実行した場合）
+    candidates = [
+        d for d in candidates if _spans_weekday(today - timedelta(days=d), today)
+    ]
 
     best = 0
     smallest_failure: int | None = None
@@ -355,6 +377,7 @@ def check_gap(jquants_end: date | None, yahoo_5m_days: int) -> None:
         print(f"  → 重ならない。間に {gap}日の穴がある")
         print("     竹の検証には5分足と同じ期間の日足が要る（ATR%・売買代金・出来高比）")
         print("     この期間の日足は yfinance で補完する必要がある")
+        print("     ※ 両端とも毎日1日ずつ進むため、この穴の幅はほぼ一定。時間では埋まらない")
     else:
         print()
         print(f"  → {-gap}日ぶん重なっている。J-Quants の日足だけで賄える")
