@@ -58,14 +58,51 @@ CAPITAL = Decimal(500_000)
 DEFAULT_MIN_NORMAL_MAX = DEFAULT_PRICE_HARD_MIN + 1
 """通常枠の上限の下限。FilterConfig が hard_min < normal_max を要求するため。"""
 
-WEIGHT_CANDIDATES = (0.25, 0.40, 0.60)
-"""比較する「1銘柄あたり総資産の上限比率」。
+MAX_WEIGHT_PER_SYMBOL = 0.25
+"""1銘柄あたり総資産の上限（docs/05-risk-management.md #7）。**固定。**
 
-**25% は docs/05-risk-management.md #7 の現行値。**
-50万円 × 25% ÷ 100株 = 1,250円までしか1単元を建てられず、
-ユニバースの株価上限3,000円と食い違う。どちらに寄せるかを
-実測してから決めるための候補。
+【実測で分かった、この値の本当の意味】
+
+25%は恣意的な値ではなく、他の2つの安全装置から逆算された値だった。
+損切りは 1.5 × ATR（config/strategies.yaml）、Layer 2 の ATR% 下限は 2%。
+1敗あたりの総資産インパクトは ``上限比率 × ATR% × 1.5`` になる::
+
+    上限      ATR 2%    ATR 3%    ATR 4%
+    25%       -0.75%    -1.12%    -1.50%
+    40%       -1.20%    -1.80%    -2.40%  ← 1敗で日次ブレーカー(-2%)到達
+    60%       -1.80%    -2.70%    -3.60%  ← 同上
+
+**上限比率を緩めることは、実質的に日次ブレーカーを無効化することに等しい。**
+1日5〜15トレードする前提が「1敗で当日終了」に変わってしまう。
+だから母集団はここではなく流動性下限で回復させる。
 """
+
+TURNOVER_CANDIDATES = (
+    Decimal(1_000_000_000),
+    Decimal(500_000_000),
+    Decimal(300_000_000),
+    Decimal(200_000_000),
+)
+"""比較する20日平均売買代金の下限。
+
+**これは安全装置ではなく品質閾値。** 10〜15万円の注文が板を動かさなければよい::
+
+    注文        10億円     5億円     3億円
+    10万円      0.010%    0.020%    0.033%
+    15万円      0.015%    0.030%    0.050%
+
+3億円銘柄でも売買代金の0.05%。現行の10億円は保守的すぎる。
+"""
+
+MAX_ORDER_YEN = Decimal(150_000)
+"""1銘柄あたりの目標建玉額の上限（config/risk.yaml の target_position_yen）。
+
+**注意: 現行の 150,000円 は 25%上限（125,000円）を超えており不整合。**
+ここは板インパクトの見積もりに使うので、大きい側＝保守的な値のままにしてある。
+"""
+
+PRICE_BANDS = (300, 500, 800, 1000, 1250)
+"""株価帯の区切り。通常枠とプレミアム枠の新しい境界を数字で決めるために出す。"""
 
 ACCEPTABLE = (100, 500)
 """合否の判定に使う範囲。**見込み値とは別に、目的から決める。**
@@ -125,62 +162,136 @@ def collect_daily_bars(
     }
 
 
-def sweep_price_cap(
+def price_ceiling() -> int:
+    """1単元が上限比率に収まる最大株価。**50万円 × 25% ÷ 100株 = 1,250円。**"""
+    return int(max_affordable_price(CAPITAL, MAX_WEIGHT_PER_SYMBOL))
+
+
+def config_for(ceiling: int, min_turnover: Decimal) -> FilterConfig:
+    """指定の株価上限・流動性下限での Layer 1 設定。
+
+    通常枠/プレミアム枠の境界はこの比較では意味を持たないので、
+    上限のすぐ下に置いて「上限以下が何銘柄か」だけを見る。
+    """
+    return FilterConfig(
+        min_avg_turnover_yen=min_turnover,
+        price_normal_max=max(DEFAULT_MIN_NORMAL_MAX, ceiling - 1),
+        price_premium_max=ceiling,
+    )
+
+
+def sweep_turnover(
     as_of: date,
     source: JQuantsDataSource,
     symbols: tuple[Symbol, ...],
     bars: dict[str, tuple[Bar, ...]],
 ) -> None:
-    """1銘柄あたりの上限比率ごとに、通過銘柄数がどう変わるかを測る。
+    """流動性下限ごとに、株価上限内の通過銘柄数がどう変わるかを測る。
 
     **収集済みの日足を使い回すので追加のAPI照会は発生しない。**
 
-    【なぜこれを測るのか】
+    【なぜ流動性を動かすのか】
 
-    ``docs/05-risk-management.md`` #7 の「1銘柄あたり総資産の25%」と、
-    ``docs/03-universe.md`` の株価上限3,000円は50万円では両立しない。
-    50万円 × 25% ÷ 100株 = 1,250円が、1単元を建てられる上限だから。
+    ``docs/05-risk-management.md`` #7 の「1銘柄あたり総資産の25%」を守ると、
+    50万円では株価1,250円が上限になる（1単元 = 株価 × 100株）。
+    実測ではこの条件で55銘柄しか残らず、監視枠50に対して1.1倍しかない。
+    **Layer 2 の選定が実質機能しない。**
 
-    25%を守ると株価1,250円超は**選定を通ってもサイジングで0株になる**。
-    エラーにならず静かに機会を失うので、どちらに寄せるかを決める必要がある。
-    その判断材料として、上限ごとの母集団サイズを並べる。
+    かといって上限比率は緩められない（`MAX_WEIGHT_PER_SYMBOL` 参照。
+    緩めると日次ブレーカーが無効化される）。
+
+    そこで**安全装置ではない側**＝流動性下限を動かして母集団を回復させる。
+    どこまで下げれば100銘柄を超えるかを、ここで数字にする。
     """
-    hr("5. 1銘柄あたりの上限比率と株価上限の突き合わせ")
-    print("  50万円・単元100株では、上限比率が株価の上限を決めてしまう。")
+    ceiling = price_ceiling()
+
+    hr("5. 流動性下限のスイープ（1銘柄あたり上限25%は固定）")
+    print(f"  1銘柄あたり上限 {MAX_WEIGHT_PER_SYMBOL:.0%} → 買える最大株価 {ceiling:,}円")
+    print("  安全装置は動かさない。品質閾値である流動性下限だけを動かす。")
     print("  （追加のAPI照会なし。収集済みの日足を使い回す）")
     print()
 
-    baseline: int | None = None
-    for weight in WEIGHT_CANDIDATES:
-        ceiling = int(max_affordable_price(CAPITAL, weight))
-        concurrent = int(1 / weight)
-        # 通常枠/プレミアム枠の境界はこの比較では意味を持たないので、
-        # 上限のすぐ下に置いて「上限以下が何銘柄か」だけを見る。
-        config = FilterConfig(
-            price_normal_max=max(DEFAULT_MIN_NORMAL_MAX, ceiling - 1),
-            price_premium_max=ceiling,
-        )
-        label = f"上限 {weight:.0%}" + ("（現行 #7）" if weight == 0.25 else "　　　　")
+    adopted: Decimal | None = None
+    for min_turnover in TURNOVER_CANDIDATES:
         try:
-            snapshot = build(as_of, source, config, bars_by_symbol=bars, symbols=symbols)
+            snapshot = build(
+                as_of,
+                source,
+                config_for(ceiling, min_turnover),
+                bars_by_symbol=bars,
+                symbols=symbols,
+            )
         except (DataSourceError, ValueError) as exc:
-            print(f"  {label}: 測定できなかった — {exc}")
+            print(f"  {min_turnover / 10**8:>4.0f}億円以上: 測定できなかった — {exc}")
             continue
 
-        if baseline is None:
-            baseline = snapshot.size
-            delta = ""
+        okay = ACCEPTABLE[0] <= snapshot.size <= ACCEPTABLE[1]
+        if okay and adopted is None:
+            adopted = min_turnover
+            mark = "  ← 採用候補（100銘柄を超える最も厳しい水準）"
+        elif snapshot.size < ACCEPTABLE[0]:
+            mark = f"  （{ACCEPTABLE[0]}銘柄に届かない）"
         else:
-            delta = f"（現行比 +{snapshot.size - baseline}）"
+            mark = ""
+        ratio = snapshot.size / WATCHLIST_SLOTS
         print(
-            f"  {label}: 最大株価 {ceiling:>5,}円 / 同時保有 {concurrent}銘柄 "
-            f"/ 通過 {snapshot.size:>4}銘柄{delta}"
+            f"  {min_turnover / 10**8:>4.0f}億円以上: 通過 {snapshot.size:>4}銘柄"
+            f"（監視枠{WATCHLIST_SLOTS}の {ratio:>4.1f}倍）{mark}"
         )
 
     print()
-    print("  上限比率を上げるほど母集団は増えるが、")
-    print("  1銘柄の逆行が資産に与える影響も比例して増える（25%→60%で2.4倍）。")
-    print("  **これは安全装置の閾値なので、人が判断する**（CLAUDE.md）。")
+    if adopted is None:
+        print("  NG: どの水準でも母集団が足りない。")
+        print("      株価下限300円の見直しか、監視枠50の縮小を検討する。")
+    else:
+        impact = MAX_ORDER_YEN / adopted
+        print(f"  → 採用候補は {adopted / 10**8:.0f}億円以上。")
+        print(
+            f"     この水準では {MAX_ORDER_YEN:,}円の注文が売買代金の {impact:.3%} で、"
+            "板を動かさない。"
+        )
+
+    _print_price_distribution(as_of, source, symbols, bars, adopted or TURNOVER_CANDIDATES[-1])
+
+
+def _print_price_distribution(
+    as_of: date,
+    source: JQuantsDataSource,
+    symbols: tuple[Symbol, ...],
+    bars: dict[str, tuple[Bar, ...]],
+    min_turnover: Decimal,
+) -> None:
+    """採用候補の水準で、株価帯ごとの銘柄数を出す。
+
+    **通常枠とプレミアム枠の新しい境界を数字で決めるために使う。**
+    現行の「通常 300〜2,000円 / プレミアム 2,000〜3,000円」は
+    株価上限1,250円のもとでは到達不能になるため、切り直す必要がある。
+    """
+    hr(f"6. 株価帯の分布（流動性 {min_turnover / 10**8:.0f}億円以上）")
+    print("  枠の境界を決めるための内訳。1単元 = 株価 × 100株。")
+    print()
+
+    previous = 0
+    for upper in PRICE_BANDS[1:]:
+        try:
+            snapshot = build(
+                as_of,
+                source,
+                config_for(upper, min_turnover),
+                bars_by_symbol=bars,
+                symbols=symbols,
+            )
+        except (DataSourceError, ValueError) as exc:
+            print(f"  〜{upper:,}円: 測定できなかった — {exc}")
+            continue
+        band = snapshot.size - previous
+        weight = upper * 100 / float(CAPITAL)
+        print(
+            f"  {PRICE_BANDS[PRICE_BANDS.index(upper) - 1]:>5,}〜{upper:>5,}円"
+            f"（1単元 最大{upper * 100:>7,}円 = 資産の{weight:>4.0%}）: "
+            f"{band:>4}銘柄  （累計 {snapshot.size:>4}）"
+        )
+        previous = snapshot.size
 
 
 def main() -> int:
@@ -273,7 +384,7 @@ def main() -> int:
         print(f"     日次{WATCHLIST_SLOTS}枠に対して母集団が"
               f"{snapshot.size / WATCHLIST_SLOTS:.1f}倍あり、選定の余地がある")
 
-    sweep_price_cap(as_of, source, symbols, bars)
+    sweep_turnover(as_of, source, symbols, bars)
 
     print()
     print("  この結果を config/universe.yaml と docs/03-universe.md に反映してから")
