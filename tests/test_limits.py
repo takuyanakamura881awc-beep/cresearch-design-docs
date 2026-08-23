@@ -10,11 +10,12 @@ from __future__ import annotations
 import pytest
 
 from autotrader.risk.limits import (
+    DEFAULT_ROLLING_LOSS_WINDOW,
     BreakerAction,
-    check_consecutive_loss,
     check_daily_loss,
     check_max_drawdown,
     check_position_limits,
+    check_rolling_loss,
     max_atr_pct,
 )
 
@@ -49,81 +50,106 @@ class TestDailyLoss:
             check_daily_loss(-0.01, threshold_pct=0.02)
 
 
-class TestConsecutiveLoss:
-    """#5 連続損失。**復帰には人の明示承認が必要。**
+class TestRollingLoss:
+    """#5 移動窓の損失。**復帰には人の明示承認が必要。**
 
-    連続日数と損失額の**両方**を要求する。日数だけだと微小な3連敗でも発動し、
-    勝っている戦略でも3ヶ月にほぼ確実に止まる（下落日率40%でも60営業日で93%）。
-    止めるべきなのは損害が続いているときで、たまたま3日下げたときではない。
+    **この装置は2度作り直している。両方の失敗を回帰テストとして残す。**
+
+    | 版 | 条件 | 問題 |
+    |---|---|---|
+    | 初版 | 3営業日連続マイナス | 誤発動。勝っている戦略でも60営業日で93%発動 |
+    | 2版 | 3連敗 かつ 累積 -5% | 見逃し。連続しない消耗を -15% まで検出できない |
+    | 3版 | 直近15営業日の累積 -5% | 連続性を要求しない |
     """
 
-    def test_3連敗かつ累積5パーセント以上で発動する(self) -> None:
-        state = check_consecutive_loss([-0.02, -0.015, -0.02])  # -5.5%
+    def test_窓の累積が閾値に達したら発動する(self) -> None:
+        state = check_rolling_loss([-0.02] * 3)  # -6%
         assert state.tripped
         assert state.action is BreakerAction.HALT
 
-    def test_微小な3連敗では発動しない(self) -> None:
-        """**実測でこれに引っかかった。**
-
-        -0.87% / -0.62% / -0.54%（合計 -2.0%）で停止し、
-        39営業日のうち7日しか検証できなかった。
-        日次ブレーカー1回ぶんの損失に3日かけて到達しただけで、
-        「戦略が相場に合っていない」証拠とは言えない。
-        """
-        assert not check_consecutive_loss([-0.0087, -0.0062, -0.0054]).tripped
-
-    def test_損失額の境界(self) -> None:
-        assert not check_consecutive_loss([-0.016] * 3).tripped  # -4.8%
-        assert check_consecutive_loss([-0.017] * 3).tripped  # -5.1%
-
     def test_自動復帰しない(self) -> None:
-        """**連敗は戦略が相場に合っていない兆候。**
+        """削られ続けているのは戦略が相場に合っていない兆候。人が判断する。"""
+        assert check_rolling_loss([-0.02] * 3).auto_resume is False
 
-        自動再開すると損失を垂れ流す。人が判断する。
+    def test_連続していない消耗を検出する(self) -> None:
+        """**2版が見逃したケース。**
+
+        実データで -0.46%/日 の消耗が続き、3日連続では -1.37% にしかならず
+        「3連敗かつ累積-5%」では発動しなかった。結果、累積DD の -15% まで
+        誰も止めなかった。移動窓なら11日目で検出できる。
         """
-        assert check_consecutive_loss([-0.02] * 3).auto_resume is False
+        bleed = [-0.00456] * 10
+        assert not check_rolling_loss(bleed).tripped  # 10日で -4.56%
+        assert check_rolling_loss([*bleed, -0.00456]).tripped  # 11日で -5.02%
 
-    def test_間に勝ちがあればリセットされる(self) -> None:
-        assert not check_consecutive_loss([-0.03, 0.02, -0.03]).tripped
+    def test_勝ち負けが混じっていても累積で判定する(self) -> None:
+        """並び方ではなく削られた量で見る。
 
-    def test_直近3日だけを見る(self) -> None:
-        """古い連敗を引きずらない。"""
-        assert not check_consecutive_loss([-0.03, -0.03, -0.03, 0.02]).tripped
+        境界ちょうど（合計 -5.0000%）は浮動小数の積算誤差で
+        どちらに転ぶか決まらないので、テストには使わない。
+        """
+        mixed = [-0.02, 0.01, -0.02, 0.005, -0.02, -0.006]  # 合計 -5.1%
+        assert check_rolling_loss(mixed).tripped
+        # 3日連続の下落は含まれていない = 「連続」条件では検出できないケース
+        assert not any(
+            mixed[i] < 0 and mixed[i + 1] < 0 and mixed[i + 2] < 0
+            for i in range(len(mixed) - 2)
+        )
+
+    def test_微小な3連敗では発動しない(self) -> None:
+        """**初版が誤発動したケース。**
+
+        実測の -0.87% / -0.62% / -0.54%（合計 -2.0%）は
+        日次ブレーカー1回ぶんの損失に3日かけて到達しただけ。
+        これで止めると勝っている戦略でも3ヶ月にほぼ確実に人の承認待ちに入る。
+        """
+        assert not check_rolling_loss([-0.0087, -0.0062, -0.0054]).tripped
+
+    def test_窓の外の損失は引きずらない(self) -> None:
+        """古い損失で永久に発動し続けない。"""
+        old_damage = [-0.03] * 3
+        recovered = [0.005] * DEFAULT_ROLLING_LOSS_WINDOW
+        assert not check_rolling_loss([*old_damage, *recovered]).tripped
+
+    def test_窓に満たなくても判定する(self) -> None:
+        """**運用初日から効かせる。**
+
+        15日揃うのを待つ間に -10% になっては意味がない。
+        """
+        assert check_rolling_loss([-0.06]).tripped
+        assert "1営業日" in check_rolling_loss([-0.06]).reason
+
+    def test_境界(self) -> None:
+        assert not check_rolling_loss([-0.049]).tripped
+        assert check_rolling_loss([-0.05]).tripped
+
+    def test_利益が出ていれば発動しない(self) -> None:
+        assert not check_rolling_loss([0.01] * 20).tripped
+        assert not check_rolling_loss([]).tripped
+
+    def test_理由に窓の長さと累積を残す(self) -> None:
+        reason = check_rolling_loss([-0.03, -0.03]).reason
+        assert "2営業日" in reason and "-6.00%" in reason
+
+    def test_窓の長さを変えられる(self) -> None:
+        bleed = [-0.01] * 10
+        assert not check_rolling_loss(bleed, window_days=3).tripped  # -3%
+        assert check_rolling_loss(bleed, window_days=10).tripped  # -10%
+
+    def test_不正な引数を拒否する(self) -> None:
+        with pytest.raises(ValueError):
+            check_rolling_loss([-0.03], window_days=0)
+        with pytest.raises(ValueError):
+            check_rolling_loss([-0.03], threshold_pct=0.05)
 
     def test_日次と累積DDの背後は残る(self) -> None:
-        """#5 を緩めても守りは薄くならない。
+        """#5 の形を変えても守りは薄くならない。
 
         1日で -2% を割れば #4 が、ピークから -15% で #6 が止める。
         #5 が担うのは「その中間の、じわじわ削られる状態」の検出。
         """
         assert check_daily_loss(-0.02).tripped
         assert check_max_drawdown([500_000, 425_000]).tripped
-
-    def test_正の閾値を拒否する(self) -> None:
-        with pytest.raises(ValueError):
-            check_consecutive_loss([-0.03] * 3, min_cumulative_loss_pct=0.05)
-
-    def test_損益ゼロは連敗を途切れさせる(self) -> None:
-        """**docs/05 の定義は「連続マイナス」。ゼロはマイナスではない。**
-
-        実務上ゼロになるのは**その日1トレードもしなかった場合**で、
-        「戦略が相場に合っていない」という判定根拠にならない。
-        連敗に数えると、様子見の日を挟んだだけで人の承認待ちに入る。
-
-        損失額は十分（-6%）なので、止まらない理由は日数のほうだと分かる。
-        """
-        assert not check_consecutive_loss([-0.03, 0.0, -0.03]).tripped
-
-    def test_日数が足りなければ発動しない(self) -> None:
-        assert not check_consecutive_loss([-0.03, -0.03]).tripped
-        assert not check_consecutive_loss([]).tripped
-
-    def test_閾値日数を変えられる(self) -> None:
-        assert check_consecutive_loss([-0.03, -0.03], threshold_days=2).tripped
-
-    def test_不正な日数を拒否する(self) -> None:
-        with pytest.raises(ValueError):
-            check_consecutive_loss([-0.03], threshold_days=0)
 
 
 class TestMaxDrawdown:

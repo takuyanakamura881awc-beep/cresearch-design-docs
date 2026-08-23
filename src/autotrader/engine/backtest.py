@@ -34,10 +34,11 @@ from autotrader.report.metrics import (
     win_rate,
 )
 from autotrader.risk.limits import (
-    DEFAULT_CONSECUTIVE_LOSS_PCT,
-    check_consecutive_loss,
+    DEFAULT_ROLLING_LOSS_PCT,
+    DEFAULT_ROLLING_LOSS_WINDOW,
     check_daily_loss,
     check_max_drawdown,
+    check_rolling_loss,
 )
 from autotrader.risk.sizing import calc_quantity, target_notional
 from autotrader.strategy.base import Strategy
@@ -184,7 +185,7 @@ class BacktestResult:
     ショートが静かに全滅していても成績はそれらしく見えてしまう。
     """
     halted_early: bool = False
-    """連続損失（#5）か累積DD（#6）で期間の途中から停止したか。
+    """移動窓の損失（#5）か累積DD（#6）で期間の途中から停止したか。
 
     True の場合、**残りの期間は取引していない**。
     総リターンをそのまま年率換算してはならない。
@@ -251,13 +252,13 @@ class BacktestConfig:
     """1銘柄あたり総資産の上限（安全装置 #7）。"""
     daily_loss_pct: float = -0.02
     """日次損失上限（安全装置 #4）。当日全停止 + 全クローズ。"""
-    consecutive_loss_days: int = 3
-    """連続損失で停止する営業日数（安全装置 #5）。以降は再開しない。"""
-    consecutive_loss_pct: float = DEFAULT_CONSECUTIVE_LOSS_PCT
-    """連続損失で停止する累積損失（安全装置 #5）。
+    rolling_loss_window: int = DEFAULT_ROLLING_LOSS_WINDOW
+    """移動窓の営業日数（安全装置 #5）。以降は再開しない。"""
+    rolling_loss_pct: float = DEFAULT_ROLLING_LOSS_PCT
+    """移動窓の累積損失（安全装置 #5）。
 
-    **日数だけでは発動しない。** 微小な3連敗で止めると、勝っている戦略でも
-    3ヶ月にほぼ確実に人の承認待ちに入る（`risk.limits` の導出根拠を参照）。
+    **連続性は要求しない。** 「3日連続」を条件にすると、じわじわ負ける
+    戦略を検出できず -15%（#6）まで気づかない（`risk.limits` の変更履歴）。
     """
     max_drawdown_pct: float = -0.15
     """累積ドローダウンの上限（安全装置 #6）。以降は再開しない。"""
@@ -356,7 +357,7 @@ def run(
         if now.date() != current_day:
             # 日をまたいだ = 前日が完了した。
             #
-            # **連続損失（#5）と累積DD（#6）はここでしか判定しない。**
+            # **移動窓の損失（#5）と累積DD（#6）はここでしか判定しない。**
             # 日中に判定すると、始まったばかりの当日を「損益0%の日」として
             # 数えてしまい、様子見の日を挟んだだけで人の承認待ちに入る
             # （実際にこれで誤発動した）。
@@ -465,7 +466,7 @@ def _daily_breaker_tripped(
 
 
 def _permanent_breaker(equity_curve: list[float], cfg: BacktestConfig) -> bool:
-    """連続損失（#5）と累積DD（#6）を判定する。
+    """移動窓の損失（#5）と累積DD（#6）を判定する。
 
     **どちらも人の明示承認がないと再開しない**ので、バックテストでは
     以降の全期間を停止として扱う。ここで自動再開させると、
@@ -478,8 +479,8 @@ def _permanent_breaker(equity_curve: list[float], cfg: BacktestConfig) -> bool:
     """
     daily_returns = to_returns(equity_curve)
     for state in (
-        check_consecutive_loss(
-            daily_returns, cfg.consecutive_loss_days, cfg.consecutive_loss_pct
+        check_rolling_loss(
+            daily_returns, cfg.rolling_loss_window, cfg.rolling_loss_pct
         ),
         check_max_drawdown(equity_curve, cfg.max_drawdown_pct),
     ):
