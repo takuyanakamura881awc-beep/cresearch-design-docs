@@ -17,10 +17,21 @@
 
 from __future__ import annotations
 
+import logging
+import time
+import uuid
 from dataclasses import dataclass
 
-from autotrader.broker.base import Broker
-from autotrader.types import Position
+from autotrader.broker.base import Broker, BrokerError
+from autotrader.types import (
+    CashMargin,
+    MarginTradeType,
+    Order,
+    OrderType,
+    Position,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -36,10 +47,17 @@ class CloseAllResult:
     residual: tuple[Position, ...]
     """クローズできなかった建玉。空でなければ失敗"""
     retries: int
+    positions_unknown: bool = False
+    """建玉を照会できなかったか。
+
+    **「確認できない」と「確認して0件」は別物。**
+    照会できない状態を成功として扱うと、残っているのに気づけない。
+    運用側の対応も変わる（前者はAPI疎通の確認、後者は残存建玉の手動クローズ）。
+    """
 
     @property
     def success(self) -> bool:
-        return len(self.residual) == 0
+        return not self.residual and not self.positions_unknown
 
 
 def close_all(
@@ -64,4 +82,111 @@ def close_all(
     Returns:
         結果。``success`` が False ならアラートを上げること。
     """
-    raise NotImplementedError("Phase 3 で実装する")
+    attempted = _list_positions(broker, max_retries, retry_interval_seconds)
+    if attempted is None:
+        # **建玉が分からなければ閉じようがない。** 成功として扱わない。
+        logger.critical(
+            "建玉を照会できない (%s)。クローズできたか**不明**。API疎通を確認すること",
+            reason,
+        )
+        return CloseAllResult((), (), (), max_retries, positions_unknown=True)
+
+    if not attempted:
+        logger.info("クローズ対象の建玉なし (%s)", reason)
+        return CloseAllResult((), (), (), 0)
+
+    logger.warning("全建玉クローズを開始する: %d件 (%s)", len(attempted), reason)
+
+    residual = attempted
+    retries = 0
+    unknown = False
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            retries = attempt
+            logger.warning(
+                "残存 %d件。%d秒待って再試行する (%d/%d)",
+                len(residual),
+                retry_interval_seconds,
+                attempt,
+                max_retries,
+            )
+            time.sleep(retry_interval_seconds)
+
+        _send_close_orders(broker, residual, reason)
+
+        # **成功したはずと仮定しない。** 発注が通ったかではなく、
+        # GET /positions で残存を実測して確認する（docs/05 #2）。
+        # 部分約定・タイムアウト・取引所側の拒否は「発注は成功」に見える。
+        checked = _list_positions(broker, 0, retry_interval_seconds)
+        if checked is None:
+            # **確認できない = 残っているかもしれない。** 成功にしない
+            unknown = True
+            continue
+        unknown = False
+        residual = checked
+        if not residual:
+            logger.info("全建玉クローズ完了 (%s / 再試行%d回)", reason, retries)
+            break
+
+    closed = tuple(p for p in attempted if p.symbol not in {r.symbol for r in residual})
+    if residual or unknown:
+        # **翌営業日に持ち越すと1注文2,200円。** 人が対応する必要がある
+        logger.critical(
+            "全建玉クローズに失敗した。残存 %d件: %s (%s)。"
+            "翌営業日に強制決済され1注文2,200円が発生する",
+            len(residual),
+            ", ".join(p.symbol for p in residual) or "不明",
+            reason,
+        )
+    return CloseAllResult(
+        attempted=attempted,
+        closed=closed,
+        residual=residual,
+        retries=retries,
+        positions_unknown=unknown,
+    )
+
+
+def _list_positions(
+    broker: Broker, max_retries: int, retry_interval_seconds: int
+) -> tuple[Position, ...] | None:
+    """建玉を照会する。失敗したら再試行し、駄目なら ``None``。
+
+    **``None`` は「0件」ではなく「不明」。** 呼び出し側で区別すること。
+    照会できない状態を「建玉なし」と扱うのが、この経路で最も危険な誤り。
+    """
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            time.sleep(retry_interval_seconds)
+        try:
+            return broker.get_positions()
+        except BrokerError as exc:
+            logger.error(
+                "建玉の照会に失敗した (%d/%d): %s", attempt, max_retries, exc
+            )
+    return None
+
+
+def _send_close_orders(
+    broker: Broker, positions: tuple[Position, ...], reason: str
+) -> None:
+    """建玉ごとに返済の成行注文を送る。
+
+    **1銘柄の失敗で全体を止めない。** ここで例外を伝播させると、
+    残りの建玉が手つかずのまま翌日に持ち越される。
+    失敗はログに残し、残存確認と再試行に任せる。
+    """
+    for position in positions:
+        order = Order(
+            client_order_id=f"close_all-{reason}-{position.symbol}-{uuid.uuid4().hex[:8]}",
+            symbol=position.symbol,
+            side=position.side,
+            quantity=position.quantity,
+            order_type=OrderType.MARKET,
+            cash_margin=CashMargin.MARGIN_CLOSE,
+            margin_trade_type=position.margin_trade_type or MarginTradeType.DAYTRADE,
+        )
+        try:
+            broker.send_order(order)
+        except BrokerError as exc:
+            logger.error("%s の返済発注に失敗した: %s", position.symbol, exc)
