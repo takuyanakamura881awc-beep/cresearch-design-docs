@@ -130,8 +130,12 @@ def check_consecutive_loss(
         threshold_days: 何営業日連続で発動するか。
 
     Note:
-        損益ゼロの日は連敗を**途切れさせない**。コストを引いた後のゼロは
-        「勝った」ではないため、リセットすると連敗を過小に数える。
+        **損益ゼロの日は連敗を途切れさせる。** docs/05 の定義が
+        「3営業日連続**マイナス**」であり、ゼロはマイナスではない。
+
+        実務上ゼロになるのは**その日1トレードもしなかった場合**で、
+        「戦略が相場に合っていない」という #5 の判定根拠にならない。
+        ここを連敗に数えると、様子見の日を挟んだだけで人の承認待ちに入る。
     """
     if threshold_days < 1:
         raise ValueError(f"threshold_days は1以上: {threshold_days}")
@@ -139,7 +143,7 @@ def check_consecutive_loss(
         return OK
 
     recent = daily_pnls[-threshold_days:]
-    if any(p > 0 for p in recent):
+    if any(p >= 0 for p in recent):
         return OK
     return BreakerState(
         tripped=True,

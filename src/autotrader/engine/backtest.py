@@ -321,7 +321,17 @@ def run(
     while not broker.exhausted:
         now = broker.now
         if now.date() != current_day:
-            # 日をまたぐ。日次ブレーカーは翌営業日に自動復帰する（#4）
+            # 日をまたいだ = 前日が完了した。
+            #
+            # **連続損失（#5）と累積DD（#6）はここでしか判定しない。**
+            # 日中に判定すると、始まったばかりの当日を「損益0%の日」として
+            # 数えてしまい、様子見の日を挟んだだけで人の承認待ちに入る
+            # （実際にこれで誤発動した）。
+            if current_day is not None and cfg.enforce_breakers and not halted_for_good:
+                halted_for_good = _permanent_breaker(
+                    [daily_equity[d] for d in sorted(daily_equity)], cfg
+                )
+            # 日次ブレーカー（#4）は翌営業日に自動復帰する
             current_day = now.date()
             closed_today = False
             day_open_equity = broker.equity()
@@ -368,12 +378,6 @@ def run(
             rejected += _open_signals(strategy, broker, view, cfg, now)
 
         daily_equity[current_day] = broker.equity()
-
-        # 3. 連続損失（#5）と累積DD（#6）。**発動したら以降は再開しない**
-        if cfg.enforce_breakers and not halted_for_good:
-            curve = [daily_equity[d] for d in sorted(daily_equity)]
-            halted_for_good = _permanent_breaker(curve, cfg)
-
         broker.advance()
 
     residual = broker.get_positions()
@@ -421,6 +425,11 @@ def _permanent_breaker(equity_curve: list[float], cfg: BacktestConfig) -> bool:
     **どちらも人の明示承認がないと再開しない**ので、バックテストでは
     以降の全期間を停止として扱う。ここで自動再開させると、
     実運用では止まっていた期間の成績を含めてしまう。
+
+    Args:
+        equity_curve: **完了した営業日ぶんだけ**の日次エクイティ。
+            進行中の日を含めると、まだ何も起きていない当日を
+            「損益0%の日」として数えてしまう。
     """
     daily_returns = to_returns(equity_curve)
     for state in (

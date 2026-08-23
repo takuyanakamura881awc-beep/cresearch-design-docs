@@ -71,12 +71,14 @@ class TestConsecutiveLoss:
         """古い連敗を引きずらない。"""
         assert not check_consecutive_loss([-0.01, -0.01, -0.01, 0.02]).tripped
 
-    def test_損益ゼロは連敗を途切れさせない(self) -> None:
-        """**コストを引いた後のゼロは「勝った」ではない。**
+    def test_損益ゼロは連敗を途切れさせる(self) -> None:
+        """**docs/05 の定義は「3営業日連続マイナス」。ゼロはマイナスではない。**
 
-        リセットすると連敗を過小に数える。
+        実務上ゼロになるのは**その日1トレードもしなかった場合**で、
+        「戦略が相場に合っていない」という判定根拠にならない。
+        連敗に数えると、様子見の日を挟んだだけで人の承認待ちに入る。
         """
-        assert check_consecutive_loss([-0.01, 0.0, -0.01]).tripped
+        assert not check_consecutive_loss([-0.01, 0.0, -0.01]).tripped
 
     def test_日数が足りなければ発動しない(self) -> None:
         assert not check_consecutive_loss([-0.01, -0.01]).tripped
