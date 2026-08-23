@@ -86,6 +86,61 @@ def monthly_from_period(total_return: float, days: int) -> float:
     return (1.0 + total_return) ** (BUSINESS_DAYS_PER_MONTH / days) - 1.0
 
 
+# --- コスト分解に使う想定建玉額 ---
+# target_notional = 資金 × 25% = 125,000 円を単元(100株)に切り下げるので、
+# 実際の建玉額は 125,000 円以下。株価300〜1,250円の分布から下限を95,000円と置く。
+# **推定に幅を持たせる。** 1点で出すと精度を装うことになる
+NOTIONAL_RANGE = (95_000.0, 125_000.0)
+CAPITAL = 500_000.0
+
+
+def gross_edge_atr(trades: int, net_return: float, notional: float) -> float:
+    """コスト**前**の1トレードあたり優位（ATR単位）を推定する。
+
+    ``net = gross - cost`` の恒等式を gross について解いているだけ。
+    cost は設定値（往復40bps）× 建玉額 × トレード数で決まり、いずれも既知。
+    """
+    net_per_trade_yen = net_return * CAPITAL / trades
+    cost_per_trade_yen = notional * 2 * SLIPPAGE_BPS_ONE_WAY / 10_000.0
+    gross_per_trade_yen = net_per_trade_yen + cost_per_trade_yen
+    return gross_per_trade_yen / notional / MEDIAN_ATR_PCT
+
+
+def decompose_cost(trades: int, net_return: float) -> None:
+    """実現損益を「コスト」と「コスト前の素の損益」に分解する。
+
+    **これは推定であって実測ではない。** 既知の値
+    （トレード数・スリッページ設定・建玉額の範囲）を恒等式に入れているだけ。
+    正確な値が要るなら `engine/backtest.py` に総コストを集計させること。
+
+    それでも意味があるのは、**cost の側が設定値から決まっていて動かない**ため。
+    推定の幅を取っても gross の符号は変わらない。
+    """
+    net_yen = net_return * CAPITAL
+    print(f"  実現損益: {net_return:+.2%} = {net_yen:+,.0f}円（{trades}トレード）")
+    for label, notional in zip(("下限", "上限"), NOTIONAL_RANGE, strict=True):
+        cost_yen = trades * notional * 2 * SLIPPAGE_BPS_ONE_WAY / 10_000.0
+        gross_yen = net_yen + cost_yen
+        print(
+            f"  建玉{notional:,.0f}円と置くと（{label}）: "
+            f"コスト {cost_yen:,.0f}円（資金の{cost_yen / CAPITAL:.1%}）/ "
+            f"コスト前 {gross_yen:+,.0f}円（{gross_yen / CAPITAL:+.1%}）"
+        )
+        print(
+            f"      → 素の優位 "
+            f"{gross_edge_atr(trades, net_return, notional):+.4f} ATR/トレード"
+        )
+
+
+def monthly_at_cost(gross_atr: float, slippage_one_way_bps: float, notional: float) -> float:
+    """素の優位とコスト前提から月次リターンを出す。"""
+    cost_atr = (2 * slippage_one_way_bps / 10_000.0) / MEDIAN_ATR_PCT
+    net_atr = gross_atr - cost_atr
+    per_trade_capital = net_atr * MEDIAN_ATR_PCT * (notional / CAPITAL)
+    trades_per_month = TRADES_PER_DAY * BUSINESS_DAYS_PER_MONTH
+    return (1.0 + per_trade_capital) ** trades_per_month - 1.0
+
+
 def main() -> None:
     print("=" * 68)
     print("竹の期待パフォーマンス — 実測からの分析")
@@ -147,10 +202,40 @@ def main() -> None:
     print(f"  PF 1.0 にするには 総利益を {(1 / pf - 1):.0%} 増やす、")
     print(f"  または 総損失を {(1 - pf):.0%} 減らす必要がある")
 
+    trades = int(measured["trades"])
+    net = float(measured["ret"])
+
+    print()
+    print("■ コスト分解 — 負けているのは「シグナルに優位がない」からか？")
+    decompose_cost(trades, net)
+
+    print()
+    print("■ コスト前提を変えたら月次はどうなるか")
+    print("  （素の優位は上の推定幅、トレード数・パラメータは現状のまま）")
+    for label, bps in (("Stage A 想定 20bps", 20.0), ("Stage B 想定 10bps", 10.0)):
+        results = [
+            monthly_at_cost(gross_edge_atr(trades, net, n), bps, n)
+            for n in NOTIONAL_RANGE
+        ]
+        print(f"  片道 {label}: 月次 {min(results):+.1%} 〜 {max(results):+.1%}")
+
+    print()
+    print("■ 月利+5% に要る『素の優位』の倍率")
+    for label, bps in (("20bps", 20.0), ("10bps", 10.0)):
+        cost_atr = (2 * bps / 10_000.0) / MEDIAN_ATR_PCT
+        ratios = []
+        for n in NOTIONAL_RANGE:
+            # 建玉が小さいぶんは要る優位が大きくなる（同じ資金利回りに要る値幅が増える）
+            scale = MAX_WEIGHT_PER_SYMBOL / (n / CAPITAL)
+            needed = cost_atr + edge_for_monthly_target(0.05) * scale
+            ratios.append(needed / gross_edge_atr(trades, net, n))
+        print(f"  片道 {label}: 現状の **{min(ratios):.2f}〜{max(ratios):.2f}倍** が要る")
+
     print()
     print("=" * 68)
     print("注意: パラメータは未検証（Phase 4 で決める）。")
     print("      これは『現在の設定の成績』であって『戦略の成否』ではない。")
+    print("      コスト分解は恒等式からの**推定**。正確な値は backtest 側で集計すること。")
     print("=" * 68)
 
 
