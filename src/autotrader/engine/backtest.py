@@ -396,8 +396,14 @@ def run(
                 # **黙って続けない。** 返済できない建玉は翌日の強制決済に
                 # つながるので、バックテストでも失敗として見える形で残す。
                 logger.warning("%s の返済が拒否された: %s", position.symbol, exc)
+
         if force_close:
-            closed_today = True
+            # **残存を実測してから「クローズ済み」にする。**
+            # 発注が通ったかどうかで判断すると、バーが無くて約定できなかった
+            # 銘柄をその日リトライしなくなり、翌日に持ち越す。
+            # docs/05 #2 の「GET /positions で残存確認する（成功したはずと
+            # 仮定しない）」をバックテストにも同じ形で適用する。
+            closed_today = not broker.get_positions()
 
         # 2. 新規建て。当日クローズ後・ブレーカー発動後は建てない
         if not closed_today and not halted_for_good:

@@ -359,3 +359,98 @@ class TestShouldClose:
             datetime(2026, 6, 1, 10, 0), _position(), ()
         )
         assert not should
+
+
+class TestReentry:
+    """**再エントリー制御。**
+
+    実データ（39営業日）で無制限にしたところ、損切り直後に
+    シグナルAが再発火して入り直す往復が起き、1日28.6トレードまで膨らんだ
+    （想定は3〜5）。損切り83件の多くがこの往復だった。
+    """
+
+    def _breaking(self) -> tuple[Bar, ...]:
+        session = [_bar(m, 1000.0, high=1010.0, low=990.0) for m in range(0, 30, 5)]
+        session.append(_bar(40, 1020.0))  # レンジ上抜け
+        return (*_history(), *session)
+
+    def _now(self) -> datetime:
+        return datetime(2026, 6, 1, 9, 45)
+
+    def test_同じ銘柄に1日1回しか入らない(self) -> None:
+        strategy = TakeIntraday()
+        bars = {"7203": self._breaking()}
+        assert len(strategy.generate(self._now(), bars, ())) == 1
+        assert strategy.generate(self._now(), bars, ()) == ()
+
+    def test_損切りした銘柄にその日もう入らない(self) -> None:
+        """**損切りは「その日のその仮説が外れた」という証拠。**"""
+        strategy = TakeIntraday(
+            TakeIntradayConfig(max_entries_per_symbol_per_day=5)
+        )
+        bars = {"7203": self._breaking()}
+        assert len(strategy.generate(self._now(), bars, ())) == 1
+
+        # 損切りを起こす（ATR 10 相当・-16円で発火）
+        should, reason = strategy.should_close(
+            datetime(2026, 6, 1, 10, 0),
+            _position(),
+            (*_history(spread=10.0), _bar(0, 984.0)),
+        )
+        assert should and reason == "stop"
+        assert strategy.generate(datetime(2026, 6, 1, 10, 5), bars, ()) == ()
+
+    def test_利確なら再入場できる(self) -> None:
+        """仮説が機能したので再発火を認める。ただし回数上限はかかる。"""
+        strategy = TakeIntraday(
+            TakeIntradayConfig(max_entries_per_symbol_per_day=2)
+        )
+        bars = {"7203": self._breaking()}
+        assert len(strategy.generate(self._now(), bars, ())) == 1
+
+        should, reason = strategy.should_close(
+            datetime(2026, 6, 1, 10, 0),
+            _position(),
+            (*_history(spread=10.0), _bar(0, 1029.0)),
+        )
+        assert should and reason == "take_profit"
+        assert len(strategy.generate(datetime(2026, 6, 1, 10, 5), bars, ())) == 1
+        # 2回で上限
+        assert strategy.generate(datetime(2026, 6, 1, 10, 10), bars, ()) == ()
+
+    def test_翌日にはリセットされる(self) -> None:
+        """**前日の損切りを引きずると翌日の正当なシグナルまで殺す。**"""
+        strategy = TakeIntraday()
+        bars = {"7203": self._breaking()}
+        strategy.generate(self._now(), bars, ())
+        strategy.should_close(
+            datetime(2026, 6, 1, 10, 0), _position(), (*_history(spread=10.0), _bar(0, 984.0))
+        )
+        assert strategy.generate(datetime(2026, 6, 1, 10, 5), bars, ()) == ()
+
+        # 翌日ぶんのバーを作って同じ状況を再現
+        next_day = [
+            _bar(m, 1000.0, high=1010.0, low=990.0, day_offset=1) for m in range(0, 30, 5)
+        ]
+        next_day.append(_bar(40, 1020.0, day_offset=1))
+        assert len(
+            strategy.generate(
+                datetime(2026, 6, 2, 9, 45), {"7203": (*_history(), *next_day)}, ()
+            )
+        ) == 1
+
+    def test_許可すれば再エントリーできる(self) -> None:
+        """検証で「禁止に意味があるか」を比較するための逃げ道。"""
+        strategy = TakeIntraday(
+            TakeIntradayConfig(reenter_after_stop=True, max_entries_per_symbol_per_day=3)
+        )
+        bars = {"7203": self._breaking()}
+        strategy.generate(self._now(), bars, ())
+        strategy.should_close(
+            datetime(2026, 6, 1, 10, 0), _position(), (*_history(spread=10.0), _bar(0, 984.0))
+        )
+        assert len(strategy.generate(datetime(2026, 6, 1, 10, 5), bars, ())) == 1
+
+    def test_回数上限はゼロを許さない(self) -> None:
+        with pytest.raises(ValueError):
+            TakeIntradayConfig(max_entries_per_symbol_per_day=0)

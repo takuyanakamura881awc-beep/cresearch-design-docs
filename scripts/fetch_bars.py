@@ -272,13 +272,29 @@ def main() -> int:
     print(f"  5分足  : {saved_5m}/{len(symbols)}銘柄")
     print(f"  保存先 : {DATA_ROOT.resolve()}")
 
-    both = [s.code for s in symbols if s.code not in missing_5m and s.code not in missing_daily]
+    both = [
+        s.code
+        for s in symbols
+        if s.code not in missing_5m and s.code not in missing_daily
+    ]
     print(f"  **両方そろった: {len(both)}銘柄**")
 
-    if missing_5m:
+    # **上場廃止と yfinance 側の欠損を切り分ける。**
+    # 日足も5分足も取れないなら上場廃止・ティッカー変更を疑う。
+    # 日足は取れて5分足だけ取れないなら、その銘柄が存在しないのではなく
+    # 分足の配信がないだけ（出来高が薄い時間帯が続くと起きる）。
+    gone = sorted(set(missing_5m) & set(missing_daily))
+    intraday_only = sorted(set(missing_5m) - set(missing_daily))
+    if gone:
         print()
-        print("  5分足が取れなかった銘柄は検証から外れる。")
-        print("  上場廃止やティッカー変更の可能性があるので、数が多いときは中身を確認する")
+        print(f"  日足も5分足も取れない（上場廃止・ティッカー変更を疑う）: {len(gone)}銘柄")
+        print(f"    {', '.join(gone[:10])}")
+        print("    → data/universe.json から外すことを検討する")
+    if intraday_only:
+        print()
+        print(f"  日足は取れるが5分足だけ取れない: {len(intraday_only)}銘柄")
+        print(f"    {', '.join(intraday_only[:10])}")
+        print("    → 上場はしている。yfinance 側の分足欠損。検証からは外れる")
 
     if not both:
         print()

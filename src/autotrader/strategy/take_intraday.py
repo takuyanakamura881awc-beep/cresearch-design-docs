@@ -85,6 +85,26 @@ class TakeIntradayConfig:
     take_profit_atr_mult: float = DEFAULT_TAKE_PROFIT_ATR_MULT
     atr_period: int = DEFAULT_ATR_PERIOD
     max_holding_minutes: int = DEFAULT_MAX_HOLDING_MINUTES
+    reenter_after_stop: bool = False
+    """損切りした銘柄に同じ日もう一度入るか。**既定は禁止。**
+
+    損切りは「その日のその仮説が外れた」という証拠であり、
+    新しい情報なしに同じ賭けを繰り返すのはコストを払うだけ。
+
+    実データ（39営業日）で禁止せずに回したところ、損切り直後に
+    シグナルAが再発火して入り直す往復が起き、**1日28.6トレード**まで膨らんだ
+    （想定は3〜5）。損切り83件の多くがこの往復だった。
+    """
+    max_entries_per_symbol_per_day: int = 1
+    """1銘柄あたり1日の最大エントリー回数。
+
+    利確で手仕舞った場合は仮説が機能したので再発火を認めるが、
+    **無制限にはしない。** 回転が増えるほど往復コストが積み上がる。
+
+    **暫定値。** Phase 4 のウォークフォワードで
+    「再エントリーを許す/許さない」の成績を比較して確定する
+    （プレミアム枠・寄り前気配と同じ検証構造）。
+    """
 
     def __post_init__(self) -> None:
         if self.range_start >= self.range_end:
@@ -103,6 +123,8 @@ class TakeIntradayConfig:
                 "利確倍率 > 損切り倍率 である必要がある。"
                 "逆だと勝率が高くても期待値が負になる"
             )
+        if self.max_entries_per_symbol_per_day < 1:
+            raise ValueError("max_entries_per_symbol_per_day は1以上")
 
 
 @dataclass(frozen=True)
@@ -180,6 +202,23 @@ class TakeIntraday(Strategy):
 
     def __init__(self, config: TakeIntradayConfig | None = None) -> None:
         self.config = config or TakeIntradayConfig()
+        # **その日の履歴。日付が変わったら捨てる。**
+        # 前日の損切りを引きずると、翌日の正当なシグナルまで殺してしまう。
+        self._day: date | None = None
+        self._entries: dict[str, int] = {}
+        self._stopped_out: set[str] = set()
+
+    def _roll_day(self, day: date) -> None:
+        if self._day != day:
+            self._day = day
+            self._entries = {}
+            self._stopped_out = set()
+
+    def _can_enter(self, symbol: str) -> bool:
+        cfg = self.config
+        if symbol in self._stopped_out and not cfg.reenter_after_stop:
+            return False
+        return self._entries.get(symbol, 0) < cfg.max_entries_per_symbol_per_day
 
     # ------------------------------------------------------------------
     # エントリー
@@ -191,15 +230,21 @@ class TakeIntraday(Strategy):
         bars: dict[str, tuple[Bar, ...]],
         positions: tuple[Position, ...],
     ) -> tuple[Signal, ...]:
+        self._roll_day(now.date())
         held = {p.symbol for p in positions}
         signals: list[Signal] = []
 
         for symbol, series in bars.items():
-            if symbol in held:
+            if symbol in held or not self._can_enter(symbol):
                 continue
             signal = self._for_symbol(symbol, series, now)
             if signal is not None:
                 signals.append(signal)
+                # **シグナルを出した時点で数える。**
+                # 約定したかどうかは戦略からは見えない（枠やレバレッジで
+                # 見送られることがある）。約定を待つと、見送られた銘柄に
+                # 毎バー出し続けることになる。
+                self._entries[symbol] = self._entries.get(symbol, 0) + 1
         return tuple(signals)
 
     def _for_symbol(
@@ -310,6 +355,7 @@ class TakeIntraday(Strategy):
         ここで False を返しても関係なくクローズされる。
         """
         cfg = self.config
+        self._roll_day(now.date())
         if not bars:
             return False, "hold"
         last = bars[-1]
@@ -321,6 +367,8 @@ class TakeIntraday(Strategy):
         move = (last.close - position.entry_price) * direction
 
         if move <= -cfg.stop_loss_atr_mult * atr:
+            # **損切りした銘柄を記録する。** その日もう入らないため
+            self._stopped_out.add(position.symbol)
             return True, "stop"
         if move >= cfg.take_profit_atr_mult * atr:
             return True, "take_profit"

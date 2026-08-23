@@ -144,10 +144,19 @@ def report(result: BacktestResult, n_days: int, label: str) -> None:
         pf = result.profit_factor
         print(f"  プロフィットファクタ: {'∞（要検査）' if pf == float('inf') else f'{pf:.2f}'}")
     print(f"  総リターン      : {result.total_return:+.2%}")
-    print(f"  最大DD          : {result.max_drawdown:.2%}")
-    sharpe = result.sharpe
-    note = "（サンプル不足で判定不能）" if sharpe == 0.0 and n_days < 21 else ""
-    print(f"  シャープ        : {sharpe:.2f}{note}")
+
+    # **途中停止したら、リスク指標は数字を出さない。**
+    # 残りの期間はエクイティカーブがフラットで、シャープも最大DDも
+    # 「取引していない期間」に薄められる。比較に使える数字ではない。
+    # report/metrics.py がサンプル不足で 0.0 を返すのと同じ思想。
+    if result.halted_early:
+        print("  最大DD          : 判定不能（途中停止）")
+        print("  シャープ        : 判定不能（途中停止）")
+    else:
+        print(f"  最大DD          : {result.max_drawdown:.2%}")
+        sharpe = result.sharpe
+        note = "（サンプル不足で判定不能）" if sharpe == 0.0 and n_days < 21 else ""
+        print(f"  シャープ        : {sharpe:.2f}{note}")
     print(f"  日次ブレーカー  : {result.breaker_days}日 発動")
     print(f"  途中停止        : {result.halted_early}")
     print(f"  レバレッジ見送り: {result.rejected_by_leverage}回")
@@ -165,15 +174,23 @@ def report(result: BacktestResult, n_days: int, label: str) -> None:
         sides = collections.Counter(t.side.value for t in result.trades)
         print(f"  方向            : {dict(sides)}")
         per_day = collections.Counter(t.exit_time.date() for t in result.trades)
-        avg = sum(per_day.values()) / len(per_day)
-        print(f"  1日あたり       : 平均 {avg:.1f}回（取引した{len(per_day)}日）")
-        if avg > 5:
-            print("    → 想定（3〜5回）を超えている。発火条件が緩い可能性")
+        traded = len(per_day)
+        # **分母を2通り出す。** 「取引した日だけ」で割ると回転の多さが見え、
+        # 「全営業日」で割ると実際の稼働率が見える。片方だけだと印象が偏る。
+        print(
+            f"  1日あたり       : 取引した{traded}日で平均 "
+            f"{sum(per_day.values()) / traded:.1f}回 / "
+            f"全{n_days}営業日なら平均 {result.n_trades / n_days:.1f}回"
+        )
+        if sum(per_day.values()) / traded > 5:
+            print("    → 取引した日は想定（3〜5回）を超えている。発火条件が緩い可能性")
+        last_day = max(per_day)
+        print(f"  最後に取引した日: {last_day}")
 
     if result.halted_early:
         print()
-        print("  **途中停止しているので総リターンを年率換算してはならない。**")
-        print("  残りの期間は取引していない。")
+        print("  **途中停止している。** 残りの期間は取引していない。")
+        print("  総リターンを年率換算してはならず、シャープ・最大DDも比較に使えない。")
 
 
 def main() -> int:

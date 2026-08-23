@@ -637,3 +637,49 @@ class TestWatchlist:
         )
         by_day = {(t.exit_time.day, t.symbol) for t in result.trades}
         assert by_day == {(1, "7203"), (2, "6758")}
+
+
+class TestCloseVerification:
+    """**クローズしたはずと仮定しない**（docs/05 #2 / CLAUDE.md 規約2）。
+
+    デイトレ信用の建玉を持ち越すと翌営業日に強制決済され1注文2,200円。
+    実データで「バーがなくて返済できない」ケースを踏んだので、
+    残存を実測してから当日クローズ済みと判定する。
+    """
+
+    def _gapped(self) -> dict[str, tuple[Bar, ...]]:
+        """大引け時刻（9:15）のバーだけ欠けた銘柄。
+
+        建玉は 9:05 に作られ、9:15 では約定価格を決められない。
+        9:20 のバーで再試行されなければ翌日に持ち越される。
+        """
+        full = _session(1, [1000.0] * 5)
+        gapped = tuple(b for b in full if b.timestamp.time() != time(9, 15))
+        return {"7203": gapped}
+
+    def test_返済できなかった建玉をその日のうちに再試行する(self) -> None:
+        result = run(
+            _BuyOnceStrategy(), self._gapped(), BacktestConfig(close_time=time(9, 15))
+        )
+        assert result.n_trades == 1
+        # 9:15 では約定できず、次の 9:20 で閉じている
+        assert result.trades[0].exit_time.time() == time(9, 20)
+        assert result.trades[0].exit_reason == "close_all"
+
+    def test_翌日に持ち越さない(self) -> None:
+        """当日クローズが失敗したまま日をまたぐのが最悪の失敗。"""
+        day1 = tuple(b for b in _session(1, [1000.0] * 5) if b.timestamp.time() != time(9, 15))
+        bars = {"7203": (*day1, *_session(2, [1000.0] * 5))}
+        result = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(9, 15)))
+        assert {t.exit_time.day for t in result.trades} == {1, 2}
+        assert all(t.exit_time.day == t.entry_time.day for t in result.trades)
+
+    def test_最後まで閉じられなければ残存として残る(self) -> None:
+        """最終バーが欠けていれば閉じようがない。**黙って消さない。**"""
+        full = _session(1, [1000.0] * 3)
+        # 建玉を作る 9:05 の後、9:10 のバーを消して閉じられなくする
+        gapped = tuple(b for b in full if b.timestamp.time() != time(9, 10))
+        result = run(
+            _BuyOnceStrategy(), {"7203": gapped}, BacktestConfig(close_time=time(9, 10))
+        )
+        assert result.n_trades == 0  # 閉じられていない = トレードとして成立しない
