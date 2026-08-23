@@ -410,6 +410,20 @@ def report_layer2(
         print("  → 流動性下限をさらに下げる（3億→2億で +25銘柄）か、")
         print("     max_watchlist を実態に合わせて下げるかを判断する。")
 
+    picked_costs = sorted(
+        round_trip_cost_atr(c.features.price, c.features.atr_yen)
+        for c in candidates
+        if c.symbol.code in {e.symbol.code for e in picked}
+    )
+    if picked_costs:
+        print()
+        print(
+            f"  選定後の往復コスト(ATR): 中央値 "
+            f"{picked_costs[len(picked_costs) // 2]:.4f} / "
+            f"最安 {picked_costs[0]:.4f} / 最高 {picked_costs[-1]:.4f}"
+        )
+        print("    **母集団の中央値より下がっていれば、選定がコストを見ている**")
+
     _print_loss_impact(picked, bars)
 
     if picked:
@@ -536,8 +550,11 @@ def sweep_concentration(
             continue
 
         selector = SelectorConfig(max_atr_pct=atr_ceiling)
-        passed = tuple(e.symbol for e in snapshot.entries)
-        tiers = {e.symbol.code: e.tier for e in snapshot.entries}
+        # ScreenResult.symbol は銘柄コードの文字列。Symbol そのものではない
+        # （report_layer2 と同じ形にする）
+        by_code = {sym.code: sym for sym in symbols}
+        passed = [by_code[r.symbol] for r in snapshot.passed if r.symbol in by_code]
+        tiers = {r.symbol: r.tier for r in snapshot.passed if r.tier is not None}
         candidates = build_candidates(as_of, passed, bars, tiers, selector)
 
         eligible = [

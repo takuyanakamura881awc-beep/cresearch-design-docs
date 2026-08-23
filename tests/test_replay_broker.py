@@ -116,6 +116,36 @@ class TestFillPrice:
             round_trip_cost_atr(2200.0, 20.0)
         )
 
+    def test_払ったコストを実測できる(self) -> None:
+        """**推定ではなく約定ごとに数える。**
+
+        ブレーカーが総リターンを閾値に張り付かせると、結果からコストを
+        逆算できなくなる（実測で -5.38% と -5.21% がほぼ同じになった）。
+        コストだけは常に直接読めるようにしておく。
+
+        1,000円・呼値1円・2tick なら片道1円。100株の往復で 200円。
+
+        約定価格は ``始値 × (1 + 率)`` の浮動小数点計算なので、
+        積算値には 1e-13 程度の相対誤差が乗る。**桁を丸めて比較する**
+        （500トレードでも 1e-10 円のオーダーで、金額として意味を持たない）。
+        """
+        broker = _broker(prices=(1000.0, 1000.0))
+        assert broker.total_slippage_yen == 0
+        broker.market_order("open", "7203", Side.LONG, 100, opening=True)
+        assert float(broker.total_slippage_yen) == pytest.approx(100.0)  # 片道
+        broker.advance()
+        broker.market_order("close", "7203", Side.LONG, 100, opening=False)
+        assert float(broker.total_slippage_yen) == pytest.approx(200.0)  # 往復
+        # 値動きゼロなので、損失はそのままコストに一致する
+        assert broker.trades[0].pnl == pytest.approx(-200.0)
+
+    def test_拒否された注文はコストに数えない(self) -> None:
+        """約定していない注文にコストは発生しない。"""
+        broker = _broker(cash=500_000)
+        with pytest.raises(OrderRejectedError):
+            broker.market_order("o", "7203", Side.LONG, 10_000, opening=True)  # 1000万円
+        assert broker.total_slippage_yen == 0
+
     def test_固定値を渡せば旧モデルを再現する(self) -> None:
         """再ベースラインの前後比較が成立する条件。"""
         bars = {"7203": (_bar("7203", 0, open_=1000.0),)}

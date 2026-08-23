@@ -190,6 +190,8 @@ class ReplayBroker(Broker):
         """
         self._turnover_cache: dict[str, Decimal | None] = {}
         self._shortable = shortable
+        self._slippage_paid = Decimal(0)
+        """払ったスリッページの累計（円）。**推定ではなく約定ごとの実測。**"""
 
     # ------------------------------------------------------------------
     # 時計
@@ -255,6 +257,28 @@ class ReplayBroker(Broker):
         if turnover is not None and turnover < THIN_TURNOVER_YEN:
             return base + THIN_SLIPPAGE_PENALTY_BPS
         return base
+
+    @property
+    def total_slippage_yen(self) -> Decimal:
+        """払ったスリッページの累計（円）。
+
+        **これを推定に頼らないための実測値。** ブレーカーが総リターンを
+        閾値に張り付かせると、`net = gross - cost` の分解を結果から
+        逆算できなくなる（実際に -5.38% と -5.21% がほぼ同じになった）。
+        コストだけは常に直接数えられる。
+
+        建玉を建てるとき・返すときの両方で、
+        ``|約定値 - 基準値| × 数量`` を足している。
+        """
+        return self._slippage_paid
+
+    def _record_slippage(self, reference: float, price: float, quantity: int) -> None:
+        """1回の約定で払ったスリッページを積算する。
+
+        **約定が確定してから呼ぶ。** レバレッジ判定で拒否された注文は
+        約定していないので、コストも発生しない。
+        """
+        self._slippage_paid += Decimal(str(abs(price - reference))) * quantity
 
     def _average_turnover(self, symbol: str) -> Decimal | None:
         if symbol not in self._turnover_cache:
@@ -396,6 +420,7 @@ class ReplayBroker(Broker):
         except LeverageViolationError as exc:
             raise OrderRejectedError(str(exc)) from exc
 
+        self._record_slippage(bar.open, price, order.quantity)
         self._positions[order.symbol] = Position(
             symbol=order.symbol,
             side=order.side,
@@ -420,6 +445,7 @@ class ReplayBroker(Broker):
             )
 
         price = self.fill_price(order.symbol, bar, position.side, opening=False)
+        self._record_slippage(bar.open, price, position.quantity)
         trade = Trade(
             symbol=order.symbol,
             side=position.side,

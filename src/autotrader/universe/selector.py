@@ -57,19 +57,51 @@ DEFAULT_VOLUME_LOOKBACK_DAYS = 20
 DEFAULT_PREMIUM_SCORE_MULTIPLIER = 1.3
 DEFAULT_PREMIUM_MAX_CONCURRENT = 1
 
-STAGE_A_FIELDS = ("atr_pct", "prev_volume_ratio", "prev_range_pct", "prev_close_position")
+STAGE_A_FIELDS = (
+    "atr_yen",
+    "atr_pct",
+    "prev_volume_ratio",
+    "prev_range_pct",
+    "prev_close_position",
+)
+"""スコアに使ってよい指標名。
+
+**`atr_pct` は既定では使わないが残してある。** 旧スコアを
+``SelectorConfig(weights={"atr_pct": 0.40, ...})`` で再現して A/B するため
+（`scripts/backtest_take.py --legacy-score`）。
+"""
 STAGE_B_FIELDS = ("gap_pct", "premarket_volume_ratio")
 
 DEFAULT_STAGE_A_WEIGHTS: dict[str, float] = {
-    "atr_pct": 0.40,
+    "atr_yen": 0.40,
     "prev_volume_ratio": 0.25,
     "prev_range_pct": 0.20,
     "prev_close_position": 0.15,
 }
 """既定の重み。config/universe.yaml の ``layer2.stage_a_weights`` と一致させること。
 
-**これは未検証の初期値。** Phase 3 のウォークフォワード検証で確定する
+**これは未検証の初期値。** Phase 4 のウォークフォワード検証で確定する
 （in-sample で決めて out-of-sample で検証する。in-sample の成績は数えない）。
+
+【なぜボラティリティ項が ATR% ではなく ATR円 なのか】
+
+**重みの数も 0.40 という値も変えていない。指標を差し替えただけ。**
+
+往復コストは ``スプレッド円 ÷ ATR円``（`autotrader.tick`）。
+ATR% は「株価が固定なら ATR円 に比例する」という前提の代理変数で、
+株価が 300〜1,250円に散らばる母集団では比例しない。
+
+実測（2026-08-24）で、ATR% で選んだ監視50銘柄の往復コストは
+**0.052〜0.121 ATR で2.3倍の開き**があった::
+
+    8012  1,156円  ATR% 3.30%  ATR 38.1円 → 0.0524 ATR  ← 最安
+    547A    447円  ATR% 3.71%  ATR 16.6円 → 0.1206 ATR  ← 最高
+
+ATR% はほぼ同じなのにコストは2.3倍違う。**スコアはこれを見ていなかった。**
+ATR円 に差し替えると、コストを実際に決めている量で並ぶ。
+
+順位正規化を入れたとき（`docs/00` 意思決定ログ19）と同じ種類の修正で、
+**新しい自由度を増やしていないので過学習の余地がない。**
 """
 
 

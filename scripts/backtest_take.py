@@ -48,10 +48,15 @@ from autotrader.risk.limits import (
 )
 from autotrader.risk.sizing import average_turnover_of, max_affordable_price
 from autotrader.strategy.take_intraday import TakeIntraday
-from autotrader.tick import half_spread_bps
-from autotrader.types import Bar, PriceTier, Symbol
+from autotrader.tick import half_spread_bps, round_trip_cost_atr, spread_yen
+from autotrader.types import Bar, PriceTier, Symbol, Trade
 from autotrader.universe.filters import FilterConfig, screen
-from autotrader.universe.selector import SelectorConfig, build_candidates, select
+from autotrader.universe.selector import (
+    DEFAULT_STAGE_A_WEIGHTS,
+    SelectorConfig,
+    build_candidates,
+    select,
+)
 
 DATA_ROOT = Path("data")
 CAPITAL = Decimal(500_000)
@@ -89,7 +94,7 @@ def daily_watchlists(
     trading_days: tuple[date, ...],
     filters: FilterConfig,
     selector: SelectorConfig,
-) -> tuple[dict[date, frozenset[str]], list[int]]:
+) -> tuple[dict[date, frozenset[str]], list[int], list[float]]:
     """営業日ごとに Layer 1 → Layer 2 を回して監視銘柄を決める。
 
     **その日より前の日足だけを使う。** `screen` に渡すバーも
@@ -97,10 +102,15 @@ def daily_watchlists(
     当日の終値で流動性や株価を判定すると、寄り前に知りえない情報で選ぶことになる。
 
     Returns:
-        (営業日 → 監視銘柄, 日ごとの選定数)。
+        (営業日 → 監視銘柄, 日ごとの選定数, 選ばれた銘柄の往復コスト（ATR単位）)。
+
+        **コストを ATR 単位で出せるのはここだけ。** 約定側は ATR を
+        持っておらず、トレードの値幅で代用すると指標が壊れる。
     """
     watchlist: dict[date, frozenset[str]] = {}
     counts: list[int] = []
+    costs: list[float] = []
+    """選ばれた銘柄の往復コスト（ATR単位）。**ATR を持っているのはここだけ。**"""
 
     for day in trading_days:
         past = {
@@ -122,7 +132,14 @@ def daily_watchlists(
         watchlist[day] = frozenset(e.symbol.code for e in picked)
         counts.append(len(picked))
 
-    return watchlist, counts
+        chosen = frozenset(e.symbol.code for e in picked)
+        costs.extend(
+            round_trip_cost_atr(c.features.price, c.features.atr_yen)
+            for c in candidates
+            if c.symbol.code in chosen
+        )
+
+    return watchlist, counts, costs
 
 
 def shortable_symbols(daily: dict[str, tuple[Bar, ...]]) -> frozenset[str]:
@@ -145,6 +162,26 @@ def shortable_symbols(daily: dict[str, tuple[Bar, ...]]) -> frozenset[str]:
     return frozenset(result)
 
 
+def _avg_notional(result: BacktestResult) -> float:
+    """1トレードあたりの平均建玉額（円）。コストの比率を出すのに使う。"""
+    if not result.trades:
+        return 1.0
+    return sum(t.entry_price * t.quantity for t in result.trades) / len(result.trades)
+
+
+def _trade_cost_bps(trade: Trade) -> float:
+    """そのトレードの往復コスト（bps）。
+
+    **ATR 単位ではなく bps で出す。** ATR は約定時点の値を持っておらず、
+    値幅（|出口 - 入口|）で代用すると損切り(1.5×ATR)・利確(2.5×ATR)・
+    時間切れ(ほぼ0)を同列に扱うことになり、指標そのものが壊れる。
+
+    ATR 単位のコストは ATR を持っている選定側で測る
+    （`_report_selection_cost`）。ここでは厳密に出せる bps にとどめる。
+    """
+    return float(spread_yen(trade.entry_price)) / trade.entry_price * 10_000.0
+
+
 def report(result: BacktestResult, n_days: int, label: str) -> None:
     hr(f"結果（{label}）")
     print(f"  期間            : {n_days}営業日")
@@ -154,6 +191,26 @@ def report(result: BacktestResult, n_days: int, label: str) -> None:
         pf = result.profit_factor
         print(f"  プロフィットファクタ: {'∞（要検査）' if pf == float('inf') else f'{pf:.2f}'}")
     print(f"  総リターン      : {result.total_return:+.2%}")
+
+    # --- コストは実測。ブレーカーが総リターンを閾値に張り付かせても読める ---
+    print()
+    print(f"  **払ったコスト  : {result.total_cost_yen:>10,.0f}円"
+          f"（資金の {result.cost_pct_of_capital:.2%}）**")
+    if result.n_trades:
+        print(
+            f"  1トレード平均   : {result.cost_per_trade_yen:>10,.0f}円"
+            f"（往復。建玉の {result.cost_per_trade_yen / _avg_notional(result):.3%}）"
+        )
+        costs = sorted(_trade_cost_bps(t) for t in result.trades)
+        mid = len(costs) // 2
+        print(
+            f"  往復コスト(bps) : 中央値 {costs[mid]:.1f} / "
+            f"最安 {costs[0]:.1f} / 最高 {costs[-1]:.1f}"
+            f"（**{costs[-1] / costs[0]:.1f}倍の開き**）"
+        )
+    print(f"  コスト前        : {result.gross_return:+.2%}"
+          "  ← net = gross - cost を解いただけ（推定ではない）")
+    print()
 
     # **途中停止したら、リスク指標は数字を出さない。**
     # 残りの期間はエクイティカーブがフラットで、シャープも最大DDも
@@ -224,6 +281,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--legacy-score",
+        action="store_true",
+        help=(
+            "スコアのボラティリティ項を ATR円 から ATR%% に戻す（差し替え前の挙動）。"
+            "選定がコストを見るようになったかの A/B に使う"
+        ),
+    )
+    parser.add_argument(
         "--max-concurrent",
         type=int,
         default=None,
@@ -261,9 +326,15 @@ def main() -> int:
 
     hr("2. Layer 2 の日次選定")
     print("  当日より前の日足だけで毎日選び直す")
+    # 旧スコアは「ATR円 の重みを ATR% に付け替える」だけ。重みの値は変えない
+    weights = dict(DEFAULT_STAGE_A_WEIGHTS)
+    if args.legacy_score:
+        weights = {"atr_pct" if k == "atr_yen" else k: v for k, v in weights.items()}
+        print("  **旧スコア**: ボラティリティ項を ATR% に戻して選定する")
+
     if args.max_concurrent is None:
         filters = FilterConfig()
-        selector = SelectorConfig()
+        selector = SelectorConfig(weights=weights)
         weight = DEFAULT_MAX_WEIGHT_PER_SYMBOL
     else:
         # 同時保有数を絞ると1銘柄あたり比率が上がり、買える株価の上限も上がる。
@@ -275,20 +346,33 @@ def main() -> int:
             price_normal_max=max(1, ceiling - 1),
             price_premium_max=ceiling,
         )
-        selector = SelectorConfig(max_atr_pct=max_atr_pct(max_weight_per_symbol=weight))
+        selector = SelectorConfig(
+            max_atr_pct=max_atr_pct(max_weight_per_symbol=weight),
+            weights=weights,
+        )
         print(f"  同時保有 {args.max_concurrent} 銘柄として選定する")
         print(
             f"    1銘柄比率 {weight:.0%} / 株価上限 {ceiling:,}円 / "
             f"ATR%上限 {selector.max_atr_pct:.2%} / "
             f"ATR円上限 {float(max_atr_yen(CAPITAL)):.1f}円（比率に依存しない）"
         )
-    watchlist, counts = daily_watchlists(
+    watchlist, counts, sel_costs = daily_watchlists(
         tuple(s for s in symbols if s.code in daily), daily, trading_days, filters, selector
     )
     filled = sum(1 for c in counts if c >= selector.max_watchlist)
     print(f"  1日あたりの監視銘柄: 平均 {sum(counts) / len(counts):.1f} / "
           f"最小 {min(counts)} / 最大 {max(counts)}")
     print(f"  枠({selector.max_watchlist})が埋まった日: {filled}/{len(counts)}")
+    if sel_costs:
+        ordered = sorted(sel_costs)
+        mid = len(ordered) // 2
+        print(
+            f"  往復コスト(ATR): 中央値 {ordered[mid]:.4f} / "
+            f"最安 {ordered[0]:.4f} / 最高 {ordered[-1]:.4f}"
+            f"（**{ordered[-1] / ordered[0]:.1f}倍の開き**）"
+        )
+        print("     スプレッド円 ÷ ATR円。**選定がコストを見ているかの判定はこれ**")
+
     if min(counts) == 0:
         empty = [d for d, c in zip(trading_days, counts, strict=True) if c == 0]
         print(f"  **選定できなかった日が {len(empty)} 日ある**: {empty[:5]}")

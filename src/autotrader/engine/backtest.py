@@ -53,6 +53,7 @@ from autotrader.types import Bar, Side, Trade
 
 logger = logging.getLogger(__name__)
 
+
 class PointInTimeView:
     """指定時刻の時点で参照してよいデータだけを露出させるビュー。
 
@@ -198,6 +199,15 @@ class BacktestResult:
     True の場合、**残りの期間は取引していない**。
     総リターンをそのまま年率換算してはならない。
     """
+    total_cost_yen: float = 0.0
+    """払ったスリッページの累計（円）。**推定ではなく約定ごとの実測。**
+
+    **ブレーカーが有効だと総リターンからはコストを逆算できない。**
+    移動窓(#5)が閾値で止めるため、総リターンは -5% 前後に張り付き、
+    コストを半分にしても結果がほとんど動かない（実測で -5.38% と -5.21%）。
+    `net = gross - cost` の cost を直接数えることでしか分解できない。
+    """
+
     rejected_by_leverage: int = 0
     """レバレッジ1倍の上限で発注を見送った回数。
 
@@ -205,6 +215,30 @@ class BacktestResult:
     バグではない。ただし極端に多い場合はサイジングが資金量に合っていない
     （1銘柄あたりの目標額が大きすぎる）ことを示す。
     """
+
+    @property
+    def cost_pct_of_capital(self) -> float:
+        """払ったコストが初期資金の何%か。"""
+        if self.initial_cash <= 0:
+            return 0.0
+        return self.total_cost_yen / self.initial_cash
+
+    @property
+    def cost_per_trade_yen(self) -> float:
+        """1トレードあたりの往復コスト（円）。"""
+        if self.n_trades == 0:
+            return 0.0
+        return self.total_cost_yen / self.n_trades
+
+    @property
+    def gross_return(self) -> float:
+        """コスト**前**のリターン。``net = gross - cost`` を解いただけ。
+
+        **推定ではない。** コストが実測になったので、これも実測から決まる。
+        """
+        if self.initial_cash <= 0:
+            return 0.0
+        return self.total_return + self.cost_pct_of_capital
 
     @classmethod
     def from_equity(
@@ -217,6 +251,7 @@ class BacktestResult:
         breaker_days: int = 0,
         halted_early: bool = False,
         skipped_shorts: int = 0,
+        total_cost_yen: float = 0.0,
     ) -> BacktestResult:
         """エクイティカーブとトレード列から指標をまとめて算出する。
 
@@ -239,6 +274,7 @@ class BacktestResult:
             breaker_days=breaker_days,
             halted_early=halted_early,
             skipped_shorts=skipped_shorts,
+            total_cost_yen=total_cost_yen,
         )
 
 
@@ -464,6 +500,7 @@ def run(
         breaker_days=len(breaker_days),
         halted_early=halted_for_good,
         skipped_shorts=skipped_shorts,
+        total_cost_yen=float(broker.total_slippage_yen),
     )
 
 

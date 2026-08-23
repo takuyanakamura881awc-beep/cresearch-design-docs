@@ -329,6 +329,37 @@ class TestSelect:
         picked = select(candidates, self.TRADE_DATE)
         assert [e.symbol.code for e in picked] == ["B"]
 
+    def test_同じATRパーセントでもATR円が大きい銘柄が上位(self) -> None:
+        """**スコアを ATR% から ATR円 に差し替えた理由。**
+
+        往復コストは ``スプレッド円 ÷ ATR円``。ATR% が同じでも株価が
+        違えばコストは違う。実測では監視50銘柄の中で2.3倍ばらついていた。
+        """
+        rich = _candidate("RICH", atr_pct=0.033, price=1200.0)   # ATR 39.6円
+        poor = _candidate("POOR", atr_pct=0.033, price=400.0)    # ATR 13.2円
+        picked = select([rich, poor], self.TRADE_DATE)
+        assert [e.symbol.code for e in picked] == ["RICH", "POOR"]
+
+    def test_旧スコアなら株価を見ない(self) -> None:
+        """`--legacy-score` 相当。ATR% が同点なら他の指標で決まる。
+
+        差し替えの A/B が成立する条件なので固定しておく。
+        """
+        legacy = SelectorConfig(
+            weights={
+                "atr_pct": 0.40,
+                "prev_volume_ratio": 0.25,
+                "prev_range_pct": 0.20,
+                "prev_close_position": 0.15,
+            }
+        )
+        rich = _candidate("RICH", atr_pct=0.033, price=1200.0)
+        poor = _candidate("POOR", atr_pct=0.033, price=400.0)
+        scores = {
+            e.symbol.code: e.score for e in select([rich, poor], self.TRADE_DATE, legacy)
+        }
+        assert scores["RICH"] == pytest.approx(scores["POOR"])
+
     def test_下限は株価で動く(self) -> None:
         """**これが ATR% を捨てて円建てにした理由。**
 

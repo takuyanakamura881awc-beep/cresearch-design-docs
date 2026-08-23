@@ -468,6 +468,36 @@ class TestWalkForward:
             )
 
 
+class TestCostAccounting:
+    """**コストは推定ではなく実測する。**
+
+    ブレーカーが有効だと総リターンは閾値（-5%前後）に張り付き、
+    コストを半分にしても結果がほとんど動かない（実測で -5.38% と -5.21%）。
+    総リターンから `net = gross - cost` を逆算できない以上、
+    コストは直接数えるしかない。
+    """
+
+    def test_コストが正で総リターンより上に出る(self) -> None:
+        result = BacktestResult.from_equity(
+            [500_000.0, 495_000.0], [], 500_000.0, total_cost_yen=3_000.0
+        )
+        assert result.total_cost_yen == 3_000.0
+        assert result.cost_pct_of_capital == pytest.approx(0.006)
+        # gross = net + cost。コストがなければどうだったか
+        assert result.gross_return == pytest.approx(result.total_return + 0.006)
+        assert result.gross_return > result.total_return
+
+    def test_トレードがなければゼロ割りしない(self) -> None:
+        result = BacktestResult.from_equity([], [], 500_000.0)
+        assert result.cost_per_trade_yen == 0.0
+        assert result.cost_pct_of_capital == 0.0
+
+    def test_初期資金ゼロでもゼロ割りしない(self) -> None:
+        result = BacktestResult.from_equity([], [], 0.0, total_cost_yen=100.0)
+        assert result.cost_pct_of_capital == 0.0
+        assert result.gross_return == 0.0
+
+
 class TestBacktestConfig:
     def test_既定はStageA(self) -> None:
         config = BacktestConfig()
