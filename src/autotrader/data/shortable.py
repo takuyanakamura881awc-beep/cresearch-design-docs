@@ -16,7 +16,7 @@ from datetime import date
 
 def fetch_shortable_symbols(as_of: date) -> frozenset[str]:
     """指定日に一般信用（デイトレ）で売建可能な銘柄を取得する。"""
-    raise NotImplementedError("Phase 1 で実装する")
+    raise NotImplementedError("Stage B（Phase 4）で実装する")
 
 
 def fetch_price_restricted_symbols(as_of: date) -> frozenset[str]:
@@ -24,4 +24,4 @@ def fetch_price_restricted_symbols(as_of: date) -> frozenset[str]:
 
     直近公表価格から一定以上下落した銘柄が対象。発注が弾かれるため事前に除外する。
     """
-    raise NotImplementedError("Phase 1 で実装する")
+    raise NotImplementedError("Stage B（Phase 4）で実装する")

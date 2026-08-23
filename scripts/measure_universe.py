@@ -35,12 +35,17 @@ from autotrader.config import load_credentials, mask
 from autotrader.data.base import DataSourceError, RateLimitError
 from autotrader.data.jquants import JQuantsDataSource
 from autotrader.risk.sizing import max_affordable_price
-from autotrader.types import Bar, Symbol
+from autotrader.types import Bar, PriceTier, Symbol
 from autotrader.universe.builder import build
 from autotrader.universe.filters import (
     DEFAULT_PRICE_HARD_MIN,
     FilterConfig,
     RejectReason,
+)
+from autotrader.universe.selector import (
+    SelectorConfig,
+    build_candidates,
+    select,
 )
 
 TURNOVER_DAYS = 20
@@ -263,9 +268,10 @@ def _print_price_distribution(
 ) -> None:
     """採用候補の水準で、株価帯ごとの銘柄数を出す。
 
-    **通常枠とプレミアム枠の新しい境界を数字で決めるために使う。**
-    現行の「通常 300〜2,000円 / プレミアム 2,000〜3,000円」は
-    株価上限1,250円のもとでは到達不能になるため、切り直す必要がある。
+    枠の境界そのものは分布ではなく安全装置から導出してある
+    （通常枠1,000円 = 資金 ÷ max_concurrent(5) ÷ 100株、
+    プレミアム上限1,250円 = 資金 × 25% ÷ 100株）。
+    ここで見るのは、その境界で母集団が偏りすぎていないかの確認。
     """
     hr(f"6. 株価帯の分布（流動性 {min_turnover / 10**8:.0f}億円以上）")
     print("  枠の境界を決めるための内訳。1単元 = 株価 × 100株。")
@@ -292,6 +298,91 @@ def _print_price_distribution(
             f"{band:>4}銘柄  （累計 {snapshot.size:>4}）"
         )
         previous = snapshot.size
+
+
+def report_layer2(
+    as_of: date,
+    source: JQuantsDataSource,
+    symbols: tuple[Symbol, ...],
+    bars: dict[str, tuple[Bar, ...]],
+) -> None:
+    """Layer 1 → Layer 2 を実データで通し、監視枠が埋まるかを確かめる。
+
+    【なぜこれを測るのか】
+
+    Layer 1 の通過数が監視枠50の2.7倍あっても、**Layer 2 はさらに
+    ATR% >= 2% で足切りする**。ここで大きく削れると「50枠に対して候補が
+    50前後」となり、選定がまた無意味になる。
+
+    Layer 1 の数字だけを見て「母集団は足りた」と判断すると、
+    この段階の目減りを見落とす。**通しで測る。**
+
+    追加のAPI照会はゼロ（収集済みの日足で `compute_features` の
+    必要本数 20 をちょうど満たす）。
+    """
+    hr("7. Layer 2 まで通す（監視枠が埋まるか）")
+
+    config = FilterConfig()
+    try:
+        snapshot = build(as_of, source, config, bars_by_symbol=bars, symbols=symbols)
+    except (DataSourceError, ValueError) as exc:
+        print(f"  NG: Layer 1 を構築できなかった — {exc}")
+        return
+
+    by_code = {s.code: s for s in symbols}
+    passed = [by_code[r.symbol] for r in snapshot.passed if r.symbol in by_code]
+    tiers = {r.symbol: r.tier for r in snapshot.passed if r.tier is not None}
+
+    # 翌営業日を売買日とみなす。当日のバーは build_candidates が入口で落とす
+    trade_date = as_of + timedelta(days=1)
+    selector = SelectorConfig()
+    candidates = build_candidates(trade_date, passed, bars, tiers, selector)
+
+    print(f"  Layer 1 通過        : {snapshot.size:>4}銘柄")
+    print(
+        f"  指標を計算できた    : {len(candidates):>4}銘柄"
+        f"（日足{selector.min_bars}本が必要。不足 {snapshot.size - len(candidates)}）"
+    )
+    if not candidates:
+        print("  NG: 指標を計算できる銘柄がない。収集した営業日数を確認する")
+        return
+
+    atrs = sorted(c.features.atr_pct for c in candidates)
+    eligible = [c for c in candidates if c.features.atr_pct >= selector.min_atr_pct]
+    print(
+        f"  ATR% >= {selector.min_atr_pct:.0%} を満たす : {len(eligible):>4}銘柄"
+        f"（{len(eligible) / len(candidates):.0%}）"
+    )
+    print(
+        f"  ATR% の分布         : 中央値 {atrs[len(atrs) // 2]:.2%} / "
+        f"上位25% {atrs[int(len(atrs) * 0.75)]:.2%} / 最大 {atrs[-1]:.2%}"
+    )
+
+    picked = select(candidates, trade_date, selector)
+    n_premium = sum(1 for e in picked if e.price_tier is PriceTier.PREMIUM)
+    print()
+    print(
+        f"  **選定された        : {len(picked):>4}銘柄"
+        f"（監視枠 {selector.max_watchlist}）**"
+        f"  通常{len(picked) - n_premium} / プレミアム{n_premium}"
+    )
+
+    if len(picked) < selector.max_watchlist:
+        print()
+        print(f"  監視枠 {selector.max_watchlist} を埋められていない。")
+        print("  → 流動性下限をさらに下げる（3億→2億で +25銘柄）か、")
+        print("     max_watchlist を実態に合わせて下げるかを判断する。")
+
+    if picked:
+        print()
+        print("  上位10銘柄:")
+        for entry in picked[:10]:
+            bar = bars[entry.symbol.code][-1]
+            print(
+                f"    {entry.symbol.code}  {bar.close:>7,.0f}円  "
+                f"スコア {entry.score:.3f}  ATR% {entry.atr_pct:>5.2%}  "
+                f"{entry.price_tier.value}  {entry.symbol.name[:16]}"
+            )
 
 
 def main() -> int:
@@ -385,6 +476,7 @@ def main() -> int:
               f"{snapshot.size / WATCHLIST_SLOTS:.1f}倍あり、選定の余地がある")
 
     sweep_turnover(as_of, source, symbols, bars)
+    report_layer2(as_of, source, symbols, bars)
 
     print()
     print("  この結果を config/universe.yaml と docs/03-universe.md に反映してから")

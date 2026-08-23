@@ -29,7 +29,7 @@ class Recorder:
     """
 
     def __init__(self, output_dir: Path, symbols: tuple[str, ...]) -> None:
-        raise NotImplementedError("Phase 1 で実装する")
+        raise NotImplementedError("Stage B で実装する")
 
     def run(self) -> None:
         """場中、分足を受信して逐次書き出す。
@@ -37,7 +37,7 @@ class Recorder:
         プロセスが落ちてもそれまでのデータが残るよう、
         メモリに溜め込まず逐次フラッシュすること。
         """
-        raise NotImplementedError("Phase 1 で実装する")
+        raise NotImplementedError("Stage B で実装する")
 
 
 def check_gaps(output_dir: Path, trade_date: date) -> tuple[str, ...]:
@@ -49,4 +49,4 @@ def check_gaps(output_dir: Path, trade_date: date) -> tuple[str, ...]:
     Returns:
         欠損が見つかった銘柄コード。
     """
-    raise NotImplementedError("Phase 1 で実装する")
+    raise NotImplementedError("Stage B で実装する")

@@ -11,6 +11,10 @@ from decimal import Decimal
 import pytest
 
 from autotrader.risk.sizing import calc_quantity, max_affordable_price
+from autotrader.universe.filters import (
+    DEFAULT_PRICE_NORMAL_MAX,
+    DEFAULT_PRICE_PREMIUM_MAX,
+)
 
 
 class TestCalcQuantity:
@@ -47,13 +51,20 @@ class TestCalcQuantity:
 
 class TestMaxAffordablePrice:
     def test_50万円の25パーセントで買える最大株価は1250円(self) -> None:
-        """**ユニバースの株価上限3,000円と食い違う。**
-
-        1銘柄あたり総資産25%（docs/05-risk-management.md #7）を守る限り、
-        1,250円を超える銘柄は1単元すら建てられない。
-        選定は通るがサイジングで0株になる銘柄が生まれる。
-        """
+        """1銘柄あたり総資産25%（docs/05-risk-management.md #7）から決まる上限。"""
         assert max_affordable_price(Decimal(500_000)) == Decimal(1250)
+
+    def test_ユニバースの株価上限と一致する(self) -> None:
+        """**この2つがずれると、選定は通るがサイジングで0株になる銘柄が生まれる。**
+
+        エラーにならず静かに機会を失うだけなので、テストで固定しておく。
+        実際に上限3,000円だった時期は、1,483銘柄中502がこの状態だった。
+        """
+        assert max_affordable_price(Decimal(500_000)) == DEFAULT_PRICE_PREMIUM_MAX
+
+    def test_通常枠の上限は同時保有数から決まる(self) -> None:
+        """5銘柄同時に持つには 1銘柄 ≤ 100% / 5 = 20% = 10万円 → 株価1,000円。"""
+        assert max_affordable_price(Decimal(500_000), 1 / 5) == DEFAULT_PRICE_NORMAL_MAX
 
     def test_資金が増えれば上がる(self) -> None:
         assert max_affordable_price(Decimal(3_000_000)) == Decimal(7500)

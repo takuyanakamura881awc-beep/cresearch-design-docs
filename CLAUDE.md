@@ -171,20 +171,39 @@ pytest
 
 ## 現在のステータス
 
-**Phase 1（Stage A のデータ基盤）完了。Phase 2 進行中。**
+**Phase 1・Phase 2 完了。次は Phase 3（竹の実装）。**
 
 Phase 1: `data/base.py`（DataSource抽象化・フォールバック）、`data/jquants.py`（V2）、
-`data/yahoo.py`、`data/store.py`（TTLキャッシュ）、`config.py`、
-`scripts/verify_data_sources.py`。**実機で全項目を実測済み。**
+`data/yahoo.py`、`data/store.py`、`config.py`、`scripts/verify_data_sources.py`。
 
-Phase 2 のうち完了:
+Phase 2:
 
 - `universe/filters.py` / `universe/builder.py` — Layer 1（ハードフィルタ）
 - `universe/selector.py` — Layer 2（順位変換スコアリング・プレミアム枠）
-- `scripts/measure_universe.py` — **実測: Layer 1 の通過は287銘柄**
-  （全上場4,451 → プライム1,565 → 貸借1,483 → 株価帯951 → 流動性287）
+- `engine/backtest.py` — `PointInTimeView`・`run`・`walk_forward`
+- `broker/replay.py` — Stage A の約定モデル（レバレッジとショートストップを強制）
+- `report/metrics.py` / `risk/leverage.py` / `risk/sizing.py` / `data/calendar.py`
 
-**残り: `engine/backtest.py`（`PointInTimeView` による時点データ制限）と
-`data/calendar.py`（営業日・決算日）。** そのあとバイアス検査。
+### 実測で確定した値（2026-08-23 / 基準日 2026-05-29）
 
-Phase 2 完了後は Phase 3（竹の実装）。工程は `docs/00-overview.md` を参照。
+```
+全上場 4,451 → プライム 1,565 → 貸借 1,483 → Layer 1 通過 133銘柄
+```
+
+**株価上限とレバレッジ上限が食い違っていたのを実測で発見して直した。**
+1銘柄あたり25%を守ると買える最大株価は1,250円で、旧上限3,000円のもとでは
+1,483中502銘柄が「選定を通ってもサイジングで0株になる」状態だった。
+
+| 値 | 確定値 | 由来 |
+|---|---|---|
+| 株価上限 | **1,250円** | 資金 × 25%(#7) ÷ 100株 |
+| 通常枠の上限 | **1,000円** | 資金 ÷ max_concurrent(5) ÷ 100株 |
+| 流動性下限 | **3億円** | 100銘柄を超える最も厳しい水準（実測） |
+
+**上限比率25%は動かさない。** 日次ブレーカー(-2%)と1.5×ATR損切りからの
+逆算値で、40%にすると ATR 4% の銘柄で1敗が当日を終わらせる。
+
+**残り: `measure_universe.py` セクション7で ATR% 足切り後も監視枠50が
+埋まるかの確認。** そのあとバイアス検査（`backtest-validator`）→ Phase 3。
+
+工程は `docs/00-overview.md` を参照。

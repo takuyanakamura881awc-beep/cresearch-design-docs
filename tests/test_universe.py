@@ -34,7 +34,7 @@ def _symbol(
 
 
 def _bars(
-    close: float = 1500.0,
+    close: float = 900.0,
     turnover: float | None = 2_000_000_000.0,
     n: int = 25,
     limit_up: bool = False,
@@ -61,7 +61,13 @@ def _bars(
 class TestPriceTier:
     """**50万円という資金では、単元100株が最も厳しい制約になる。**
 
-    株価P円の1単元 = 100P円。3,000円の銘柄は1単元30万円で資金の60%を占める。
+    株価P円の1単元 = 100P円。境界は分布ではなく**既存の安全装置から導出**する::
+
+        通常枠の上限   = 50万 ÷ max_concurrent(5) ÷ 100株 = 1,000円
+        プレミアム上限 = 50万 × 上限比率(25%)      ÷ 100株 = 1,250円
+
+    1,000円を超えると5銘柄同時に持てなくなり（4銘柄に減る）、
+    1,250円を超えると**1単元すら建てられない**。
     """
 
     @pytest.mark.parametrize(
@@ -69,11 +75,11 @@ class TestPriceTier:
         [
             (299.0, None),  # 1ティック(1円)が0.33%以上でコスト過大
             (300.0, PriceTier.NORMAL),
-            (1500.0, PriceTier.NORMAL),  # 1単元15万円。理想的
-            (2000.0, PriceTier.NORMAL),
-            (2000.5, PriceTier.PREMIUM),
-            (3000.0, PriceTier.PREMIUM),  # 1単元30万円。資金の60%
-            (3000.5, None),  # 分散が成立しない
+            (900.0, PriceTier.NORMAL),  # 1単元9万円。5銘柄持てる
+            (1000.0, PriceTier.NORMAL),  # 1単元10万円 = 資金の20%。5銘柄がちょうど
+            (1000.5, PriceTier.PREMIUM),
+            (1250.0, PriceTier.PREMIUM),  # 1単元12.5万円 = 25%。4銘柄まで
+            (1250.5, None),  # 25%上限に抵触し1単元も建てられない
             (10000.0, None),
         ],
     )
@@ -81,6 +87,16 @@ class TestPriceTier:
         self, price: float, expected: PriceTier | None
     ) -> None:
         assert classify_price_tier(price) == expected
+
+    def test_1単元が上限比率を超える株価は対象外になる(self) -> None:
+        """**選定を通してもサイジングで0株になる銘柄を母集団に入れない。**
+
+        エラーにならず静かに機会を失うだけなので、入口で落とす。
+        実測では上限3,000円のとき、この状態の銘柄が1,483中502あった。
+        """
+        assert classify_price_tier(1251.0) is None
+        assert classify_price_tier(2000.0) is None  # かつては通常枠だった
+        assert classify_price_tier(3000.0) is None  # かつてはプレミアム枠だった
 
     def test_有名な高株価銘柄は対象外になる(self) -> None:
         """50万円ではソニーやキーエンスのような銘柄は扱えない。
@@ -92,29 +108,40 @@ class TestPriceTier:
         assert classify_price_tier(60000.0) is None
 
     def test_資金が増えれば上限を緩められる(self) -> None:
-        """株価レンジは資金量の関数。"""
+        """株価レンジは資金量の関数。300万円なら 300万 × 25% ÷ 100 = 7,500円まで。"""
         assert classify_price_tier(5000.0) is None
-        assert classify_price_tier(5000.0, premium_max=8000) == PriceTier.PREMIUM
+        assert classify_price_tier(5000.0, normal_max=6000, premium_max=7500) == (
+            PriceTier.NORMAL
+        )
+        assert classify_price_tier(7000.0, normal_max=6000, premium_max=7500) == (
+            PriceTier.PREMIUM
+        )
 
 
 class TestLiquidity:
     def test_売買代金が閾値以上なら通る(self) -> None:
-        assert passes_liquidity(Decimal(1_000_000_000))
+        """下限は3億円。**実測で10億円から引き下げた。**
+
+        10億円だと株価上限1,250円との組み合わせで55銘柄しか残らず、
+        監視枠50の1.1倍で Layer 2 の選定が機能しなかった。
+        10〜15万円の注文は3億円銘柄でも売買代金の0.033〜0.050%で、板を動かさない。
+        """
+        assert passes_liquidity(Decimal(300_000_000))
         assert passes_liquidity(Decimal(5_000_000_000))
 
     def test_薄い銘柄は落とす(self) -> None:
         """自分の注文が板を動かすと約定モデルが成立しない。"""
-        assert not passes_liquidity(Decimal(999_999_999))
+        assert not passes_liquidity(Decimal(299_999_999))
 
     def test_実売買代金があればそれを使う(self) -> None:
         """J-Quants の Va。終値×出来高の近似より正確。"""
-        bars = _bars(close=1000.0, turnover=3_000_000_000.0, n=20)
+        bars = _bars(close=900.0, turnover=3_000_000_000.0, n=20)
         assert average_turnover(bars) == Decimal(3_000_000_000)
 
     def test_売買代金がなければ終値かける出来高で近似する(self) -> None:
         """yfinance 由来のバーには売買代金がない。"""
         bars = _bars(close=1000.0, turnover=None, volume=5000, n=20)
-        assert average_turnover(bars) == Decimal(5_000_000)
+        assert average_turnover(bars) == Decimal(5_000_000)  # 1000 × 5000
 
     def test_日数が足りなければNoneを返す(self) -> None:
         """少ない日数の平均は流動性の判定として信用できない。
@@ -165,7 +192,8 @@ class TestScreen:
         assert result.reason is RejectReason.PRICE_TOO_LOW
 
     def test_株価が高すぎれば落ちる(self) -> None:
-        result = screen(_symbol(), _bars(close=5000.0))
+        """1,250円超は1単元が資金の25%を超え、1単元すら建てられない。"""
+        result = screen(_symbol(), _bars(close=1300.0))
         assert result.reason is RejectReason.PRICE_TOO_HIGH
 
     def test_流動性が足りなければ落ちる(self) -> None:
@@ -210,7 +238,7 @@ class TestScreen:
 class TestFilterConfig:
     def test_株価レンジの大小関係を検証する(self) -> None:
         with pytest.raises(ValueError):
-            FilterConfig(price_hard_min=3000, price_normal_max=2000)
+            FilterConfig(price_hard_min=1500, price_normal_max=1000)
 
     def test_遡及日数はゼロを許さない(self) -> None:
         with pytest.raises(ValueError):
