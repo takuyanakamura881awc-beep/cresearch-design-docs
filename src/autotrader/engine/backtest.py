@@ -33,6 +33,11 @@ from autotrader.report.metrics import (
     to_returns,
     win_rate,
 )
+from autotrader.risk.limits import (
+    check_consecutive_loss,
+    check_daily_loss,
+    check_max_drawdown,
+)
 from autotrader.risk.sizing import calc_quantity, target_notional
 from autotrader.strategy.base import Strategy
 from autotrader.types import Bar, Side, Trade
@@ -165,6 +170,18 @@ class BacktestResult:
     equity_curve: tuple[float, ...]
     trades: tuple[Trade, ...] = ()
     initial_cash: float = 0.0
+    breaker_days: int = 0
+    """日次損失ブレーカー（#4）が発動した日数。
+
+    **成績の解釈に要る。** 発動日が多いなら、1トレードあたりのリスクが
+    資金量に対して大きすぎる（docs/04 のトレード頻度想定を参照）。
+    """
+    halted_early: bool = False
+    """連続損失（#5）か累積DD（#6）で期間の途中から停止したか。
+
+    True の場合、**残りの期間は取引していない**。
+    総リターンをそのまま年率換算してはならない。
+    """
     rejected_by_leverage: int = 0
     """レバレッジ1倍の上限で発注を見送った回数。
 
@@ -181,6 +198,8 @@ class BacktestResult:
         initial_cash: float,
         periods_per_year: int = 252,
         rejected_by_leverage: int = 0,
+        breaker_days: int = 0,
+        halted_early: bool = False,
     ) -> BacktestResult:
         """エクイティカーブとトレード列から指標をまとめて算出する。
 
@@ -200,6 +219,8 @@ class BacktestResult:
             trades=tuple(trades),
             initial_cash=initial_cash,
             rejected_by_leverage=rejected_by_leverage,
+            breaker_days=breaker_days,
+            halted_early=halted_early,
         )
 
 
@@ -219,6 +240,19 @@ class BacktestConfig:
     """同時保有の上限（安全装置 #7）。"""
     max_weight_per_symbol: float = 0.25
     """1銘柄あたり総資産の上限（安全装置 #7）。"""
+    daily_loss_pct: float = -0.02
+    """日次損失上限（安全装置 #4）。当日全停止 + 全クローズ。"""
+    consecutive_loss_days: int = 3
+    """連続損失で停止する営業日数（安全装置 #5）。以降は再開しない。"""
+    max_drawdown_pct: float = -0.15
+    """累積ドローダウンの上限（安全装置 #6）。以降は再開しない。"""
+    enforce_breakers: bool = True
+    """ブレーカーを再現するか。
+
+    **False にするのは「ブレーカーの寄与を測る」ときだけ。**
+    切って出した成績を採用してはならない。実運用では止まっていた日の
+    取引を含んだ、実現不可能な成績になる。
+    """
 
     def __post_init__(self) -> None:
         if self.initial_cash <= 0:
@@ -280,21 +314,32 @@ def run(
     order_seq = 0
     current_day: date | None = None
     closed_today = False
+    halted_for_good = False
+    breaker_days: list[date] = []
+    day_open_equity = float(cfg.initial_cash)
 
     while not broker.exhausted:
         now = broker.now
         if now.date() != current_day:
+            # 日をまたぐ。日次ブレーカーは翌営業日に自動復帰する（#4）
             current_day = now.date()
             closed_today = False
+            day_open_equity = broker.equity()
 
         view = PointInTimeView(bars, now)
         positions = broker.get_positions()
 
-        # 1. 手仕舞い。当日クローズは戦略の判断より優先する
-        force_close = not closed_today and now.time() >= cfg.close_time
+        # 1. 手仕舞い。当日クローズとブレーカーは戦略の判断より優先する
+        #
+        # **日中の損益で判定する。** 日次終値だけで見ると、日中に -2% を
+        # 割ってから戻した日を見逃し、実運用では止まっていた取引を成績に含める。
+        tripped = _daily_breaker_tripped(broker, cfg, day_open_equity, closed_today)
+        if tripped and current_day not in breaker_days:
+            breaker_days.append(current_day)
+        force_close = tripped or (not closed_today and now.time() >= cfg.close_time)
         for position in positions:
             if force_close:
-                should, reason = True, "close_all"
+                should, reason = True, "daily_breaker" if tripped else "close_all"
             else:
                 should, reason = strategy.should_close(
                     now, position, view.get(position.symbol)
@@ -318,11 +363,17 @@ def run(
         if force_close:
             closed_today = True
 
-        # 2. 新規建て。当日クローズ後は同じ日に建て直さない
-        if not closed_today:
+        # 2. 新規建て。当日クローズ後・ブレーカー発動後は建てない
+        if not closed_today and not halted_for_good:
             rejected += _open_signals(strategy, broker, view, cfg, now)
 
         daily_equity[current_day] = broker.equity()
+
+        # 3. 連続損失（#5）と累積DD（#6）。**発動したら以降は再開しない**
+        if cfg.enforce_breakers and not halted_for_good:
+            curve = [daily_equity[d] for d in sorted(daily_equity)]
+            halted_for_good = _permanent_breaker(curve, cfg)
+
         broker.advance()
 
     residual = broker.get_positions()
@@ -339,7 +390,47 @@ def run(
         list(broker.trades),
         float(cfg.initial_cash),
         rejected_by_leverage=rejected,
+        breaker_days=len(breaker_days),
+        halted_early=halted_for_good,
     )
+
+
+def _daily_breaker_tripped(
+    broker: ReplayBroker,
+    cfg: BacktestConfig,
+    day_open_equity: float,
+    closed_today: bool,
+) -> bool:
+    """日次損失ブレーカー（#4）が発動したか。
+
+    **すでにクローズ済みの日は再判定しない。** クローズ後は建玉がないので
+    損益は動かないが、毎バー「発動中」と数えると発動日数が水増しされる。
+    """
+    if not cfg.enforce_breakers or closed_today or day_open_equity <= 0:
+        return False
+    pnl_pct = broker.equity() / day_open_equity - 1.0
+    state = check_daily_loss(pnl_pct, cfg.daily_loss_pct)
+    if state.tripped:
+        logger.info("日次ブレーカー発動: %s", state.reason)
+    return state.tripped
+
+
+def _permanent_breaker(equity_curve: list[float], cfg: BacktestConfig) -> bool:
+    """連続損失（#5）と累積DD（#6）を判定する。
+
+    **どちらも人の明示承認がないと再開しない**ので、バックテストでは
+    以降の全期間を停止として扱う。ここで自動再開させると、
+    実運用では止まっていた期間の成績を含めてしまう。
+    """
+    daily_returns = to_returns(equity_curve)
+    for state in (
+        check_consecutive_loss(daily_returns, cfg.consecutive_loss_days),
+        check_max_drawdown(equity_curve, cfg.max_drawdown_pct),
+    ):
+        if state.tripped:
+            logger.warning("再開に人の承認が要るブレーカーが発動: %s", state.reason)
+            return True
+    return False
 
 
 def _open_signals(

@@ -433,3 +433,125 @@ class TestBacktestConfig:
             BacktestConfig(initial_cash=Decimal(0))
         with pytest.raises(ValueError):
             BacktestConfig(max_concurrent=0)
+
+
+# ---------------------------------------------------------------------------
+# 損失ブレーカーの再現（安全装置 #4/#5/#6）
+# ---------------------------------------------------------------------------
+
+
+class TestBreakers:
+    """**ブレーカーを再現しないバックテストは、実現不可能な成績を出す。**
+
+    実運用では止まっていた日の取引を成績に含めてしまうため。
+    ここでは「入れると結果が変わる」ことを確認する — 変わらないなら
+    組み込めていない。
+    """
+
+    def _crash(self) -> dict[str, tuple[Bar, ...]]:
+        """建てた直後に -10% 落ちる1日。
+
+        1単元100株を1,002円で建てて900円まで落ちると
+        -10,200円 = 資金50万の -2.04% で日次ブレーカーに達する。
+        """
+        return {"7203": tuple(_session(1, [1000.0, 1000.0, 900.0, 900.0]))}
+
+    def test_日次ブレーカーが発動して当日を止める(self) -> None:
+        config = BacktestConfig(close_time=time(23, 0))
+        result = run(_BuyOnceStrategy(), self._crash(), config)
+
+        assert result.breaker_days == 1
+        assert result.trades[0].exit_reason == "daily_breaker"
+
+    def test_発動を切ると結果が変わる(self) -> None:
+        """**切って出した成績を採用してはならない。**
+
+        ここが同じ結果になるなら、ブレーカーが組み込めていない。
+        """
+        bars = self._crash()
+        # 9:15 に当日クローズ。ブレーカーは 9:10 に発動するのでそちらが先に効く
+        on = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(9, 15)))
+        off = run(
+            _BuyOnceStrategy(),
+            bars,
+            BacktestConfig(close_time=time(9, 15), enforce_breakers=False),
+        )
+        assert on.breaker_days == 1
+        assert off.breaker_days == 0
+        assert on.trades[0].exit_reason == "daily_breaker"
+        assert off.trades[0].exit_reason == "close_all"
+        assert on.trades[0].exit_time < off.trades[0].exit_time
+
+    def test_日中の損益で判定する(self) -> None:
+        """**日次終値だけで見ると、日中に割ってから戻した日を見逃す。**
+
+        終値は始値と同じ（損益ゼロ）だが、途中で -10% を付けている。
+        """
+        bars = {"7203": tuple(_session(1, [1000.0, 1000.0, 900.0, 1000.0]))}
+        result = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(23, 0)))
+        assert result.breaker_days == 1
+
+    def test_翌営業日には自動復帰する(self) -> None:
+        """日次ブレーカーだけは人の承認なしで復帰してよい（#4）。"""
+        bars = {
+            "7203": tuple(
+                _session(1, [1000.0, 1000.0, 900.0, 900.0])
+                + _session(2, [1000.0, 1000.0, 1000.0, 1000.0])
+            )
+        }
+        result = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(9, 15)))
+        # 2日目も建てている = 復帰した
+        assert result.n_trades == 2
+        assert {t.exit_time.day for t in result.trades} == {1, 2}
+        assert [t.exit_reason for t in result.trades] == ["daily_breaker", "close_all"]
+
+    def test_発動日に建て直さない(self) -> None:
+        """止めた当日に再エントリーしたらブレーカーの意味がない。"""
+        bars = {"7203": tuple(_session(1, [1000.0, 1000.0, 900.0, 900.0, 900.0, 900.0]))}
+        result = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(23, 0)))
+        assert result.n_trades == 1
+
+    def test_損失が小さければ発動しない(self) -> None:
+        bars = {"7203": tuple(_session(1, [1000.0, 1000.0, 995.0, 995.0]))}
+        result = run(_BuyOnceStrategy(), bars, BacktestConfig(close_time=time(23, 0)))
+        assert result.breaker_days == 0
+
+    def test_連続損失で期間の途中から停止する(self) -> None:
+        """**#5 は人の承認がないと再開しない。** 以降の期間は取引しない。"""
+        days: list[Bar] = []
+        for d in range(1, 9):
+            # 毎日じわじわ負ける（往復コストだけでも負ける）
+            days.extend(_session(d, [1000.0] * 4))
+        result = run(
+            _BuyOnceStrategy(),
+            {"7203": tuple(days)},
+            BacktestConfig(close_time=time(9, 15)),
+        )
+        assert result.halted_early
+        # 8日ぶんのデータがあるが、3連敗した時点で止まる
+        assert result.n_trades < 8
+
+    def test_停止後は建てない(self) -> None:
+        days: list[Bar] = []
+        for d in range(1, 11):
+            days.extend(_session(d, [1000.0] * 4))
+        result = run(
+            _BuyOnceStrategy(),
+            {"7203": tuple(days)},
+            BacktestConfig(close_time=time(9, 15)),
+        )
+        traded_days = {t.exit_time.day for t in result.trades}
+        assert result.halted_early
+        assert max(traded_days) < 10
+
+    def test_勝ち続ければ停止しない(self) -> None:
+        days: list[Bar] = []
+        for d in range(1, 9):
+            days.extend(_session(d, [1000.0, 1000.0, 1100.0, 1100.0]))
+        result = run(
+            _BuyOnceStrategy(),
+            {"7203": tuple(days)},
+            BacktestConfig(close_time=time(9, 15)),
+        )
+        assert not result.halted_early
+        assert result.breaker_days == 0

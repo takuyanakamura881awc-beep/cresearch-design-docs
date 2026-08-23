@@ -415,7 +415,11 @@ def _print_loss_impact(
 
     1敗の損失 = 建玉 × 損切り幅 = 建玉 × 1.5 × ATR%。
     単元100株が最小単位なので、この値はこれ以上小さくできない。
-    日次ブレーカー（-2%）に対して何敗まで耐えられるかがここで決まる。
+
+    **「N敗で到達」は勝ちを挟まない連敗の場合の数字。**
+    日次ブレーカーは損益 -2% で判定するのであって敗数ではない。
+    利確2.5×ATR / 損切1.5×ATR なので1勝が約1.7敗を打ち消し、
+    勝ちが挟まればもっと回せる（docs/04）。
     """
     if not picked:
         return
@@ -443,7 +447,7 @@ def _print_loss_impact(
     print()
     print("  1敗あたりの総資産インパクト（1単元が最小単位なのでこれ以上下げられない）")
     print(
-        f"    中央値 -{median:.2%}（{DAILY_BREAKER_PCT / median:.1f}敗で"
+        f"    中央値 -{median:.2%}（**勝ちを挟まず**{DAILY_BREAKER_PCT / median:.1f}連敗で"
         f"日次ブレーカー -{DAILY_BREAKER_PCT:.0%} 到達）"
     )
     print(
