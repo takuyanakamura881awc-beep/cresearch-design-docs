@@ -175,7 +175,9 @@ pytest
 
 - Phase 1: データ基盤（`data/`）。全項目を実機で実測済み
 - Phase 2: Layer 1/2（`universe/`）、バックテスト基盤（`engine/` `broker/replay.py`）
-- Phase 3: 竹（`strategy/take_intraday.py`）、ブレーカー三層（`risk/limits.py`）
+- Phase 3: 竹（`strategy/take_intraday.py`）、ブレーカー三層（`risk/limits.py`）、
+  発注まわり（`execution/`）、スケジューラ（`engine/scheduler.py`）、
+  日次レポート（`report/daily.py`）
 
 ### 実測で確定した値（2026-08-23 / 基準日 2026-05-29）
 
@@ -223,6 +225,15 @@ pytest
 **全発注は `execution/order.py` の `submit()` を通る。** バイパス経路を作らない。
 発注前に `execution/journal.py` へ注文IDを永続化することで、
 ネットワーク断のリトライでも二重発注しない（#9）。
+
+### 口座開設待ち（Stage A では書けない）
+
+`broker/kabus.py` / `broker/paper.py` / `data/shortable.py` /
+`data/recorder.py` / `engine/live.py` は kabuステーションAPI の実物が要る。
+
+**ペーパートレード（Phase 5）にも口座は必要**（運用資金は入れない）。
+開設に1〜2週間かかるので、5分足を貯める8週間のうちに済ませておくと
+Stage B の着手が遅れない。
 
 ### 次にやること
 
