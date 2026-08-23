@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import math
 
+from autotrader.tick import round_trip_cost_atr, spread_yen
+
 # --- 戦略とコストの定数（実装から転記。変えたらここも変える） ---
 STOP_ATR_MULT = 1.5  # strategy/take_intraday.py DEFAULT_STOP_ATR_MULT
 TAKE_PROFIT_ATR_MULT = 2.5  # 同 DEFAULT_TAKE_PROFIT_ATR_MULT
-SLIPPAGE_BPS_ONE_WAY = 20.0  # engine/backtest.py STAGE_A_SLIPPAGE_BPS
+SLIPPAGE_BPS_ONE_WAY = 20.0  # broker/replay.py STAGE_A_SLIPPAGE_BPS（**旧モデル**）
 MEDIAN_ATR_PCT = 0.0333  # 実測（scripts/measure_universe.py §7 の中央値）
 MAX_WEIGHT_PER_SYMBOL = 0.25  # 安全装置 #7
 TRADES_PER_DAY = 13.0  # 実測 12.7〜13
@@ -230,6 +232,28 @@ def main() -> None:
             needed = cost_atr + edge_for_monthly_target(0.05) * scale
             ratios.append(needed / gross_edge_atr(trades, net, n))
         print(f"  片道 {label}: 現状の **{min(ratios):.2f}〜{max(ratios):.2f}倍** が要る")
+
+    print()
+    print("■ 呼値モデルに置き換えると損益分岐はどう動くか")
+    print("  （旧モデルは固定40bps。呼値モデルは株価ごとにコストが変わる）")
+    print(f"  {'株価':>7} {'スプレッド':>10} {'往復(ATR)':>10} {'損益分岐':>9} {'月利+5%':>9}")
+    print("  " + "-" * 52)
+    for price in (400.0, 600.0, 1000.0, 1250.0, 1600.0, 2200.0):
+        # ATR% は株価帯で変わるが、まず「同じ ATR% なら」で比較する
+        cost = round_trip_cost_atr(price, price * MEDIAN_ATR_PCT)
+        be = (STOP_ATR_MULT + cost) / (TAKE_PROFIT_ATR_MULT + STOP_ATR_MULT)
+        target = (
+            STOP_ATR_MULT + cost + edge_for_monthly_target(0.05)
+        ) / (TAKE_PROFIT_ATR_MULT + STOP_ATR_MULT)
+        print(
+            f"  {price:>6,.0f}円 {float(spread_yen(price)):>8.1f}円 "
+            f"{cost:>10.4f} {be:>8.1%} {target:>8.1%}"
+        )
+    print()
+    print(f"  比較: 旧モデル（固定40bps・ATR%{MEDIAN_ATR_PCT:.2%}）は 0.120 ATR / 40.5%")
+    print("  **同じ ATR% なら株価が高いほど分岐点が下がる。**")
+    print("  ただし高価格帯ほど ATR% 自体が小さいのが普通なので、")
+    print("  実際にどうなるかは measure_universe.py §8 の実測を見ること。")
 
     print()
     print("=" * 68)

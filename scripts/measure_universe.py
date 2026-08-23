@@ -34,12 +34,18 @@ from decimal import Decimal
 from autotrader.config import load_credentials, mask
 from autotrader.data.base import DataSourceError, RateLimitError
 from autotrader.data.jquants import JQuantsDataSource
-from autotrader.risk.limits import DEFAULT_DAILY_BREAKER_PCT, DEFAULT_STOP_ATR_MULT
+from autotrader.risk.limits import (
+    DEFAULT_DAILY_BREAKER_PCT,
+    DEFAULT_STOP_ATR_MULT,
+    max_atr_pct,
+    max_atr_yen,
+)
 from autotrader.risk.sizing import (
     calc_quantity,
     max_affordable_price,
     target_notional,
 )
+from autotrader.tick import min_atr_yen, round_trip_cost_atr
 from autotrader.types import Bar, PriceTier, Symbol, UniverseEntry
 from autotrader.universe.builder import build
 from autotrader.universe.filters import (
@@ -359,7 +365,13 @@ def report_layer2(
         return
 
     atrs = sorted(c.features.atr_pct for c in candidates)
-    quiet = sum(1 for a in atrs if a < selector.min_atr_pct)
+    yens = sorted(c.features.atr_yen for c in candidates)
+    quiet = sum(
+        1
+        for c in candidates
+        if c.features.atr_yen
+        < float(min_atr_yen(c.features.price, selector.min_atr_cost_multiple))
+    )
     wild = sum(1 for a in atrs if a > selector.max_atr_pct)
     eligible = len(candidates) - quiet - wild
     print(
@@ -367,7 +379,13 @@ def report_layer2(
         f"上位25% {atrs[int(len(atrs) * 0.75)]:.2%} / 最大 {atrs[-1]:.2%}"
     )
     print(
-        f"  ATR% < {selector.min_atr_pct:.2%}（コスト負け）  : {quiet:>4}銘柄で除外"
+        f"  ATR円 の分布        : 中央値 {yens[len(yens) // 2]:.1f}円 / "
+        f"上位25% {yens[int(len(yens) * 0.75)]:.1f}円 / 最大 {yens[-1]:.1f}円"
+        f"（上限 {float(max_atr_yen(CAPITAL)):.1f}円）"
+    )
+    print(
+        f"  ATR円 < スプレッド×{selector.min_atr_cost_multiple:.0f}"
+        f"（コスト負け）: {quiet:>4}銘柄で除外"
     )
     print(
         f"  ATR% > {selector.max_atr_pct:.2%}（1敗でブレーカー）: {wild:>4}銘柄で除外"
@@ -458,6 +476,110 @@ def _print_loss_impact(
         print("       → ATR% 上限が効いていない。導出を確認する")
     else:
         print("    OK: 1敗でブレーカーに達する銘柄はない")
+
+
+def sweep_concentration(
+    as_of: date,
+    source: JQuantsDataSource,
+    symbols: tuple[Symbol, ...],
+    bars: dict[str, tuple[Bar, ...]],
+) -> None:
+    """同時保有数を変えたとき、母集団とコストがどう動くかを測る。
+
+    【なぜ測るのか】
+
+    同時保有を絞ると1銘柄あたりの比率が上がり、買える株価の上限も上がる。
+    株価が高いほど呼値が相対的に小さいので、コストは下がる**はず**。
+
+    ところが制約を解くと、達成しうる ATR円の上限は同時保有数に依存しない
+    （`risk.limits.max_atr_yen`）。株価上限が上がる利得と ATR% 上限が
+    下がる損失が正確に打ち消し合うため。
+
+    **したがって効くかどうかは「その制約を満たす銘柄が実在するか」だけで
+    決まり、それは計算では出ない。ここで実測する。**
+
+    【見るもの】
+
+    - 通過銘柄数。監視枠を埋められる母数が残るか（これが本命）
+    - ATR円の分布。天井にどこまで近づけるか
+    - 往復コストの中央値（ATR単位）。現状からどれだけ下がるか
+    - 単元100株の飛びによる資金の遊び。集中の隠れコスト
+    """
+    hr("8. 同時保有数のスイープ（1銘柄あたり比率と株価上限が連動する）")
+    print("  安全装置#7の変更は人間の判断事項。**ここでは測るだけで何も変えない**")
+    print()
+    print(f"  ATR円の上限は同時保有数に依存しない: {float(max_atr_yen(CAPITAL)):.1f}円")
+    print("    = 資金 × 日次ブレーカー ÷ (単元 × 損切倍率)")
+    print()
+    print(
+        f"  {'同時':>4} {'比率':>6} {'株価上限':>8} {'ATR%上限':>8} "
+        f"{'通過':>5} {'ATR円中央':>9} {'往復コスト':>9} {'資金稼働':>8}"
+    )
+    print("  " + "-" * 68)
+
+    for n in (5, 4, 3, 2):
+        weight = 1.0 / n
+        ceiling = int(max_affordable_price(CAPITAL, weight))
+        atr_ceiling = max_atr_pct(max_weight_per_symbol=weight)
+        budget = CAPITAL * Decimal(str(weight))
+
+        try:
+            snapshot = build(
+                as_of,
+                source,
+                config_for(ceiling, FilterConfig().min_avg_turnover_yen),
+                bars_by_symbol=bars,
+                symbols=symbols,
+            )
+        except DataSourceError as exc:
+            print(f"  {n:>4} 取得できなかった: {exc}")
+            continue
+
+        selector = SelectorConfig(max_atr_pct=atr_ceiling)
+        passed = tuple(e.symbol for e in snapshot.entries)
+        tiers = {e.symbol.code: e.tier for e in snapshot.entries}
+        candidates = build_candidates(as_of, passed, bars, tiers, selector)
+
+        eligible = [
+            c
+            for c in candidates
+            if c.features.atr_yen
+            >= float(min_atr_yen(c.features.price, selector.min_atr_cost_multiple))
+            and c.features.atr_pct <= atr_ceiling
+        ]
+        if not eligible:
+            print(
+                f"  {n:>4} {weight:>5.0%} {ceiling:>7,}円 {atr_ceiling:>7.2%} "
+                f"{0:>5} — 通過銘柄なし"
+            )
+            continue
+
+        yens = sorted(c.features.atr_yen for c in eligible)
+        costs = sorted(
+            round_trip_cost_atr(c.features.price, c.features.atr_yen) for c in eligible
+        )
+        # 単元100株の飛び。目標額に対して実際に置ける建玉の比率
+        deployed = sorted(
+            float(
+                Decimal(calc_quantity(budget, c.features.price))
+                * Decimal(str(c.features.price))
+                / budget
+            )
+            for c in eligible
+        )
+        mid = len(eligible) // 2
+        print(
+            f"  {n:>4} {weight:>5.0%} {ceiling:>7,}円 {atr_ceiling:>7.2%} "
+            f"{len(eligible):>5} {yens[mid]:>8.1f}円 {costs[mid]:>8.4f} "
+            f"{deployed[mid]:>7.0%}"
+        )
+
+    print()
+    print("  読み方:")
+    print("    通過   — 監視枠50を埋めるには最低でもこの2倍は欲しい")
+    print("    往復コスト — ATR単位。**現行設定の実測相当は 0.120**")
+    print("    資金稼働 — 単元の飛びで目標建玉額の何%まで置けるか。")
+    print("               集中するほど1単元が大きくなり、ここが落ちる")
 
 
 def main() -> int:
@@ -552,6 +674,7 @@ def main() -> int:
 
     sweep_turnover(as_of, source, symbols, bars)
     report_layer2(as_of, source, symbols, bars)
+    sweep_concentration(as_of, source, symbols, bars)
 
     print()
     print("  この結果を config/universe.yaml と docs/03-universe.md に反映してから")

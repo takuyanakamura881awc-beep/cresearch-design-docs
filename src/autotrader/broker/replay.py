@@ -15,7 +15,8 @@
 成行               **そのバーの始値 + スリッページ**。不利な側にずらしたうえで
                    バーのレンジ [安値, 高値] に収める
 指値               バーのレンジが指値を通過した場合のみ約定
-スリッページ       **厚めに見積もる**（Stage A は片道20bps。Stage B は10bps）
+スリッページ       **呼値から株価ごとに導く**。成行はスプレッドの半分を払い、
+                   スプレッドは呼値より狭くなれない（`autotrader.tick`）
 =================  ==========================================================
 
 始値を基準にするのは、**発注した瞬間に実際に出ていた価格がそれだから**。
@@ -46,6 +47,7 @@ from decimal import Decimal
 from autotrader.broker.base import Broker, BrokerError, OrderRejectedError
 from autotrader.risk.leverage import LeverageViolationError, enforce
 from autotrader.risk.sizing import average_turnover_of
+from autotrader.tick import DEFAULT_SPREAD_TICKS, half_spread_bps
 from autotrader.types import (
     AccountState,
     Bar,
@@ -63,7 +65,32 @@ from autotrader.types import (
 logger = logging.getLogger(__name__)
 
 STAGE_A_SLIPPAGE_BPS = 20.0
-"""Stage A の片道スリッページ（bps）。板がないぶん Stage B（10bps）より厚い。"""
+"""**旧モデル**の片道スリッページ（bps）。固定値で、株価を見ない。
+
+既定では使わない。`ReplayBroker(slippage_bps=STAGE_A_SLIPPAGE_BPS)` と
+明示したときだけこの固定値で動く。**tick モデル導入前の結果と
+比較するために残してある**（`scripts/backtest_take.py --flat-slippage`）。
+
+固定値がなぜ足りないか: 約定コストの正体はスプレッドで、
+スプレッドは呼値より狭くなれない。**同じ20bpsでも600円の銘柄では
+1.2円（ほぼ1tick）、2,200円の銘柄では4.4円（4tick超）を意味する。**
+株価帯をまたいで比較すると、この差がそのまま誤差になる。
+"""
+
+MIN_SLIPPAGE_BPS = 3.0
+"""tick から導いた片道スリッページの下限（bps）。**これは仮定であって実測ではない。**
+
+**tick モデルはスプレッドしか説明しない。** マーケットインパクト
+（自分の注文が板を動かすぶん）は別物で、モデルに入っていない。
+建玉12万円は売買代金3億円の0.04%なのでインパクトは小さいはずだが、
+ゼロではない（CLAUDE.md 規約5）。
+
+我々の株価帯（通常銘柄・1円tick）では tick 由来の値が常にこれを上回るので
+実質的に効かないが、**TOPIX100構成銘柄が入ってくると効く**
+（1,000円で0.1円tickなら片道1bpsとなり、明らかに楽観的）。
+
+`tick.DEFAULT_SPREAD_TICKS` と同じく、**実測に置き換えるまで小さくしない。**
+"""
 
 THIN_TURNOVER_YEN = Decimal(500_000_000)
 """これを下回る売買代金の銘柄には追加スリッページを当てる。"""
@@ -102,15 +129,20 @@ class ReplayBroker(Broker):
         self,
         initial_cash: Decimal,
         bars: Mapping[str, tuple[Bar, ...]],
-        slippage_bps: float = STAGE_A_SLIPPAGE_BPS,
+        slippage_bps: float | None = None,
         shortable: frozenset[str] | None = None,
+        spread_ticks: float = DEFAULT_SPREAD_TICKS,
     ) -> None:
         """
         Args:
             initial_cash: 架空の初期資金（円）。
             bars: 銘柄コード → バー列（時刻の昇順）。
-            slippage_bps: 片道スリッページ（bps）。
-                **板がないので Stage B（10bps）より厚く見積もる。**
+            slippage_bps: 片道スリッページ（bps）を固定したい場合に指定する。
+
+                **省略時は呼値から株価ごとに導出する（既定）。**
+                固定値を渡すと株価を見なくなるので、旧モデルとの比較にだけ使う。
+            spread_ticks: スプレッドが呼値の何本ぶんあるとみなすか。
+                ``slippage_bps`` を指定した場合は無視される。
             shortable: 売建できる銘柄。
 
                 **省略すると1銘柄も売建できない。** 保守的な側に倒している
@@ -120,18 +152,22 @@ class ReplayBroker(Broker):
                 呼び出し側の責務にしてある。
 
         Raises:
-            ValueError: スリッページが0以下、または資金が0以下の場合。
+            ValueError: スリッページが0以下、スプレッド本数が0以下、
+                または資金が0以下の場合。
         """
-        if slippage_bps <= 0:
+        if slippage_bps is not None and slippage_bps <= 0:
             raise ValueError(
                 "スリッページを0以下にしてはならない。"
                 "手数料が0でもコストは0ではない（CLAUDE.md 規約5）"
             )
+        if spread_ticks <= 0:
+            raise ValueError(f"スプレッドの本数は正の値である必要がある: {spread_ticks}")
         if initial_cash <= 0:
             raise ValueError(f"初期資金は正の値である必要がある: {initial_cash}")
 
         self._bars = dict(bars)
         self._slippage_bps = slippage_bps
+        self._spread_ticks = spread_ticks
         self._initial_cash = initial_cash
         self._cash = initial_cash
 
@@ -198,16 +234,27 @@ class ReplayBroker(Broker):
     # 約定価格
     # ------------------------------------------------------------------
 
-    def slippage_bps_for(self, symbol: str) -> float:
-        """その銘柄に当てるスリッページ（bps）。
+    def slippage_bps_for(self, symbol: str, price: float) -> float:
+        """その銘柄・その株価に当てる片道スリッページ（bps）。
 
-        薄い銘柄には上乗せする。流動性下限を下げたぶん、
+        **株価を見る。** 成行で板を叩けばスプレッドの半分を払い、
+        スプレッドは呼値より狭くなれない。同じ「1円のスプレッド」でも
+        600円の銘柄なら16.7bps、2,200円の銘柄なら4.5bps で、
+        **固定bpsで両者を同じ扱いにすると株価帯の比較を誤る。**
+
+        薄い銘柄には上乗せする。流動性下限を10億から3億へ下げたぶん、
         **約定モデルは逆に厳しくする**（CLAUDE.md 規約5）。
         """
+        if self._slippage_bps is not None:
+            base = self._slippage_bps
+        else:
+            base = max(
+                half_spread_bps(price, self._spread_ticks), MIN_SLIPPAGE_BPS
+            )
         turnover = self._average_turnover(symbol)
         if turnover is not None and turnover < THIN_TURNOVER_YEN:
-            return self._slippage_bps + THIN_SLIPPAGE_PENALTY_BPS
-        return self._slippage_bps
+            return base + THIN_SLIPPAGE_PENALTY_BPS
+        return base
 
     def _average_turnover(self, symbol: str) -> Decimal | None:
         if symbol not in self._turnover_cache:
@@ -223,7 +270,7 @@ class ReplayBroker(Broker):
         観測されたレンジ [安値, 高値] で頭を抑える
         （その日そのバーで実際に付いていない価格では約定しえない）。
         """
-        rate = self.slippage_bps_for(symbol) / 10_000.0
+        rate = self.slippage_bps_for(symbol, bar.open) / 10_000.0
         buying = (side is Side.LONG) == opening
         if buying:
             return min(bar.open * (1 + rate), bar.high)
@@ -280,7 +327,7 @@ class ReplayBroker(Broker):
         bar = self.current_bar(symbol)
         if bar is None:
             raise BrokerError(f"{symbol} は {self.now} 時点のバーがない")
-        half = bar.close * self.slippage_bps_for(symbol) / 10_000.0
+        half = bar.close * self.slippage_bps_for(symbol, bar.close) / 10_000.0
         return Quote(
             symbol=symbol,
             timestamp=bar.timestamp,

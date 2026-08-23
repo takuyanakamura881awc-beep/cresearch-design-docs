@@ -12,6 +12,7 @@ from decimal import Decimal
 
 import pytest
 
+from autotrader.broker.replay import MIN_SLIPPAGE_BPS
 from autotrader.data.calendar import TradingCalendar
 from autotrader.engine.backtest import (
     STAGE_A_SLIPPAGE_BPS,
@@ -23,6 +24,7 @@ from autotrader.engine.backtest import (
     walk_forward,
 )
 from autotrader.strategy.base import Strategy
+from autotrader.tick import DEFAULT_SPREAD_TICKS
 from autotrader.types import Bar, Position, Side, Signal, Trade
 
 
@@ -104,9 +106,32 @@ class TestPointInTimeView:
 
 
 class TestCostModel:
-    def test_既定はStageAの20bps(self) -> None:
-        """板がないぶん Stage B（10bps）より厚く見積もる。"""
-        assert CostModel().slippage_bps == STAGE_A_SLIPPAGE_BPS == 20.0
+    def test_既定は呼値から株価ごとに導く(self) -> None:
+        """**固定値ではない。** コストの正体はスプレッドで、呼値より狭くなれない。"""
+        cost = CostModel()
+        assert cost.slippage_bps is None
+        # 1,000円: tick 1円 × 2本 = 2円のスプレッド。片道は半分の1円 = 10bps
+        assert cost.rate_at(1000.0) == pytest.approx(0.0010)
+        # 2,200円: 同じ2円のスプレッドでも株価が高いぶん相対的に安い
+        assert cost.rate_at(2200.0) == pytest.approx(1.0 / 2200.0)
+
+    def test_株価が高いほど相対コストが下がる(self) -> None:
+        """**これが tick モデルを入れた理由。** 固定bpsでは表現できない。"""
+        cost = CostModel()
+        assert cost.rate_at(2200.0) < cost.rate_at(1250.0) < cost.rate_at(600.0)
+
+    def test_固定値を渡せば株価を見なくなる(self) -> None:
+        """旧モデルとの比較用。指定したときだけ従来どおり動く。"""
+        cost = CostModel(slippage_bps=STAGE_A_SLIPPAGE_BPS)
+        assert cost.rate_at(600.0) == cost.rate_at(2200.0) == pytest.approx(0.0020)
+
+    def test_下限を割らない(self) -> None:
+        """tick はスプレッドしか説明せず、マーケットインパクトが入っていない。
+
+        TOPIX100 の 1,000円（呼値0.1円）だと片道1bpsになってしまうので、
+        `MIN_SLIPPAGE_BPS` で床を張る。
+        """
+        assert CostModel().rate_at(1_000_000.0) >= MIN_SLIPPAGE_BPS / 10_000.0
 
     def test_ゼロを拒否する(self) -> None:
         """**手数料が0でもコストは0ではない**（CLAUDE.md 規約5）。"""
@@ -446,7 +471,8 @@ class TestWalkForward:
 class TestBacktestConfig:
     def test_既定はStageA(self) -> None:
         config = BacktestConfig()
-        assert config.slippage_bps == STAGE_A_SLIPPAGE_BPS
+        assert config.slippage_bps is None  # 呼値から導く（固定値ではない）
+        assert config.spread_ticks == DEFAULT_SPREAD_TICKS
         assert config.close_time == time(14, 50)
         assert config.max_weight_per_symbol == 0.25
 

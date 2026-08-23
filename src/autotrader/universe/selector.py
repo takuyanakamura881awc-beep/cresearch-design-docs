@@ -29,16 +29,28 @@ from datetime import date
 from statistics import median
 
 from autotrader.risk.limits import max_atr_pct
+from autotrader.tick import (
+    DEFAULT_COST_ATR_MULTIPLE,
+    DEFAULT_SPREAD_TICKS,
+    min_atr_yen,
+)
 from autotrader.types import Bar, PriceTier, Symbol, UniverseEntry
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_WATCHLIST = 50
-DEFAULT_MIN_ATR_PCT = 0.02
-"""ATR% の下限。**往復コストの5倍**という根拠から決まる。
+LEGACY_MIN_ATR_PCT = 0.02
+"""**廃止した ATR% の下限。** 経緯を残すためだけに置いてある。
 
-Stage A のスリッページは片道20bps = 往復40bps。日中値幅がその5倍ないと
-コスト負けする。上限とは根拠がまったく別なので、片方を動かしても他方は動かない。
+「往復コスト40bps の5倍」という導出だったが、これは**株価帯が
+300〜1,250円に固定されているという前提の上でだけ成り立つ近似**だった。
+
+往復コストの正体は ``スプレッド円 ÷ ATR円`` で、株価は式に出てこない
+（`autotrader.tick`）。600円 × ATR3.33% と 2,200円 × ATR0.91% は
+どちらも ATR 20円で払うコストは同じなのに、2% の下限は前者だけを通す。
+
+**株価帯を動かすなら円建てで判定しないと壊れる。**
+現在は `min_atr_cost_multiple` × スプレッド円 を銘柄ごとに評価する。
 """
 DEFAULT_ATR_PERIOD = 14
 DEFAULT_VOLUME_LOOKBACK_DAYS = 20
@@ -73,7 +85,15 @@ class StageAFeatures:
     """
 
     atr_pct: float
-    """14日ATR ÷ 株価。日中値幅の期待値"""
+    """14日ATR ÷ 株価。日中値幅の期待値。**スコアリングに使う**"""
+    price: float
+    """前日終値（円）。呼値を引くのに要る。**スコアリングには使わない**"""
+    atr_yen: float
+    """14日ATR（円）。**コスト判定はこちらで行う**
+
+    往復コストは ``スプレッド円 ÷ ATR円``。ATR% ではなく ATR円が
+    コストを決めるので、下限の判定は円建てで行う（`autotrader.tick`）。
+    """
     prev_volume_ratio: float
     """前日出来高 ÷ 20日平均出来高。前日に注目が集まったか"""
     prev_range_pct: float
@@ -106,13 +126,25 @@ class SelectorConfig:
     """Layer 2 の設定。config/universe.yaml の ``layer2`` に対応する。"""
 
     max_watchlist: int = DEFAULT_MAX_WATCHLIST
-    min_atr_pct: float = DEFAULT_MIN_ATR_PCT
+    min_atr_cost_multiple: float = DEFAULT_COST_ATR_MULTIPLE
+    """ATR の下限。**スプレッドの何倍の値幅があれば通すか**（既定5倍）。
+
+    往復コストが ATR の 1/5 を超えないこと、と同義。
+    **銘柄ごとに株価から評価する**ので、ここには倍率しか置かない
+    （呼値が株価で変わるため、固定の ATR% では表現できない）。
+    """
+    spread_ticks: float = DEFAULT_SPREAD_TICKS
+    """スプレッドが呼値の何本ぶんあるとみなすか。**実測ではなく仮定。**"""
     max_atr_pct: float = field(default_factory=max_atr_pct)
     """ATR% の上限。**日次ブレーカーからの導出値**（`risk.limits.max_atr_pct`）。
 
-    下限（コスト）とは根拠が別で、こちらは
-    「1敗で当日が終わる銘柄を選ばない」ための制約。
+    下限とは根拠も単位も別。こちらは「1敗で当日が終わる銘柄を選ばない」
+    ための**リスク**制約なので、資金に対する比率＝ATR% で効く。
     50万円・上限25%・損切り1.5×ATR では 5.33%。
+
+    **下限（コスト）は円、上限（リスク）は%。** 単位が違うのは間違いではなく、
+    それぞれが依存している量が違うため。同時保有数を絞って建玉比率を上げると
+    こちらだけが下がる（`risk.limits.max_atr_yen` を参照）。
     """
     atr_period: int = DEFAULT_ATR_PERIOD
     volume_lookback_days: int = DEFAULT_VOLUME_LOOKBACK_DAYS
@@ -128,13 +160,12 @@ class SelectorConfig:
             raise ValueError("max_watchlist は1以上")
         if self.atr_period < 1 or self.volume_lookback_days < 1:
             raise ValueError("atr_period と volume_lookback_days は1以上")
-        if self.min_atr_pct < 0:
-            raise ValueError("min_atr_pct は0以上")
-        if self.max_atr_pct <= self.min_atr_pct:
-            raise ValueError(
-                f"min_atr_pct({self.min_atr_pct}) < max_atr_pct({self.max_atr_pct}) "
-                "である必要がある"
-            )
+        if self.min_atr_cost_multiple <= 0:
+            raise ValueError("min_atr_cost_multiple は正の値")
+        if self.spread_ticks <= 0:
+            raise ValueError("spread_ticks は正の値")
+        if self.max_atr_pct <= 0:
+            raise ValueError("max_atr_pct は正の値")
         if self.premium_max_concurrent < 0:
             raise ValueError("premium_max_concurrent は0以上")
         validate_weights(self.weights)
@@ -251,6 +282,8 @@ def compute_features(
 
     return StageAFeatures(
         atr_pct=atr / prev.close,
+        price=prev.close,
+        atr_yen=atr,
         prev_volume_ratio=volume_ratio,
         prev_range_pct=day_range / prev.close,
         prev_close_position=close_position,
@@ -377,6 +410,22 @@ class Candidate:
     stage_b: StageBFeatures | None = None
 
 
+def _clears_cost(candidate: Candidate, cfg: SelectorConfig) -> bool:
+    """往復コストに対して値幅が十分あるか。**銘柄ごとに株価から評価する。**
+
+    ``ATR円 ≥ スプレッド円 × min_atr_cost_multiple``。
+
+    かつては「ATR% ≥ 2%」で判定していたが、これは株価帯が固定という
+    前提の上でだけ成り立つ近似だった（`LEGACY_MIN_ATR_PCT`）。
+    """
+    floor = min_atr_yen(
+        candidate.features.price,
+        cfg.min_atr_cost_multiple,
+        cfg.spread_ticks,
+    )
+    return candidate.features.atr_yen >= float(floor)
+
+
 def build_candidates(
     trade_date: date,
     symbols: Sequence[Symbol],
@@ -491,22 +540,25 @@ def select(
         }
     scores = score_all(features, cfg.weights, stage_b_by_symbol=stage_b)
 
-    # 2. ATR% のハードルはスコアの前ではなく後に適用する。
+    # 2. ATR のハードルはスコアの前ではなく後に適用する。
     #    順位変換の母集団を先に削ると、残った銘柄の順位が母集団の切り方で変わる。
     #
-    #    **下限と上限は根拠が別**なので、落ちた件数も別々に数える。
+    #    **下限と上限は根拠も単位も別**なので、落ちた件数を別々に数える。
     #    下限が効きすぎているのか上限が効きすぎているのかで打つ手が変わる。
-    too_quiet = [c for c in candidates if c.features.atr_pct < cfg.min_atr_pct]
+    #
+    #    下限はコスト由来なので**円**（スプレッドは株価で変わる）、
+    #    上限はリスク由来なので**%**（資金に対する比率で効く）。
+    too_quiet = [c for c in candidates if not _clears_cost(c, cfg)]
     too_wild = [c for c in candidates if c.features.atr_pct > cfg.max_atr_pct]
     eligible = [
         c
         for c in candidates
-        if cfg.min_atr_pct <= c.features.atr_pct <= cfg.max_atr_pct
+        if _clears_cost(c, cfg) and c.features.atr_pct <= cfg.max_atr_pct
     ]
     if too_quiet:
         logger.info(
-            "ATR%% < %.2f%%（コスト負け）で除外: %d銘柄",
-            cfg.min_atr_pct * 100,
+            "ATR がスプレッドの%.1f倍に満たない（コスト負け）で除外: %d銘柄",
+            cfg.min_atr_cost_multiple,
             len(too_quiet),
         )
     if too_wild:
@@ -517,9 +569,10 @@ def select(
         )
     if not eligible:
         logger.warning(
-            "%s: ATR%% が %.2f%%〜%.2f%% に収まる銘柄がない。監視銘柄なし",
+            "%s: コスト下限（スプレッド×%.1f）と ATR%% 上限 %.2f%% の"
+            "両方を満たす銘柄がない。監視銘柄なし",
             trade_date,
-            cfg.min_atr_pct * 100,
+            cfg.min_atr_cost_multiple,
             cfg.max_atr_pct * 100,
         )
         return ()

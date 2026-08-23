@@ -33,12 +33,22 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from autotrader.broker.replay import SHORTABLE_MIN_TURNOVER_YEN
+from autotrader.broker.replay import (
+    SHORTABLE_MIN_TURNOVER_YEN,
+    STAGE_A_SLIPPAGE_BPS,
+)
 from autotrader.data.store import BarStore
 from autotrader.engine.backtest import BacktestConfig, BacktestResult, run
 from autotrader.report.metrics import TRADING_DAYS_PER_YEAR
-from autotrader.risk.sizing import average_turnover_of
+from autotrader.risk.limits import (
+    DEFAULT_MAX_CONCURRENT,
+    DEFAULT_MAX_WEIGHT_PER_SYMBOL,
+    max_atr_pct,
+    max_atr_yen,
+)
+from autotrader.risk.sizing import average_turnover_of, max_affordable_price
 from autotrader.strategy.take_intraday import TakeIntraday
+from autotrader.tick import half_spread_bps
 from autotrader.types import Bar, PriceTier, Symbol
 from autotrader.universe.filters import FilterConfig, screen
 from autotrader.universe.selector import SelectorConfig, build_candidates, select
@@ -205,7 +215,27 @@ def main() -> int:
         action="store_true",
         help="ブレーカーを切って寄与を測る。**この成績を採用してはならない**",
     )
+    parser.add_argument(
+        "--flat-slippage",
+        action="store_true",
+        help=(
+            f"約定コストを固定{STAGE_A_SLIPPAGE_BPS:.0f}bpsにする（tick モデル導入前の"
+            "挙動）。過去の結果と比較するときだけ使う"
+        ),
+    )
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "同時保有数。**指定すると1銘柄あたり比率・株価上限・ATR%%上限が連動する。**"
+            "安全装置#7の値そのものは変えず、この実行だけの比較用"
+        ),
+    )
     args = parser.parse_args()
+    if args.max_concurrent is not None and args.max_concurrent < 1:
+        parser.error("--max-concurrent は1以上")
 
     print("竹を実データでバックテストする")
 
@@ -231,8 +261,27 @@ def main() -> int:
 
     hr("2. Layer 2 の日次選定")
     print("  当日より前の日足だけで毎日選び直す")
-    filters = FilterConfig()
-    selector = SelectorConfig()
+    if args.max_concurrent is None:
+        filters = FilterConfig()
+        selector = SelectorConfig()
+        weight = DEFAULT_MAX_WEIGHT_PER_SYMBOL
+    else:
+        # 同時保有数を絞ると1銘柄あたり比率が上がり、買える株価の上限も上がる。
+        # ATR%上限は逆に下がる（1敗が日次ブレーカーに届かない条件）。
+        # **この連動を手で外すと安全装置が黙って無効になる。**
+        weight = 1.0 / args.max_concurrent
+        ceiling = int(max_affordable_price(CAPITAL, weight))
+        filters = FilterConfig(
+            price_normal_max=max(1, ceiling - 1),
+            price_premium_max=ceiling,
+        )
+        selector = SelectorConfig(max_atr_pct=max_atr_pct(max_weight_per_symbol=weight))
+        print(f"  同時保有 {args.max_concurrent} 銘柄として選定する")
+        print(
+            f"    1銘柄比率 {weight:.0%} / 株価上限 {ceiling:,}円 / "
+            f"ATR%上限 {selector.max_atr_pct:.2%} / "
+            f"ATR円上限 {float(max_atr_yen(CAPITAL)):.1f}円（比率に依存しない）"
+        )
     watchlist, counts = daily_watchlists(
         tuple(s for s in symbols if s.code in daily), daily, trading_days, filters, selector
     )
@@ -251,13 +300,33 @@ def main() -> int:
         initial_cash=CAPITAL,
         shortable=shortable,
         enforce_breakers=not args.no_breakers,
+        slippage_bps=STAGE_A_SLIPPAGE_BPS if args.flat_slippage else None,
+        max_concurrent=args.max_concurrent or DEFAULT_MAX_CONCURRENT,
+        max_weight_per_symbol=weight,
     )
     print(f"  初期資金      : {int(CAPITAL):,}円")
     print(
         f"  売建可能      : {len(shortable)}/{len(daily)}銘柄"
         f"（日次売買代金 {int(SHORTABLE_MIN_TURNOVER_YEN):,}円以上・Stage A の代理）"
     )
-    print(f"  スリッページ  : 片道{config.slippage_bps:.0f}bps（薄い銘柄は+5bps）")
+    if config.slippage_bps is not None:
+        print(
+            f"  スリッページ  : **固定** 片道{config.slippage_bps:.0f}bps"
+            "（旧モデル。株価を見ない）"
+        )
+    else:
+        print(
+            f"  スリッページ  : 呼値から導出（スプレッド{config.spread_ticks:.0f}tick想定）"
+            "。薄い銘柄は+5bps"
+        )
+        for sample in (600.0, 1250.0, 2200.0):
+            print(
+                f"      {sample:>6,.0f}円 → 片道 {half_spread_bps(sample):.1f}bps"
+            )
+    print(
+        f"  同時保有/比率 : {config.max_concurrent}銘柄 / "
+        f"1銘柄 {config.max_weight_per_symbol:.0%}"
+    )
     print(f"  当日クローズ  : {config.close_time}")
     print(f"  ブレーカー    : {'有効' if config.enforce_breakers else '**無効**'}")
     if args.no_breakers:

@@ -24,7 +24,13 @@ from datetime import date, datetime, time
 from decimal import Decimal
 
 from autotrader.broker.base import OrderRejectedError
-from autotrader.broker.replay import ReplayBroker
+from autotrader.broker.replay import (
+    MIN_SLIPPAGE_BPS,
+    ReplayBroker,
+)
+from autotrader.broker.replay import (
+    STAGE_A_SLIPPAGE_BPS as STAGE_A_SLIPPAGE_BPS,  # 旧モデル比較のため再輸出
+)
 from autotrader.data.calendar import TradingCalendar
 from autotrader.report.metrics import (
     max_drawdown,
@@ -42,17 +48,10 @@ from autotrader.risk.limits import (
 )
 from autotrader.risk.sizing import calc_quantity, target_notional
 from autotrader.strategy.base import Strategy
+from autotrader.tick import DEFAULT_SPREAD_TICKS, half_spread_bps
 from autotrader.types import Bar, Side, Trade
 
 logger = logging.getLogger(__name__)
-
-STAGE_A_SLIPPAGE_BPS = 20.0
-"""Stage A の片道スリッページ（bps）。
-
-**Stage B（10bps）より厚い。** 板情報がないぶん約定価格を推定に頼るため、
-検証できないものは保守的な側に倒す（CLAUDE.md 規約5）。
-"""
-
 
 class PointInTimeView:
     """指定時刻の時点で参照してよいデータだけを露出させるビュー。
@@ -131,19 +130,27 @@ class CostModel:
     コストゼロのシミュレーションは本番で必ず乖離する。
     """
 
-    slippage_bps: float = STAGE_A_SLIPPAGE_BPS
-    """片道スリッページ（bps）。往復では2倍かかる。"""
+    slippage_bps: float | None = None
+    """片道スリッページ（bps）を固定したい場合に指定する。
+
+    **省略時は呼値から株価ごとに導出する（既定）。**
+    tick 由来の計算は `autotrader.tick` に一本化してあり、
+    `broker.replay.ReplayBroker.slippage_bps_for` と同じ式を使う
+    （**約定価格の実装を二つ持たない**）。
+    """
 
     def __post_init__(self) -> None:
-        if self.slippage_bps <= 0:
+        if self.slippage_bps is not None and self.slippage_bps <= 0:
             raise ValueError(
                 "スリッページを0以下にしてはならない。"
                 "手数料が0でもコストは0ではない（CLAUDE.md 規約5）"
             )
 
-    @property
-    def rate(self) -> float:
-        return self.slippage_bps / 10_000.0
+    def rate_at(self, price: float) -> float:
+        """``price`` に当てる片道スリッページ（率）。"""
+        if self.slippage_bps is not None:
+            return self.slippage_bps / 10_000.0
+        return max(half_spread_bps(price), MIN_SLIPPAGE_BPS) / 10_000.0
 
     def fill_price(self, side: Side, reference: float, *, opening: bool) -> float:
         """約定価格。**必ず不利な側にずらす。**
@@ -151,8 +158,9 @@ class CostModel:
         買い建て・売り決済の別ではなく「その取引で自分がどちら側か」で決まる。
         新規買い/返済買いは高く、新規売り/返済売りは安く約定する。
         """
+        rate = self.rate_at(reference)
         buying = (side is Side.LONG) == opening
-        return reference * (1 + self.rate) if buying else reference * (1 - self.rate)
+        return reference * (1 + rate) if buying else reference * (1 - rate)
 
 
 @dataclass(frozen=True)
@@ -239,7 +247,15 @@ class BacktestConfig:
     """バックテストの実行設定。"""
 
     initial_cash: Decimal = Decimal(500_000)
-    slippage_bps: float = STAGE_A_SLIPPAGE_BPS
+    slippage_bps: float | None = None
+    """片道スリッページ（bps）を固定したい場合に指定する。
+
+    **省略時は呼値から株価ごとに導出する（既定）。**
+    `STAGE_A_SLIPPAGE_BPS` を渡すと tick モデル導入前と同じ挙動になり、
+    過去の結果と比較できる（`scripts/backtest_take.py --flat-slippage`）。
+    """
+    spread_ticks: float = DEFAULT_SPREAD_TICKS
+    """スプレッドが呼値の何本ぶんあるとみなすか。**実測ではなく仮定。**"""
     close_time: time = time(14, 50)
     """当日クローズの時刻（安全装置 #2 と同じ 14:50）。
 
@@ -335,7 +351,13 @@ def run(
         その再現は Phase 3 で ``risk/limits.py`` を組み込んでから行う。
     """
     cfg = config or BacktestConfig()
-    broker = ReplayBroker(cfg.initial_cash, bars, cfg.slippage_bps, cfg.shortable)
+    broker = ReplayBroker(
+        cfg.initial_cash,
+        bars,
+        cfg.slippage_bps,
+        cfg.shortable,
+        spread_ticks=cfg.spread_ticks,
+    )
     if not broker.timeline:
         return BacktestResult.from_equity([], [], float(cfg.initial_cash))
 

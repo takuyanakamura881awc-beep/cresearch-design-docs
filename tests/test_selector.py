@@ -76,8 +76,17 @@ def _features(
     prev_volume_ratio: float = 1.0,
     prev_range_pct: float = 0.03,
     prev_close_position: float = 0.5,
+    price: float = 1000.0,
 ) -> StageAFeatures:
-    return StageAFeatures(atr_pct, prev_volume_ratio, prev_range_pct, prev_close_position)
+    # ATR円は ATR% と株価から決まる。コスト下限はこちらで判定される
+    return StageAFeatures(
+        atr_pct=atr_pct,
+        price=price,
+        atr_yen=atr_pct * price,
+        prev_volume_ratio=prev_volume_ratio,
+        prev_range_pct=prev_range_pct,
+        prev_close_position=prev_close_position,
+    )
 
 
 def _candidate(
@@ -311,10 +320,25 @@ class TestSelect:
         assert [e.symbol.code for e in picked] == ["B", "C", "A"]
 
     def test_ATRが足りない銘柄を落とす(self) -> None:
-        """日中値幅が往復コストの5倍ないとコスト負けする。"""
-        candidates = [_candidate("A", atr_pct=0.019), _candidate("B", atr_pct=0.021)]
+        """日中値幅がスプレッドの5倍ないとコスト負けする。
+
+        1,000円なら呼値1円 × 2本 = スプレッド2円。その5倍の10円が下限で、
+        ATR% にすると 1.0%。
+        """
+        candidates = [_candidate("A", atr_pct=0.009), _candidate("B", atr_pct=0.011)]
         picked = select(candidates, self.TRADE_DATE)
         assert [e.symbol.code for e in picked] == ["B"]
+
+    def test_下限は株価で動く(self) -> None:
+        """**これが ATR% を捨てて円建てにした理由。**
+
+        同じ ATR 0.9% でも、2,200円なら 19.8円で下限10円を超えるが、
+        600円なら 5.4円で足りない。固定の 2% では両方を落としてしまう。
+        """
+        rich = _candidate("RICH", atr_pct=0.009, price=2200.0)
+        poor = _candidate("POOR", atr_pct=0.009, price=600.0)
+        picked = select([rich, poor], self.TRADE_DATE)
+        assert [e.symbol.code for e in picked] == ["RICH"]
 
     def test_ATRの足切りはスコア計算の後に行う(self) -> None:
         """**順位変換の母集団を先に削ってはならない。**
@@ -393,9 +417,13 @@ class TestAtrCeiling:
     def test_上限で全滅したら空を返す(self) -> None:
         assert select([_candidate("A", atr_pct=0.20)], self.TRADE_DATE) == ()
 
-    def test_上限は下限より大きくなければならない(self) -> None:
+    def test_不正な下限を拒否する(self) -> None:
+        with pytest.raises(ValueError, match="min_atr_cost_multiple"):
+            SelectorConfig(min_atr_cost_multiple=0.0)
+        with pytest.raises(ValueError, match="spread_ticks"):
+            SelectorConfig(spread_ticks=0.0)
         with pytest.raises(ValueError, match="max_atr_pct"):
-            SelectorConfig(min_atr_pct=0.06, max_atr_pct=0.05)
+            SelectorConfig(max_atr_pct=0.0)
 
     def test_ブレーカーを緩めれば上限も上がる(self) -> None:
         """安全装置を動かしたときに、導出値が置き去りにならないことの確認。"""
@@ -477,7 +505,8 @@ class TestSelectorConfig:
         """
         cfg = SelectorConfig()
         assert cfg.max_watchlist == 50
-        assert cfg.min_atr_pct == 0.02
+        assert cfg.min_atr_cost_multiple == 5.0
+        assert cfg.spread_ticks == 2.0
         assert cfg.atr_period == 14
         assert cfg.premium_score_multiplier == 1.3
         assert cfg.premium_max_concurrent == 1

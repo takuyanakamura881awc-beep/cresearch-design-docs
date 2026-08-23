@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 
 from autotrader.report.metrics import max_drawdown
@@ -97,6 +98,58 @@ def max_atr_pct(
     if max_weight_per_symbol <= 0 or stop_atr_mult <= 0:
         raise ValueError("上限比率と損切り倍率は正の値である必要がある")
     return daily_breaker_pct / (max_weight_per_symbol * stop_atr_mult)
+
+
+def max_atr_yen(
+    capital: Decimal,
+    daily_breaker_pct: float = DEFAULT_DAILY_BREAKER_PCT,
+    stop_atr_mult: float = DEFAULT_STOP_ATR_MULT,
+    lot_size: int = 100,
+) -> Decimal:
+    """**建てられる建玉の ATR の上限（円）。同時保有数に依存しない。**
+
+    `max_atr_pct` は「1敗が日次ブレーカーに届かない ATR%」で、
+    `sizing.max_affordable_price` は「1単元が上限比率に収まる株価」。
+    この2つを掛けると建玉比率が**約分で消える**::
+
+        株価上限   = 資金 × 比率 ÷ 単元
+        ATR%上限   = ブレーカー ÷ (比率 × 損切倍率)
+        ────────────────────────────────────────────
+        ATR円上限  = 資金 × ブレーカー ÷ (単元 × 損切倍率)
+
+        = 500,000 × 0.02 ÷ (100 × 1.5) = 66.7円
+
+    【なぜこれが重要か】
+
+    往復コストは ``スプレッド円 ÷ ATR円``（`autotrader.tick`）。
+    つまり **ATR円の上限が、達成しうるコストの下限を決めている**。
+
+    そして上の式に建玉比率が出てこない以上、
+    **同時保有数を絞ってもコストの理論的な下限は1ミリも動かない。**
+    集中すると高い株が買えるが（tick に有利）、同時に ATR% の上限が
+    下がる（不利）。この2つが正確に打ち消し合う。
+
+    ただし**実在する銘柄の分布は変わる**。同時2銘柄なら
+    「2,200円 かつ ATR 2.0%」で天井に近づけるが、これはプライムの
+    中大型に普通にある。同時4銘柄で天井に届くには
+    「1,250円 かつ ATR 5.33%」が要り、こちらは極端に荒い小型株で稀。
+    **どちらの母集団が厚いかは計算では決まらないので実測する**
+    （`scripts/measure_universe.py` セクション8）。
+
+    Raises:
+        ValueError: 資金・損切り倍率・単元が正の値でない場合。
+    """
+    if capital <= 0:
+        raise ValueError(f"資金は正の値である必要がある: {capital}")
+    if stop_atr_mult <= 0:
+        raise ValueError(f"損切り倍率は正の値である必要がある: {stop_atr_mult}")
+    if lot_size < 1:
+        raise ValueError(f"単元株数は1以上である必要がある: {lot_size}")
+    return (
+        capital
+        * Decimal(str(daily_breaker_pct))
+        / (Decimal(lot_size) * Decimal(str(stop_atr_mult)))
+    )
 
 
 class BreakerAction(Enum):

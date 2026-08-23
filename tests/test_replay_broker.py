@@ -19,6 +19,7 @@ from autotrader.broker.replay import (
     THIN_SLIPPAGE_PENALTY_BPS,
     ReplayBroker,
 )
+from autotrader.tick import round_trip_cost_atr
 from autotrader.types import Bar, Side
 
 T0 = datetime(2026, 6, 1, 9, 0)
@@ -92,11 +93,36 @@ class TestFillPrice:
     def test_買いは高く売りは安く約定する(self) -> None:
         broker = _broker()
         bar = _bar("7203", 0, open_=1000.0)
-        # 20bps = 2円
-        assert broker.fill_price("7203", bar, Side.LONG, opening=True) == pytest.approx(1002.0)
-        assert broker.fill_price("7203", bar, Side.LONG, opening=False) == pytest.approx(998.0)
-        assert broker.fill_price("7203", bar, Side.SHORT, opening=True) == pytest.approx(998.0)
-        assert broker.fill_price("7203", bar, Side.SHORT, opening=False) == pytest.approx(1002.0)
+        # 1,000円: 呼値1円 × 2本 = スプレッド2円。片道はその半分の1円
+        assert broker.fill_price("7203", bar, Side.LONG, opening=True) == pytest.approx(1001.0)
+        assert broker.fill_price("7203", bar, Side.LONG, opening=False) == pytest.approx(999.0)
+        assert broker.fill_price("7203", bar, Side.SHORT, opening=True) == pytest.approx(999.0)
+        assert broker.fill_price("7203", bar, Side.SHORT, opening=False) == pytest.approx(1001.0)
+
+    def test_株価が高いほど相対コストが下がる(self) -> None:
+        """**tick モデルの主眼。** 固定bpsでは 600円も2,200円も同じ扱いになる。"""
+        broker = _broker()
+        assert broker.slippage_bps_for("7203", 2200.0) < broker.slippage_bps_for(
+            "7203", 1250.0
+        ) < broker.slippage_bps_for("7203", 600.0)
+
+    def test_同じATR円なら株価が違ってもコストは同じ(self) -> None:
+        """``往復コスト(ATR単位) = スプレッド円 ÷ ATR円``。株価は式に出てこない。
+
+        600円 × ATR3.33% と 2,200円 × ATR0.91% はどちらも ATR 20円で、
+        **払うコストは完全に同じ**。ATR% で判定すると前者だけ通ってしまう。
+        """
+        assert round_trip_cost_atr(600.0, 20.0) == pytest.approx(
+            round_trip_cost_atr(2200.0, 20.0)
+        )
+
+    def test_固定値を渡せば旧モデルを再現する(self) -> None:
+        """再ベースラインの前後比較が成立する条件。"""
+        bars = {"7203": (_bar("7203", 0, open_=1000.0),)}
+        flat = ReplayBroker(Decimal(500_000), bars, slippage_bps=20.0)
+        assert flat.slippage_bps_for("7203", 600.0) == flat.slippage_bps_for(
+            "7203", 2200.0
+        ) == 20.0
 
     def test_バーのレンジを超えては約定しない(self) -> None:
         """観測された高値を超える価格では実際には約定しえない。"""
@@ -109,9 +135,9 @@ class TestFillPrice:
         """流動性下限を下げるぶん、約定モデルは逆に厳しくする。"""
         thick = _broker(turnover=2_000_000_000.0)
         thin = _broker(turnover=300_000_000.0)
-        assert thin.slippage_bps_for("7203") == thick.slippage_bps_for("7203") + (
-            THIN_SLIPPAGE_PENALTY_BPS
-        )
+        assert thin.slippage_bps_for("7203", 1000.0) == thick.slippage_bps_for(
+            "7203", 1000.0
+        ) + (THIN_SLIPPAGE_PENALTY_BPS)
 
 
 class TestLeverage:
@@ -221,10 +247,10 @@ class TestRoundTrip:
         broker.market_order("close", "7203", Side.LONG, 100, opening=False)
 
         trade = broker.trades[0]
-        # 建値 1000*1.002 = 1002.0 / 返済 1100*0.998 = 1097.8
-        assert trade.entry_price == pytest.approx(1002.0)
-        assert trade.exit_price == pytest.approx(1097.8)
-        assert trade.pnl == pytest.approx((1097.8 - 1002.0) * 100)
+        # 1,000円は片道1円（10bps）、1,100円は片道1円（9.09bps）。呼値は同じ1円
+        assert trade.entry_price == pytest.approx(1001.0)
+        assert trade.exit_price == pytest.approx(1099.0)
+        assert trade.pnl == pytest.approx((1099.0 - 1001.0) * 100)
         assert broker.get_positions() == ()
 
     def test_往復コストが必ず引かれる(self) -> None:
