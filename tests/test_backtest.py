@@ -230,6 +230,28 @@ class _BuyOnceStrategy(Strategy):
         return False, "hold"
 
 
+class _BuyAllStrategy(Strategy):
+    """監視対象の全銘柄を1回ずつ建てる。watchlist の効きを見るための戦略。"""
+
+    def generate(
+        self,
+        now: datetime,
+        bars: dict[str, tuple[Bar, ...]],
+        positions: tuple[Position, ...],
+    ) -> tuple[Signal, ...]:
+        held = {p.symbol for p in positions}
+        return tuple(
+            Signal(code, Side.LONG, 1.0, "test")
+            for code, series in bars.items()
+            if code not in held and series
+        )
+
+    def should_close(
+        self, now: datetime, position: Position, bars: tuple[Bar, ...]
+    ) -> tuple[bool, str]:
+        return False, "hold"
+
+
 def _session(day: int, prices: list[float], symbol: str = "7203") -> list[Bar]:
     """9:00 から5分刻みのバー列を1日ぶん作る。"""
     return [
@@ -555,3 +577,63 @@ class TestBreakers:
         )
         assert not result.halted_early
         assert result.breaker_days == 0
+
+
+class TestWatchlist:
+    """**Layer 2 は日次で監視50銘柄を選び直す。** その日見ていない銘柄で建てない。"""
+
+    def _two_symbols(self) -> dict[str, tuple[Bar, ...]]:
+        return {
+            code: tuple(_session(1, [1000.0] * 4, symbol=code))
+            for code in ("7203", "6758")
+        }
+
+    def test_監視銘柄だけ建てる(self) -> None:
+        result = run(
+            _BuyAllStrategy(),
+            self._two_symbols(),
+            BacktestConfig(close_time=time(9, 15)),
+            watchlist={date(2026, 6, 1): frozenset({"7203"})},
+        )
+        assert {t.symbol for t in result.trades} == {"7203"}
+
+    def test_省略すれば全銘柄が対象(self) -> None:
+        """単体テスト用の逃げ道。実データの検証では必ず渡す。"""
+        result = run(
+            _BuyAllStrategy(), self._two_symbols(), BacktestConfig(close_time=time(9, 15))
+        )
+        assert {t.symbol for t in result.trades} == {"7203", "6758"}
+
+    def test_指定のない日は1銘柄も建てない(self) -> None:
+        """**「指定がなければ全部」にしない。**
+
+        選定が失敗した日に全銘柄が対象になるのが最悪の失敗。
+        空集合と同じ扱いにして、静かに広がらないようにする。
+        """
+        result = run(
+            _BuyAllStrategy(),
+            self._two_symbols(),
+            BacktestConfig(close_time=time(9, 15)),
+            watchlist={date(2026, 5, 1): frozenset({"7203"})},  # 別の日
+        )
+        assert result.n_trades == 0
+
+    def test_日ごとに入れ替わる(self) -> None:
+        bars = {
+            code: tuple(
+                _session(1, [1000.0] * 4, symbol=code)
+                + _session(2, [1000.0] * 4, symbol=code)
+            )
+            for code in ("7203", "6758")
+        }
+        result = run(
+            _BuyAllStrategy(),
+            bars,
+            BacktestConfig(close_time=time(9, 15)),
+            watchlist={
+                date(2026, 6, 1): frozenset({"7203"}),
+                date(2026, 6, 2): frozenset({"6758"}),
+            },
+        )
+        by_day = {(t.exit_time.day, t.symbol) for t in result.trades}
+        assert by_day == {(1, "7203"), (2, "6758")}

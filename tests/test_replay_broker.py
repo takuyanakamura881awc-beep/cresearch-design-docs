@@ -279,13 +279,34 @@ class TestQuote:
 
 
 class TestShortable:
-    def test_流動性で代理する(self) -> None:
-        """**Stage A では実データが取れないための代理指標。**
+    """**売建可否は約定バーから導出しない。**
 
-        Stage B で差し替えたときに成績が落ちうることを織り込んでおく。
+    5分足で「直近20本の平均売買代金」を取ると100分ぶんの値になり、
+    日次の閾値（10億円）と単位が食い違う。実際にこれで
+    **ショートが1件も出ないのにエラーも出ない**という失敗をした。
+    判定は日次データを持つ呼び出し側の責務にしてある。
+    """
+
+    def _with(self, shortable: frozenset[str] | None) -> ReplayBroker:
+        bars = {"7203": (_bar("7203", 0, open_=1000.0),)}
+        return ReplayBroker(Decimal(500_000), bars, shortable=shortable)
+
+    def test_渡された集合で判定する(self) -> None:
+        assert self._with(frozenset({"7203"})).is_shortable("7203")
+        assert not self._with(frozenset({"6758"})).is_shortable("7203")
+
+    def test_省略すると1銘柄も売建できない(self) -> None:
+        """**保守的な側に倒す**（CLAUDE.md 規約5）。
+
+        「全部売建できる」を既定にすると、渡し忘れたときに
+        実際には建てられない銘柄で成績が出てしまう。
         """
-        assert _broker(turnover=2_000_000_000.0).is_shortable("7203")
-        assert not _broker(turnover=300_000_000.0).is_shortable("7203")
+        assert not self._with(None).is_shortable("7203")
 
     def test_知らない銘柄は売建不可(self) -> None:
-        assert not _broker().is_shortable("9999")
+        assert not self._with(frozenset({"7203"})).is_shortable("9999")
+
+    def test_ストップつきでも売建不可なら建てられない(self) -> None:
+        """売建可否のチェックは engine 側。broker は判定を提供するだけ。"""
+        broker = self._with(frozenset())
+        assert not broker.is_shortable("7203")

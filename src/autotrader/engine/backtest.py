@@ -176,6 +176,12 @@ class BacktestResult:
     **成績の解釈に要る。** 発動日が多いなら、1トレードあたりのリスクが
     資金量に対して大きすぎる（docs/04 のトレード頻度想定を参照）。
     """
+    skipped_shorts: int = 0
+    """売建できないため見送ったショートシグナルの件数。
+
+    **0 でないのに `BacktestConfig.shortable` を渡し忘れていないか確認する。**
+    ショートが静かに全滅していても成績はそれらしく見えてしまう。
+    """
     halted_early: bool = False
     """連続損失（#5）か累積DD（#6）で期間の途中から停止したか。
 
@@ -200,6 +206,7 @@ class BacktestResult:
         rejected_by_leverage: int = 0,
         breaker_days: int = 0,
         halted_early: bool = False,
+        skipped_shorts: int = 0,
     ) -> BacktestResult:
         """エクイティカーブとトレード列から指標をまとめて算出する。
 
@@ -221,6 +228,7 @@ class BacktestResult:
             rejected_by_leverage=rejected_by_leverage,
             breaker_days=breaker_days,
             halted_early=halted_early,
+            skipped_shorts=skipped_shorts,
         )
 
 
@@ -246,6 +254,12 @@ class BacktestConfig:
     """連続損失で停止する営業日数（安全装置 #5）。以降は再開しない。"""
     max_drawdown_pct: float = -0.15
     """累積ドローダウンの上限（安全装置 #6）。以降は再開しない。"""
+    shortable: frozenset[str] | None = None
+    """売建できる銘柄（安全装置 #12 の Stage A 代理）。
+
+    **省略すると1銘柄も売建しない。** ショートが静かに消えるのを防ぐため、
+    見送った件数は `BacktestResult.skipped_shorts` に出る。
+    """
     enforce_breakers: bool = True
     """ブレーカーを再現するか。
 
@@ -265,6 +279,7 @@ def run(
     strategy: Strategy,
     bars: Mapping[str, tuple[Bar, ...]],
     config: BacktestConfig | None = None,
+    watchlist: Mapping[date, frozenset[str]] | None = None,
 ) -> BacktestResult:
     """バックテストを実行する。
 
@@ -289,6 +304,16 @@ def run(
         strategy: 検証する戦略。
         bars: 銘柄コード → バー列（時刻の昇順）。分足を想定する。
         config: 実行設定。省略時は Stage A の既定（20bps・14:50クローズ）。
+        watchlist: 営業日 → その日に**新規建てしてよい**銘柄。
+
+            Layer 2 は日次で監視50銘柄を選び直すので、それを再現するために使う。
+            **省略すると全銘柄が対象になる** — 単体テストでは省くが、
+            実データの検証では必ず渡すこと。渡さないと「その日は見ていなかった
+            銘柄」で建ててしまい、実運用では起こりえない成績になる。
+
+            日付が辞書にない日は**その日は1銘柄も建てない**（空集合と同じ）。
+            「指定がなければ全部」にすると、選定が失敗した日に
+            全銘柄が対象になるという最悪の失敗をする。
 
     Returns:
         結果。**採用の判断前に backtest-validator の検証を通すこと。**
@@ -302,7 +327,7 @@ def run(
         その再現は Phase 3 で ``risk/limits.py`` を組み込んでから行う。
     """
     cfg = config or BacktestConfig()
-    broker = ReplayBroker(cfg.initial_cash, bars, cfg.slippage_bps)
+    broker = ReplayBroker(cfg.initial_cash, bars, cfg.slippage_bps, cfg.shortable)
     if not broker.timeline:
         return BacktestResult.from_equity([], [], float(cfg.initial_cash))
 
@@ -311,6 +336,7 @@ def run(
     # 建玉は当日中に必ず閉じるので、日次のエクイティは実現済みの状態を表す。
     daily_equity: dict[date, float] = {}
     rejected = 0
+    skipped_shorts = 0
     order_seq = 0
     current_day: date | None = None
     closed_today = False
@@ -375,7 +401,12 @@ def run(
 
         # 2. 新規建て。当日クローズ後・ブレーカー発動後は建てない
         if not closed_today and not halted_for_good:
-            rejected += _open_signals(strategy, broker, view, cfg, now)
+            allowed = None if watchlist is None else watchlist.get(current_day, frozenset())
+            n_rejected, n_skipped = _open_signals(
+                strategy, broker, view, cfg, now, allowed
+            )
+            rejected += n_rejected
+            skipped_shorts += n_skipped
 
         daily_equity[current_day] = broker.equity()
         broker.advance()
@@ -396,6 +427,7 @@ def run(
         rejected_by_leverage=rejected,
         breaker_days=len(breaker_days),
         halted_early=halted_for_good,
+        skipped_shorts=skipped_shorts,
     )
 
 
@@ -448,19 +480,26 @@ def _open_signals(
     view: PointInTimeView,
     cfg: BacktestConfig,
     now: datetime,
-) -> int:
+    allowed: frozenset[str] | None = None,
+) -> tuple[int, int]:
     """シグナルから新規建てを行う。
 
+    Args:
+        allowed: その日の監視銘柄。``None`` なら制限しない。
+
     Returns:
-        レバレッジ上限で見送った件数。
+        (レバレッジ上限で見送った件数, 売建不可で見送った件数)。
     """
     positions = broker.get_positions()
     held = {p.symbol for p in positions}
     signals = strategy.generate(now, view.as_dict(), positions)
+    if allowed is not None:
+        signals = tuple(s for s in signals if s.symbol in allowed)
     if not signals:
-        return 0
+        return 0, 0
 
     rejected = 0
+    skipped_shorts = 0
     # 強いシグナルから順に建てる。枠が足りないとき何が優先されるかを決めておく
     for signal in sorted(signals, key=lambda s: (-s.strength, s.symbol)):
         if len(held) >= cfg.max_concurrent:
@@ -477,6 +516,7 @@ def _open_signals(
                 logger.warning("%s: ストップのないショートを無視した", signal.symbol)
                 continue
             if not broker.is_shortable(signal.symbol):
+                skipped_shorts += 1
                 continue
 
         target = target_notional(
@@ -503,7 +543,7 @@ def _open_signals(
             continue
         held.add(signal.symbol)
 
-    return rejected
+    return rejected, skipped_shorts
 
 
 def walk_forward(

@@ -76,7 +76,15 @@ THIN_SLIPPAGE_PENALTY_BPS = 5.0
 """
 
 SHORTABLE_MIN_TURNOVER_YEN = Decimal(1_000_000_000)
-"""Stage A で「売建できる」とみなす売買代金の下限。**これは代理指標。**"""
+"""Stage A で「売建できる」とみなす**日次**売買代金の下限。**これは代理指標。**
+
+**約定に使うバーから導出してはならない。** 5分足で「直近20本の平均」を取ると
+100分ぶんの売買代金になり、日次の閾値と単位が食い違う。実際に踏んだ:
+実データ相当の検証でショートが1件も出ず、しかもエラーは出なかった。
+
+売建可否は `ReplayBroker(shortable=...)` に**外から渡す**。
+日次データを持っている側（`scripts/backtest_take.py`）が判定する。
+"""
 
 
 class ReplayBroker(Broker):
@@ -95,6 +103,7 @@ class ReplayBroker(Broker):
         initial_cash: Decimal,
         bars: Mapping[str, tuple[Bar, ...]],
         slippage_bps: float = STAGE_A_SLIPPAGE_BPS,
+        shortable: frozenset[str] | None = None,
     ) -> None:
         """
         Args:
@@ -102,6 +111,13 @@ class ReplayBroker(Broker):
             bars: 銘柄コード → バー列（時刻の昇順）。
             slippage_bps: 片道スリッページ（bps）。
                 **板がないので Stage B（10bps）より厚く見積もる。**
+            shortable: 売建できる銘柄。
+
+                **省略すると1銘柄も売建できない。** 保守的な側に倒している
+                （CLAUDE.md 規約5）。約定バーから推定する実装にしていたが、
+                5分足だと日次の閾値と単位が食い違い、**ショートが1件も出ないのに
+                エラーも出ない**という失敗をした。判定は日次データを持つ
+                呼び出し側の責務にしてある。
 
         Raises:
             ValueError: スリッページが0以下、または資金が0以下の場合。
@@ -137,6 +153,7 @@ class ReplayBroker(Broker):
         リプレイ側で記録する。`Trade.exit_reason` は監査とデバッグに要る。
         """
         self._turnover_cache: dict[str, Decimal | None] = {}
+        self._shortable = shortable
 
     # ------------------------------------------------------------------
     # 時計
@@ -394,14 +411,19 @@ class ReplayBroker(Broker):
 
         **Stage A では一般信用の売建可能銘柄リストが取得できない。**
         流動性上位であることで代理し、Stage B で実データに差し替える
-        （docs/09-data-sources.md §3）。
+        （docs/09-data-sources.md §3）。判定は**呼び出し側が日次データで行い**、
+        結果を ``shortable`` で渡す。
 
         代理である以上、Stage A のショート成績は
         **実際には売建できない銘柄を含んでいる可能性がある**。
         Stage B での差し替え後に成績が落ちうることを織り込んでおく。
+
+        Returns:
+            ``shortable`` を渡していなければ**常に False**（保守的な側）。
         """
-        turnover = self._average_turnover(symbol)
-        return turnover is not None and turnover >= SHORTABLE_MIN_TURNOVER_YEN
+        if self._shortable is None:
+            return False
+        return symbol in self._shortable
 
     # ------------------------------------------------------------------
     # 便宜
