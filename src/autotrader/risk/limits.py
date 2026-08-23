@@ -20,6 +20,44 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+DEFAULT_DAILY_BREAKER_PCT = 0.02
+"""日次損失上限（#4）。総資産のこの割合を失ったら当日全停止する。"""
+
+DEFAULT_MAX_WEIGHT_PER_SYMBOL = 0.25
+"""1銘柄あたり総資産の上限（#7）。"""
+
+DEFAULT_STOP_ATR_MULT = 1.5
+"""損切り幅の ATR 倍率。config/strategies.yaml の ``stop_loss_atr_mult`` と一致させる。"""
+
+
+def max_atr_pct(
+    daily_breaker_pct: float = DEFAULT_DAILY_BREAKER_PCT,
+    max_weight_per_symbol: float = DEFAULT_MAX_WEIGHT_PER_SYMBOL,
+    stop_atr_mult: float = DEFAULT_STOP_ATR_MULT,
+) -> float:
+    """**1敗が日次ブレーカーに達しない ATR% の上限。**
+
+    1敗あたりの総資産インパクトは ``建玉比率 × ATR% × 損切り倍率``。
+    建玉比率が上限（25%）のとき、これが日次ブレーカー（2%）に届かない条件は::
+
+        0.25 × ATR% × 1.5 < 0.02   →   ATR% < 5.33%
+
+    【なぜ上限が要るのか】
+
+    Layer 2 のスコアは **ATR% に最大の重み（0.40）** を置いている。
+    値幅がないとコスト負けするので下限（2%）は当然として、
+    **上限がないとスコアリング自体が「1敗で当日が終わる銘柄」を上位に押し上げる。**
+
+    実測（2026-05-29）では ATR% の最大が 17.12% で、上位10銘柄のうち2つが
+    1敗 -2% を超えていた。下限だけでは足りない。
+
+    **定数を直書きせず導出する**のは `risk.sizing.max_affordable_price` と同じ理由。
+    ブレーカーや上限比率を動かしたとき、ここが自動で追随する。
+    """
+    if max_weight_per_symbol <= 0 or stop_atr_mult <= 0:
+        raise ValueError("上限比率と損切り倍率は正の値である必要がある")
+    return daily_breaker_pct / (max_weight_per_symbol * stop_atr_mult)
+
 
 class BreakerAction(Enum):
     """ブレーカー発動時の動作。"""

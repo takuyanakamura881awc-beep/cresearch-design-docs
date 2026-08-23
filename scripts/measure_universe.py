@@ -34,8 +34,13 @@ from decimal import Decimal
 from autotrader.config import load_credentials, mask
 from autotrader.data.base import DataSourceError, RateLimitError
 from autotrader.data.jquants import JQuantsDataSource
-from autotrader.risk.sizing import max_affordable_price
-from autotrader.types import Bar, PriceTier, Symbol
+from autotrader.risk.limits import DEFAULT_DAILY_BREAKER_PCT, DEFAULT_STOP_ATR_MULT
+from autotrader.risk.sizing import (
+    calc_quantity,
+    max_affordable_price,
+    target_notional,
+)
+from autotrader.types import Bar, PriceTier, Symbol, UniverseEntry
 from autotrader.universe.builder import build
 from autotrader.universe.filters import (
     DEFAULT_PRICE_HARD_MIN,
@@ -105,6 +110,12 @@ MAX_ORDER_YEN = Decimal(150_000)
 **注意: 現行の 150,000円 は 25%上限（125,000円）を超えており不整合。**
 ここは板インパクトの見積もりに使うので、大きい側＝保守的な値のままにしてある。
 """
+
+STOP_ATR_MULT = DEFAULT_STOP_ATR_MULT
+"""損切り幅の ATR 倍率。config/strategies.yaml と一致させること。"""
+
+DAILY_BREAKER_PCT = DEFAULT_DAILY_BREAKER_PCT
+"""日次損失上限（安全装置 #4）。"""
 
 PRICE_BANDS = (300, 500, 800, 1000, 1250)
 """株価帯の区切り。通常枠とプレミアム枠の新しい境界を数字で決めるために出す。"""
@@ -348,14 +359,22 @@ def report_layer2(
         return
 
     atrs = sorted(c.features.atr_pct for c in candidates)
-    eligible = [c for c in candidates if c.features.atr_pct >= selector.min_atr_pct]
-    print(
-        f"  ATR% >= {selector.min_atr_pct:.0%} を満たす : {len(eligible):>4}銘柄"
-        f"（{len(eligible) / len(candidates):.0%}）"
-    )
+    quiet = sum(1 for a in atrs if a < selector.min_atr_pct)
+    wild = sum(1 for a in atrs if a > selector.max_atr_pct)
+    eligible = len(candidates) - quiet - wild
     print(
         f"  ATR% の分布         : 中央値 {atrs[len(atrs) // 2]:.2%} / "
         f"上位25% {atrs[int(len(atrs) * 0.75)]:.2%} / 最大 {atrs[-1]:.2%}"
+    )
+    print(
+        f"  ATR% < {selector.min_atr_pct:.2%}（コスト負け）  : {quiet:>4}銘柄で除外"
+    )
+    print(
+        f"  ATR% > {selector.max_atr_pct:.2%}（1敗でブレーカー）: {wild:>4}銘柄で除外"
+    )
+    print(
+        f"  → 範囲内            : {eligible:>4}銘柄"
+        f"（{eligible / len(candidates):.0%}）"
     )
 
     picked = select(candidates, trade_date, selector)
@@ -373,6 +392,8 @@ def report_layer2(
         print("  → 流動性下限をさらに下げる（3億→2億で +25銘柄）か、")
         print("     max_watchlist を実態に合わせて下げるかを判断する。")
 
+    _print_loss_impact(picked, bars)
+
     if picked:
         print()
         print("  上位10銘柄:")
@@ -383,6 +404,56 @@ def report_layer2(
                 f"スコア {entry.score:.3f}  ATR% {entry.atr_pct:>5.2%}  "
                 f"{entry.price_tier.value}  {entry.symbol.name[:16]}"
             )
+
+
+def _print_loss_impact(
+    picked: tuple[UniverseEntry, ...], bars: dict[str, tuple[Bar, ...]]
+) -> None:
+    """選定された銘柄の「1敗あたり総資産インパクト」を出す。
+
+    **ATR% 上限が実際に効いているかの検算。**
+
+    1敗の損失 = 建玉 × 損切り幅 = 建玉 × 1.5 × ATR%。
+    単元100株が最小単位なので、この値はこれ以上小さくできない。
+    日次ブレーカー（-2%）に対して何敗まで耐えられるかがここで決まる。
+    """
+    if not picked:
+        return
+
+    losses = []
+    for entry in picked:
+        price = bars[entry.symbol.code][-1].close
+        qty = calc_quantity(target_notional(CAPITAL), price)
+        if qty <= 0:
+            continue
+        notional = qty * price
+        losses.append((entry.symbol.code, notional / float(CAPITAL),
+                       notional * STOP_ATR_MULT * entry.atr_pct / float(CAPITAL)))
+
+    if not losses:
+        print()
+        print("  NG: 選定された銘柄が1つも発注できない（1単元も買えない）")
+        return
+
+    values = sorted(v for _, _, v in losses)
+    worst_code, worst_weight, worst = max(losses, key=lambda x: x[2])
+    median = values[len(values) // 2]
+    over = [c for c, _, v in losses if v >= DAILY_BREAKER_PCT]
+
+    print()
+    print("  1敗あたりの総資産インパクト（1単元が最小単位なのでこれ以上下げられない）")
+    print(
+        f"    中央値 -{median:.2%}（{DAILY_BREAKER_PCT / median:.1f}敗で"
+        f"日次ブレーカー -{DAILY_BREAKER_PCT:.0%} 到達）"
+    )
+    print(
+        f"    最悪   -{worst:.2%}  {worst_code}（建玉が資金の{worst_weight:.0%}）"
+    )
+    if over:
+        print(f"    **NG: 1敗でブレーカー到達する銘柄が {len(over)} 件: {over[:5]}**")
+        print("       → ATR% 上限が効いていない。導出を確認する")
+    else:
+        print("    OK: 1敗でブレーカーに達する銘柄はない")
 
 
 def main() -> int:

@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
+from autotrader.risk.limits import max_atr_pct
 from autotrader.types import Bar, PriceTier, Symbol
 from autotrader.universe.selector import (
     DEFAULT_STAGE_A_WEIGHTS,
@@ -303,8 +304,8 @@ class TestSelect:
     def test_スコア降順で返す(self) -> None:
         candidates = [
             _candidate("A", atr_pct=0.03),
-            _candidate("B", atr_pct=0.09),
-            _candidate("C", atr_pct=0.06),
+            _candidate("B", atr_pct=0.05),
+            _candidate("C", atr_pct=0.04),
         ]
         picked = select(candidates, self.TRADE_DATE)
         assert [e.symbol.code for e in picked] == ["B", "C", "A"]
@@ -335,7 +336,7 @@ class TestSelect:
     def test_監視枠の上限で切る(self) -> None:
         """上限50は Stage B の WebSocket 制限。Stage A も同じ数に揃える。"""
         candidates = [
-            _candidate(f"{1000 + i}", atr_pct=0.03 + i * 0.001) for i in range(60)
+            _candidate(f"{1000 + i}", atr_pct=0.021 + i * 0.0005) for i in range(60)
         ]
         picked = select(candidates, self.TRADE_DATE)
         assert len(picked) == 50
@@ -361,18 +362,66 @@ class TestSelect:
         assert picked[0].gap_pct is None  # Stage A
 
 
+class TestAtrCeiling:
+    """**ATR% の上限。下限とは根拠がまったく別。**
+
+    下限（2%）はコスト負けの回避。
+    上限（5.33%）は「1敗で日次ブレーカー（-2%）に達する銘柄を採らない」ため。
+
+    スコアは ATR% に最大の重み（0.40）を置いているので、**上限がないと
+    選定自体が最も危険な銘柄を上位に押し上げる**。実測（2026-05-29）では
+    ATR% の最大が17.12%で、上位10銘柄のうち2つが1敗 -2% を超えていた。
+    """
+
+    TRADE_DATE = date(2026, 6, 1)
+
+    def test_既定値は日次ブレーカーからの導出値(self) -> None:
+        """定数を直書きせず導出する。ブレーカーを動かせば自動で追随する。"""
+        assert SelectorConfig().max_atr_pct == max_atr_pct()
+        assert max_atr_pct() == pytest.approx(0.02 / (0.25 * 1.5))
+
+    def test_ボラが高すぎる銘柄を落とす(self) -> None:
+        candidates = [_candidate("A", atr_pct=0.05), _candidate("B", atr_pct=0.06)]
+        picked = select(candidates, self.TRADE_DATE)
+        assert [e.symbol.code for e in picked] == ["A"]
+
+    def test_境界値(self) -> None:
+        ceiling = max_atr_pct()
+        assert select([_candidate("A", atr_pct=ceiling)], self.TRADE_DATE)
+        assert select([_candidate("A", atr_pct=ceiling * 1.001)], self.TRADE_DATE) == ()
+
+    def test_上限で全滅したら空を返す(self) -> None:
+        assert select([_candidate("A", atr_pct=0.20)], self.TRADE_DATE) == ()
+
+    def test_上限は下限より大きくなければならない(self) -> None:
+        with pytest.raises(ValueError, match="max_atr_pct"):
+            SelectorConfig(min_atr_pct=0.06, max_atr_pct=0.05)
+
+    def test_ブレーカーを緩めれば上限も上がる(self) -> None:
+        """安全装置を動かしたときに、導出値が置き去りにならないことの確認。"""
+        assert max_atr_pct(daily_breaker_pct=0.03) == pytest.approx(0.08)
+        assert max_atr_pct(max_weight_per_symbol=0.20) == pytest.approx(0.0666, abs=1e-4)
+
+    def test_不正な引数を拒否する(self) -> None:
+        with pytest.raises(ValueError):
+            max_atr_pct(max_weight_per_symbol=0)
+        with pytest.raises(ValueError):
+            max_atr_pct(stop_atr_mult=0)
+
+
 class TestPremiumTier:
     """1単元が資金の40〜60%を占める枠。**安易に採らない。**"""
 
     TRADE_DATE = date(2026, 6, 1)
 
     def _mixed(self, premium_atr: float) -> list[Candidate]:
+        """ATR% は上限（5.33%）の内側に収める。超えると枠の判定より先に落ちる。"""
         normal = [_candidate(f"N{i}", atr_pct=0.03 + i * 0.001) for i in range(5)]
         premium = _candidate("P1", tier=PriceTier.PREMIUM, atr_pct=premium_atr)
         return [*normal, premium]
 
     def test_ハードルを超えれば採用する(self) -> None:
-        picked = select(self._mixed(premium_atr=0.99), self.TRADE_DATE)
+        picked = select(self._mixed(premium_atr=0.05), self.TRADE_DATE)
         assert "P1" in [e.symbol.code for e in picked]
 
     def test_ハードルに届かなければ採用しない(self) -> None:
@@ -383,7 +432,8 @@ class TestPremiumTier:
     def test_同時採用数の上限を守る(self) -> None:
         normal = [_candidate(f"N{i}", atr_pct=0.03 + i * 0.0001) for i in range(5)]
         premium = [
-            _candidate(f"P{i}", tier=PriceTier.PREMIUM, atr_pct=0.5 + i) for i in range(3)
+            _candidate(f"P{i}", tier=PriceTier.PREMIUM, atr_pct=0.045 + i * 0.003)
+            for i in range(3)
         ]
         picked = select([*normal, *premium], self.TRADE_DATE)
         n_premium = sum(1 for e in picked if e.price_tier is PriceTier.PREMIUM)
@@ -395,19 +445,19 @@ class TestPremiumTier:
         基準がない状態で例外枠を採るのは保守的でない。
         """
         picked = select(
-            [_candidate("P1", tier=PriceTier.PREMIUM, atr_pct=0.10)], self.TRADE_DATE
+            [_candidate("P1", tier=PriceTier.PREMIUM, atr_pct=0.05)], self.TRADE_DATE
         )
         assert picked == ()
 
     def test_無効にできる(self) -> None:
         """Phase 3 で寄与しないと分かったら枠ごと落とす。"""
         config = SelectorConfig(premium_enabled=False)
-        picked = select(self._mixed(premium_atr=0.99), self.TRADE_DATE, config)
+        picked = select(self._mixed(premium_atr=0.05), self.TRADE_DATE, config)
         assert "P1" not in [e.symbol.code for e in picked]
 
     def test_プレミアムを入れても枠の総数は超えない(self) -> None:
         config = SelectorConfig(max_watchlist=5)
-        picked = select(self._mixed(premium_atr=0.99), self.TRADE_DATE, config)
+        picked = select(self._mixed(premium_atr=0.05), self.TRADE_DATE, config)
         assert len(picked) == 5
         assert "P1" in [e.symbol.code for e in picked]
 

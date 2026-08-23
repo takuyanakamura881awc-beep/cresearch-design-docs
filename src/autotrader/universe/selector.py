@@ -28,12 +28,18 @@ from dataclasses import dataclass, field
 from datetime import date
 from statistics import median
 
+from autotrader.risk.limits import max_atr_pct
 from autotrader.types import Bar, PriceTier, Symbol, UniverseEntry
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_WATCHLIST = 50
 DEFAULT_MIN_ATR_PCT = 0.02
+"""ATR% の下限。**往復コストの5倍**という根拠から決まる。
+
+Stage A のスリッページは片道20bps = 往復40bps。日中値幅がその5倍ないと
+コスト負けする。上限とは根拠がまったく別なので、片方を動かしても他方は動かない。
+"""
 DEFAULT_ATR_PERIOD = 14
 DEFAULT_VOLUME_LOOKBACK_DAYS = 20
 DEFAULT_PREMIUM_SCORE_MULTIPLIER = 1.3
@@ -101,6 +107,13 @@ class SelectorConfig:
 
     max_watchlist: int = DEFAULT_MAX_WATCHLIST
     min_atr_pct: float = DEFAULT_MIN_ATR_PCT
+    max_atr_pct: float = field(default_factory=max_atr_pct)
+    """ATR% の上限。**日次ブレーカーからの導出値**（`risk.limits.max_atr_pct`）。
+
+    下限（コスト）とは根拠が別で、こちらは
+    「1敗で当日が終わる銘柄を選ばない」ための制約。
+    50万円・上限25%・損切り1.5×ATR では 5.33%。
+    """
     atr_period: int = DEFAULT_ATR_PERIOD
     volume_lookback_days: int = DEFAULT_VOLUME_LOOKBACK_DAYS
     weights: dict[str, float] = field(
@@ -117,6 +130,11 @@ class SelectorConfig:
             raise ValueError("atr_period と volume_lookback_days は1以上")
         if self.min_atr_pct < 0:
             raise ValueError("min_atr_pct は0以上")
+        if self.max_atr_pct <= self.min_atr_pct:
+            raise ValueError(
+                f"min_atr_pct({self.min_atr_pct}) < max_atr_pct({self.max_atr_pct}) "
+                "である必要がある"
+            )
         if self.premium_max_concurrent < 0:
             raise ValueError("premium_max_concurrent は0以上")
         validate_weights(self.weights)
@@ -429,8 +447,11 @@ def select(
     手順:
 
     1. 母集団を横断してスコアを計算する
-    2. **ATR% < min_atr_pct の銘柄を落とす**
-       （日中値幅が往復コストの5倍ないとコスト負けする）
+    2. **ATR% が範囲外の銘柄を落とす**
+       （下限: 日中値幅が往復コストの5倍ないとコスト負けする /
+       上限: 1敗で日次ブレーカーに達する銘柄を採らない）
+       **上限も見る**。ATR% が高すぎる銘柄は、上限比率で建てると
+       1敗で日次ブレーカー（-2%）に達し当日が終わる
     3. 通常枠からスコア上位を採用する
     4. プレミアム枠は条件を満たす場合のみ追加する:
 
@@ -472,20 +493,34 @@ def select(
 
     # 2. ATR% のハードルはスコアの前ではなく後に適用する。
     #    順位変換の母集団を先に削ると、残った銘柄の順位が母集団の切り方で変わる。
-    eligible = [c for c in candidates if c.features.atr_pct >= cfg.min_atr_pct]
-    dropped = len(candidates) - len(eligible)
-    if dropped:
+    #
+    #    **下限と上限は根拠が別**なので、落ちた件数も別々に数える。
+    #    下限が効きすぎているのか上限が効きすぎているのかで打つ手が変わる。
+    too_quiet = [c for c in candidates if c.features.atr_pct < cfg.min_atr_pct]
+    too_wild = [c for c in candidates if c.features.atr_pct > cfg.max_atr_pct]
+    eligible = [
+        c
+        for c in candidates
+        if cfg.min_atr_pct <= c.features.atr_pct <= cfg.max_atr_pct
+    ]
+    if too_quiet:
         logger.info(
-            "ATR%% < %.1f%% で除外: %d銘柄（残り %d）",
+            "ATR%% < %.2f%%（コスト負け）で除外: %d銘柄",
             cfg.min_atr_pct * 100,
-            dropped,
-            len(eligible),
+            len(too_quiet),
+        )
+    if too_wild:
+        logger.info(
+            "ATR%% > %.2f%%（1敗で日次ブレーカー到達）で除外: %d銘柄",
+            cfg.max_atr_pct * 100,
+            len(too_wild),
         )
     if not eligible:
         logger.warning(
-            "%s: ATR%% >= %.1f%% を満たす銘柄がない。監視銘柄なし",
+            "%s: ATR%% が %.2f%%〜%.2f%% に収まる銘柄がない。監視銘柄なし",
             trade_date,
             cfg.min_atr_pct * 100,
+            cfg.max_atr_pct * 100,
         )
         return ()
 
