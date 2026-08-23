@@ -182,8 +182,13 @@ def report(result: BacktestResult, n_days: int, label: str) -> None:
             f"{sum(per_day.values()) / traded:.1f}回 / "
             f"全{n_days}営業日なら平均 {result.n_trades / n_days:.1f}回"
         )
-        if sum(per_day.values()) / traded > 5:
-            print("    → 取引した日は想定（3〜5回）を超えている。発火条件が緩い可能性")
+        # **回数そのものは制約ではない**（docs/04）。縛っているのは日次損益。
+        # 目安から外れたことより、日次ブレーカーが何日発動したかを見る。
+        if result.breaker_days:
+            print(
+                f"    → 日次ブレーカーが{result.breaker_days}日発動している。"
+                "1トレードあたりのリスクが資金量に対して大きい可能性"
+            )
         last_day = max(per_day)
         print(f"  最後に取引した日: {last_day}")
 

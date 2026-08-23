@@ -50,46 +50,80 @@ class TestDailyLoss:
 
 
 class TestConsecutiveLoss:
-    """#5 連続損失。**復帰には人の明示承認が必要。**"""
+    """#5 連続損失。**復帰には人の明示承認が必要。**
 
-    def test_3営業日連続マイナスで発動する(self) -> None:
-        state = check_consecutive_loss([-0.01, -0.005, -0.02])
+    連続日数と損失額の**両方**を要求する。日数だけだと微小な3連敗でも発動し、
+    勝っている戦略でも3ヶ月にほぼ確実に止まる（下落日率40%でも60営業日で93%）。
+    止めるべきなのは損害が続いているときで、たまたま3日下げたときではない。
+    """
+
+    def test_3連敗かつ累積5パーセント以上で発動する(self) -> None:
+        state = check_consecutive_loss([-0.02, -0.015, -0.02])  # -5.5%
         assert state.tripped
         assert state.action is BreakerAction.HALT
+
+    def test_微小な3連敗では発動しない(self) -> None:
+        """**実測でこれに引っかかった。**
+
+        -0.87% / -0.62% / -0.54%（合計 -2.0%）で停止し、
+        39営業日のうち7日しか検証できなかった。
+        日次ブレーカー1回ぶんの損失に3日かけて到達しただけで、
+        「戦略が相場に合っていない」証拠とは言えない。
+        """
+        assert not check_consecutive_loss([-0.0087, -0.0062, -0.0054]).tripped
+
+    def test_損失額の境界(self) -> None:
+        assert not check_consecutive_loss([-0.016] * 3).tripped  # -4.8%
+        assert check_consecutive_loss([-0.017] * 3).tripped  # -5.1%
 
     def test_自動復帰しない(self) -> None:
         """**連敗は戦略が相場に合っていない兆候。**
 
         自動再開すると損失を垂れ流す。人が判断する。
         """
-        assert check_consecutive_loss([-0.01] * 3).auto_resume is False
+        assert check_consecutive_loss([-0.02] * 3).auto_resume is False
 
     def test_間に勝ちがあればリセットされる(self) -> None:
-        assert not check_consecutive_loss([-0.01, 0.02, -0.01]).tripped
+        assert not check_consecutive_loss([-0.03, 0.02, -0.03]).tripped
 
     def test_直近3日だけを見る(self) -> None:
         """古い連敗を引きずらない。"""
-        assert not check_consecutive_loss([-0.01, -0.01, -0.01, 0.02]).tripped
+        assert not check_consecutive_loss([-0.03, -0.03, -0.03, 0.02]).tripped
+
+    def test_日次と累積DDの背後は残る(self) -> None:
+        """#5 を緩めても守りは薄くならない。
+
+        1日で -2% を割れば #4 が、ピークから -15% で #6 が止める。
+        #5 が担うのは「その中間の、じわじわ削られる状態」の検出。
+        """
+        assert check_daily_loss(-0.02).tripped
+        assert check_max_drawdown([500_000, 425_000]).tripped
+
+    def test_正の閾値を拒否する(self) -> None:
+        with pytest.raises(ValueError):
+            check_consecutive_loss([-0.03] * 3, min_cumulative_loss_pct=0.05)
 
     def test_損益ゼロは連敗を途切れさせる(self) -> None:
-        """**docs/05 の定義は「3営業日連続マイナス」。ゼロはマイナスではない。**
+        """**docs/05 の定義は「連続マイナス」。ゼロはマイナスではない。**
 
         実務上ゼロになるのは**その日1トレードもしなかった場合**で、
         「戦略が相場に合っていない」という判定根拠にならない。
         連敗に数えると、様子見の日を挟んだだけで人の承認待ちに入る。
+
+        損失額は十分（-6%）なので、止まらない理由は日数のほうだと分かる。
         """
-        assert not check_consecutive_loss([-0.01, 0.0, -0.01]).tripped
+        assert not check_consecutive_loss([-0.03, 0.0, -0.03]).tripped
 
     def test_日数が足りなければ発動しない(self) -> None:
-        assert not check_consecutive_loss([-0.01, -0.01]).tripped
+        assert not check_consecutive_loss([-0.03, -0.03]).tripped
         assert not check_consecutive_loss([]).tripped
 
     def test_閾値日数を変えられる(self) -> None:
-        assert check_consecutive_loss([-0.01, -0.01], threshold_days=2).tripped
+        assert check_consecutive_loss([-0.03, -0.03], threshold_days=2).tripped
 
     def test_不正な日数を拒否する(self) -> None:
         with pytest.raises(ValueError):
-            check_consecutive_loss([-0.01], threshold_days=0)
+            check_consecutive_loss([-0.03], threshold_days=0)
 
 
 class TestMaxDrawdown:

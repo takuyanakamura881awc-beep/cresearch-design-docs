@@ -223,6 +223,57 @@ def fetch_interval(
     return saved, missing
 
 
+WALKFORWARD_DAYS = 80
+"""ウォークフォワードに要る営業日数の目安（学習60 + 検証20）。"""
+
+
+def _print_accumulation(store: BarStore, symbols: tuple[Symbol, ...]) -> None:
+    """5分足の蓄積状況を出す。
+
+    【なぜ蓄積が要るか】
+
+    **yfinance の5分足は常に58日ぶんしか返さない。** 一度の取得では
+    ウォークフォワード（学習60 + 検証20 = 80営業日）に足りない。
+
+    ただし `BarStore.write` は既存データとマージするので、
+    **定期実行すれば58日の窓を超えて溜まっていく。**
+    週1回まわせば3ヶ月後には100営業日前後になる。
+
+    ここで進捗を出すのは、「あと何日で Phase 4 が回せるか」を
+    毎回の実行で確認できるようにするため。
+    """
+    hr("5. 5分足の蓄積状況")
+
+    days: set[date] = set()
+    covered = 0
+    for symbol in symbols:
+        span = store.coverage(symbol.code, "5m")
+        if span is None:
+            continue
+        covered += 1
+        for bar in store.read(symbol.code, "5m"):
+            days.add(bar.timestamp.date())
+
+    if not days:
+        print("  5分足がまだ無い")
+        return
+
+    business_days = len(days)
+    print(f"  期間      : {min(days)} 〜 {max(days)}")
+    print(f"  営業日数  : {business_days}日（{covered}銘柄）")
+    print(f"  必要日数  : {WALKFORWARD_DAYS}日（ウォークフォワード 学習60 + 検証20）")
+
+    if business_days >= WALKFORWARD_DAYS:
+        print("  **Phase 4（ウォークフォワードでのパラメータ確定）を回せる**")
+    else:
+        remaining = WALKFORWARD_DAYS - business_days
+        print(f"  あと {remaining}営業日ぶん足りない（約{remaining / 5:.0f}週）")
+        print()
+        print("  **yfinance の5分足は常に58日ぶんしか返さない。**")
+        print("  BarStore は既存データとマージするので、週1回この取得を回せば")
+        print("  58日の窓を超えて溜まっていく。定期実行を習慣にすること。")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -300,6 +351,8 @@ def main() -> int:
         print()
         print("  NG: 検証できる銘柄がない")
         return 1
+
+    _print_accumulation(store, symbols)
 
     print()
     print("  次: python scripts/backtest_take.py")

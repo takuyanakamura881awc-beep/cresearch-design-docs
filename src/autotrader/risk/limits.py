@@ -28,6 +28,33 @@ DEFAULT_DAILY_BREAKER_PCT = 0.02
 DEFAULT_MAX_WEIGHT_PER_SYMBOL = 0.25
 """1銘柄あたり総資産の上限（#7）。"""
 
+DEFAULT_CONSECUTIVE_LOSS_PCT = -0.05
+"""連続損失ブレーカー（#5）が発動する累積損失。
+
+**「方向」だけでなく「損害」で判定するための閾値。** 他の安全装置から導く:
+
+- 日次上限 -2% の **2.5倍** — 1日ぶんの悪い日が3日続いた程度では止めない
+- 累積DD上限 -15% の **1/3** — DD が発動する手前で先に気づける
+
+【なぜ方向だけでは駄目か — 実測とモンテカルロ】
+
+実データ（39営業日）で発動したのは -0.87% / -0.62% / -0.54%（合計 -2.0%）の
+3日だった。日次ブレーカー1回ぶんの損失に3日かけて到達しただけで、
+「戦略が相場に合っていない」証拠とは言えない。
+
+3連敗が期間中に起きる確率（モンテカルロ）::
+
+    下落日率     39営業日   60営業日
+    55%            98%       100%
+    50%            96%        99%
+    45%            90%        97%
+    40%(good)      81%        93%
+
+**勝っている戦略でも3ヶ月にほぼ確実に発動する。** 再開には人の承認が
+要るので、「完全自動＋キルスイッチ」という運用方針が成立しなくなる。
+ペーパートレードの稼働日数も削られ、サンプルが溜まらない。
+"""
+
 DEFAULT_MAX_CONCURRENT = 5
 """同時保有の上限（#7）。通常枠の株価上限1,000円もここから導かれる。"""
 
@@ -118,20 +145,30 @@ def check_daily_loss(pnl_pct: float, threshold_pct: float = -0.02) -> BreakerSta
 
 
 def check_consecutive_loss(
-    daily_pnls: list[float], threshold_days: int = 3
+    daily_pnls: list[float],
+    threshold_days: int = 3,
+    min_cumulative_loss_pct: float = DEFAULT_CONSECUTIVE_LOSS_PCT,
 ) -> BreakerState:
-    """連続損失日数を判定する（#5）。**復帰には人の明示承認が必要。**
+    """連続損失を判定する（#5）。**復帰には人の明示承認が必要。**
 
     連続して負けているのは戦略が現在の相場に合っていない可能性があり、
     自動再開すると損失を垂れ流す。だから ``auto_resume`` は False。
 
+    **連続日数と損失額の両方を要求する。** 日数だけだと微小な3連敗でも
+    発動し、勝っている戦略でも3ヶ月にほぼ確実に止まる
+    （`DEFAULT_CONSECUTIVE_LOSS_PCT` の docstring に実測とモンテカルロ）。
+    止めるべきなのは「損害が続いているとき」であって
+    「たまたま3日下げたとき」ではない。
+
     Args:
         daily_pnls: 日次損益率の列。**時系列の昇順**（末尾が直近）。
         threshold_days: 何営業日連続で発動するか。
+        min_cumulative_loss_pct: 連敗期間の累積損失がこれ以下なら発動。
+            **負の値**で渡す。
 
     Note:
         **損益ゼロの日は連敗を途切れさせる。** docs/05 の定義が
-        「3営業日連続**マイナス**」であり、ゼロはマイナスではない。
+        「連続**マイナス**」であり、ゼロはマイナスではない。
 
         実務上ゼロになるのは**その日1トレードもしなかった場合**で、
         「戦略が相場に合っていない」という #5 の判定根拠にならない。
@@ -139,17 +176,29 @@ def check_consecutive_loss(
     """
     if threshold_days < 1:
         raise ValueError(f"threshold_days は1以上: {threshold_days}")
+    if min_cumulative_loss_pct >= 0:
+        raise ValueError(
+            f"min_cumulative_loss_pct は負の値: {min_cumulative_loss_pct}"
+        )
     if len(daily_pnls) < threshold_days:
         return OK
 
     recent = daily_pnls[-threshold_days:]
     if any(p >= 0 for p in recent):
         return OK
+
+    cumulative = sum(recent)
+    if cumulative > min_cumulative_loss_pct:
+        # 連敗はしているが損害が小さい。**止めるほどではない。**
+        # 日次(-2%)と累積DD(-15%)が背後に残っているので守りは薄くならない。
+        return OK
+
     return BreakerState(
         tripped=True,
         action=BreakerAction.HALT,
         reason=(
-            f"{threshold_days}営業日連続でマイナス"
+            f"{threshold_days}営業日連続でマイナス、累積 {cumulative:.2%} が "
+            f"上限 {min_cumulative_loss_pct:.2%} に到達"
             f"（{', '.join(f'{p:.2%}' for p in recent)}）"
         ),
         auto_resume=False,
