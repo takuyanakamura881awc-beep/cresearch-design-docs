@@ -12,8 +12,8 @@
 =================  ==========================================================
 注文               約定の仮定
 =================  ==========================================================
-成行               **そのバーの始値 + スリッページ**。不利な側にずらしたうえで
-                   バーのレンジ [安値, 高値] に収める
+成行               **そのバーの始値 + スプレッドの半分**。不利な側にずらす。
+                   **レンジで頭を抑えない**（気配は最高約定値より上でありうる）
 指値               バーのレンジが指値を通過した場合のみ約定
 スリッページ       **呼値から株価ごとに導く**。成行はスプレッドの半分を払い、
                    スプレッドは呼値より狭くなれない（`autotrader.tick`）
@@ -22,7 +22,10 @@
 始値を基準にするのは、**発注した瞬間に実際に出ていた価格がそれだから**。
 「バーの高値で約定する」とすると、発注から5分待ってから最悪値で約定する
 という現実にない遅延をモデル化することになり、保守的というより不正確になる。
-一方、観測された高値を超える価格では約定しえないので、レンジで頭を抑える。
+
+**ただしレンジで頭を抑えてはならない。** 高値・安値は約定値であって気配ではなく、
+成行買いが約定する最良売気配はそれより上でありうる。抑えると
+始値=高値の足でスリッページが消える（実際に踏んだ。`fill_price` 参照）。
 
 **楽観的な約定モデルを使わない。**
 バックテストで勝つ戦略を作るのは簡単だが、それは目的ではない。
@@ -269,16 +272,22 @@ class ReplayBroker(Broker):
 
         建玉を建てるとき・返すときの両方で、
         ``|約定値 - 基準値| × 数量`` を足している。
+
+        **``sum(t.cost_yen for t in trades)`` とは一致しないことがある。**
+        返済が拒否されて残った建玉は、建玉時のコストだけがここに入り、
+        `Trade` にはならないため。差が出たら返済失敗を疑う。
         """
         return self._slippage_paid
 
-    def _record_slippage(self, reference: float, price: float, quantity: int) -> None:
-        """1回の約定で払ったスリッページを積算する。
+    def _record_slippage(self, reference: float, price: float, quantity: int) -> float:
+        """1回の約定で払ったスリッページを積算し、その金額（円）を返す。
 
         **約定が確定してから呼ぶ。** レバレッジ判定で拒否された注文は
         約定していないので、コストも発生しない。
         """
-        self._slippage_paid += Decimal(str(abs(price - reference))) * quantity
+        paid = abs(price - reference) * quantity
+        self._slippage_paid += Decimal(str(paid))
+        return paid
 
     def _average_turnover(self, symbol: str) -> Decimal | None:
         if symbol not in self._turnover_cache:
@@ -288,17 +297,31 @@ class ReplayBroker(Broker):
         return self._turnover_cache[symbol]
 
     def fill_price(self, symbol: str, bar: Bar, side: Side, *, opening: bool) -> float:
-        """成行の約定価格。
+        """成行の約定価格。始値を基準に**不利な側**へスプレッドぶんずらす。
 
-        始値を基準に**不利な側**へスリッページぶんずらし、
-        観測されたレンジ [安値, 高値] で頭を抑える
-        （その日そのバーで実際に付いていない価格では約定しえない）。
+        【バーのレンジで頭を抑えてはならない】
+
+        かつて ``min(始値 × (1 + 率), 高値)`` としていた。
+        「そのバーで付いていない価格では約定しえない」という理屈だったが、
+        **これはスプレッドには当てはまらない。**
+
+        高値・安値は**約定した**価格であって気配ではない。成行買いは
+        最良売気配で約定し、それは最高約定値より上でありうる
+        （最高値が買い気配での約定だった場合など）。
+        極端には**始値=高値の陰線でスリッページがゼロになっていた。**
+
+        実測（2026-08-24）で往復20.2bps しか払っておらず、
+        **設定40bps の半分が消えていた。**規約5「検証できないものは
+        保守的な側に倒す」に反する方向にモデルが甘くなっていた。
+
+        **指値を実装するときはレンジで判定してよい。** あちらは
+        「実際に取引が成立した価格帯を通過したか」の話なので、
+        高値・安値が約定値であることがそのまま根拠になる。
+        ここで問題なのは、それを**スプレッドにまで適用していた**こと。
         """
         rate = self.slippage_bps_for(symbol, bar.open) / 10_000.0
         buying = (side is Side.LONG) == opening
-        if buying:
-            return min(bar.open * (1 + rate), bar.high)
-        return max(bar.open * (1 - rate), bar.low)
+        return bar.open * (1 + rate) if buying else bar.open * (1 - rate)
 
     # ------------------------------------------------------------------
     # Broker インターフェース
@@ -420,8 +443,10 @@ class ReplayBroker(Broker):
         except LeverageViolationError as exc:
             raise OrderRejectedError(str(exc)) from exc
 
-        self._record_slippage(bar.open, price, order.quantity)
+        entry_cost = self._record_slippage(bar.open, price, order.quantity)
         self._positions[order.symbol] = Position(
+            entry_reason=self._reasons.get(order.client_order_id, ""),
+            entry_cost_yen=entry_cost,
             symbol=order.symbol,
             side=order.side,
             quantity=order.quantity,
@@ -445,8 +470,10 @@ class ReplayBroker(Broker):
             )
 
         price = self.fill_price(order.symbol, bar, position.side, opening=False)
-        self._record_slippage(bar.open, price, position.quantity)
+        exit_cost = self._record_slippage(bar.open, price, position.quantity)
         trade = Trade(
+            entry_reason=position.entry_reason,
+            cost_yen=position.entry_cost_yen + exit_cost,
             symbol=order.symbol,
             side=position.side,
             quantity=position.quantity,

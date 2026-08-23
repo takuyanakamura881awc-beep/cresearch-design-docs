@@ -610,6 +610,7 @@ def _open_signals(
                 signal.side,
                 quantity,
                 opening=True,
+                reason=signal.reason,
                 stop_price=signal.stop_price,
             )
         except OrderRejectedError as exc:

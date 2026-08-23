@@ -47,6 +47,7 @@ from autotrader.risk.limits import (
     max_atr_yen,
 )
 from autotrader.risk.sizing import average_turnover_of, max_affordable_price
+from autotrader.strategy.random_baseline import RandomEntry, entry_probability_for
 from autotrader.strategy.take_intraday import TakeIntraday
 from autotrader.tick import half_spread_bps, round_trip_cost_atr, spread_yen
 from autotrader.types import Bar, PriceTier, Symbol, Trade
@@ -60,6 +61,13 @@ from autotrader.universe.selector import (
 
 DATA_ROOT = Path("data")
 CAPITAL = Decimal(500_000)
+
+MIN_BASELINE_SEEDS = 20
+"""ランダムベースラインの最小シード数。
+
+**1〜数本では分布にならない。** 竹が「上位20%に入った」と言うには
+少なくともこれくらい要る。少ないシードでの比較は運と区別できない。
+"""
 
 
 def hr(title: str) -> None:
@@ -182,6 +190,38 @@ def _trade_cost_bps(trade: Trade) -> float:
     return float(spread_yen(trade.entry_price)) / trade.entry_price * 10_000.0
 
 
+def report_by_signal(result: BacktestResult) -> None:
+    """エントリーシグナル別に損益を分解する。
+
+    **竹は orb / orb+vwap / vwap_reversion を混ぜている。**
+    全体が負けていても、片方だけ優位がある可能性は潰しておく。
+
+    見るのは **gross**（コスト前）。net はコストの重い銘柄を多く引いた
+    シグナルが不利に見えるだけで、優位の有無は判定できない。
+    """
+    if not result.trades:
+        return
+    groups: dict[str, list[Trade]] = collections.defaultdict(list)
+    for trade in result.trades:
+        groups[trade.entry_reason or "(不明)"].append(trade)
+
+    print()
+    print("  --- エントリーシグナル別（**見るのは gross**）---")
+    print(
+        f"  {'シグナル':<16} {'件数':>5} {'勝率':>7} {'gross計':>10} "
+        f"{'gross/件':>9} {'cost/件':>8}"
+    )
+    for reason, trades in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        gross = sum(t.gross_pnl for t in trades)
+        cost = sum(t.cost_yen for t in trades)
+        wins = sum(1 for t in trades if t.pnl > 0)
+        print(
+            f"  {reason:<16} {len(trades):>5} {wins / len(trades):>6.1%} "
+            f"{gross:>+9,.0f}円 {gross / len(trades):>+8,.0f}円 "
+            f"{cost / len(trades):>7,.0f}円"
+        )
+
+
 def report(result: BacktestResult, n_days: int, label: str) -> None:
     hr(f"結果（{label}）")
     print(f"  期間            : {n_days}営業日")
@@ -265,6 +305,92 @@ def report(result: BacktestResult, n_days: int, label: str) -> None:
         print("  総リターンを年率換算してはならず、シャープ・最大DDも比較に使えない。")
 
 
+def run_random_baseline(
+    take: BacktestResult,
+    intraday: dict[str, tuple[Bar, ...]],
+    config: BacktestConfig,
+    watchlist: dict[date, frozenset[str]],
+    n_seeds: int,
+    n_days: int,
+) -> None:
+    """エントリーだけをランダムにしたベースラインと比べる。
+
+    **見るのは「竹の gross がランダムの分布のどこに落ちるか」だけ。**
+
+    手仕舞い（1.5×ATR 損切り / 2.5×ATR 利確 / 180分 / 14:50クローズ）は
+    それ自体が損益を生む。エントリーが何もしていなくても数字は動くので、
+    **比較対象なしに「gross ≈ 0 だから優位がない」とは言えない。**
+
+    総額ではなく**1トレードあたり**で比べる。同時保有数の上限などで
+    ランダム側のトレード数は竹と揃わないため。
+    """
+    hr(f"ランダムエントリーとの比較（{n_seeds}シード）")
+    if take.n_trades == 0:
+        print("  竹のトレードが0件。比較できない")
+        return
+
+    n_bars = len({b.timestamp for bars in intraday.values() for b in bars})
+    n_symbols = max((len(v) for v in watchlist.values()), default=1)
+    probability = entry_probability_for(take.n_trades, n_symbols, n_bars)
+    print(
+        f"  エントリー確率 {probability:.5f}"
+        f"（竹の{take.n_trades}トレードに合わせた目安。"
+        f"{n_symbols}銘柄 × {n_bars}バー）"
+    )
+    print("  手仕舞い・同時保有数・レバレッジ・売建可否はすべて竹と同一")
+    print()
+
+    per_trade: list[float] = []
+    totals: list[float] = []
+    counts: list[int] = []
+    for seed in range(n_seeds):
+        outcome = run(
+            RandomEntry(seed=seed, entry_probability=probability),
+            intraday,
+            config,
+            watchlist,
+        )
+        if outcome.n_trades == 0:
+            continue
+        gross = sum(t.gross_pnl for t in outcome.trades)
+        per_trade.append(gross / outcome.n_trades)
+        totals.append(gross)
+        counts.append(outcome.n_trades)
+
+    if len(per_trade) < 2:
+        print("  ランダム側がほとんど約定しなかった。確率の見積もりを疑う")
+        return
+
+    take_gross = sum(t.gross_pnl for t in take.trades)
+    take_per_trade = take_gross / take.n_trades
+    ordered = sorted(per_trade)
+    # **竹がランダムの何割を上回ったか。** これが検定の答え
+    beaten = sum(1 for v in per_trade if take_per_trade > v)
+    pct = beaten / len(per_trade)
+
+    print(f"  {'':16} {'トレード数':>10} {'gross/件':>12}")
+    print(f"  {'竹':16} {take.n_trades:>10} {take_per_trade:>+11,.1f}円")
+    print(
+        f"  {'ランダム 中央値':16} {sum(counts) // len(counts):>10} "
+        f"{ordered[len(ordered) // 2]:>+11,.1f}円"
+    )
+    print(f"  {'ランダム 最低':16} {'':>10} {ordered[0]:>+11,.1f}円")
+    print(f"  {'ランダム 最高':16} {'':>10} {ordered[-1]:>+11,.1f}円")
+    print()
+    print(f"  **竹はランダム{len(per_trade)}本のうち {beaten} 本を上回った（{pct:.0%}）**")
+    print()
+    if pct >= 0.95:
+        print("  → シグナルに優位がある。Phase 4 に進む価値がある")
+    elif pct >= 0.80:
+        print("  → 示唆はあるが決定的ではない。期間を延ばして再検定する")
+    else:
+        print("  → **シグナルはランダムと区別できない。**")
+        print("     パラメータ探索は過学習を拾うだけになる。手法の再検討に戻る")
+    print()
+    print(f"  注意: {n_days}営業日・パラメータ未検証。これは「竹の否定」ではなく")
+    print("        「現パラメータの竹が、この期間で、ランダムと区別できるか」の検定")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -289,6 +415,16 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--random-baseline",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "エントリーだけをランダムにしたベースラインを N シード回し、"
+            "竹の gross がその分布のどこに落ちるかを出す。20〜30 を推奨"
+        ),
+    )
+    parser.add_argument(
         "--max-concurrent",
         type=int,
         default=None,
@@ -301,6 +437,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.max_concurrent is not None and args.max_concurrent < 1:
         parser.error("--max-concurrent は1以上")
+    if args.random_baseline < 0:
+        parser.error("--random-baseline は0以上")
+    if 0 < args.random_baseline < MIN_BASELINE_SEEDS:
+        parser.error(
+            f"--random-baseline は {MIN_BASELINE_SEEDS} 以上にする。"
+            "少ないシードでは分布にならず、1点対1点の比較と変わらない"
+        )
 
     print("竹を実データでバックテストする")
 
@@ -418,6 +561,12 @@ def main() -> int:
 
     result = run(TakeIntraday(), intraday, config, watchlist)
     report(result, len(trading_days), "ブレーカー無効" if args.no_breakers else "通常")
+    report_by_signal(result)
+
+    if args.random_baseline:
+        run_random_baseline(
+            result, intraday, config, watchlist, args.random_baseline, len(trading_days)
+        )
 
     hr("4. この結果の読み方")
     print(f"  総トレード数 {result.n_trades} に対し、合格基準は > 100"

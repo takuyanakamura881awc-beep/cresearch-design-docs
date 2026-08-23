@@ -154,12 +154,36 @@ class TestFillPrice:
             "7203", 2200.0
         ) == 20.0
 
-    def test_バーのレンジを超えては約定しない(self) -> None:
-        """観測された高値を超える価格では実際には約定しえない。"""
+    def test_始値が高値の足でもスリッページを払う(self) -> None:
+        """**レンジで頭を抑えてはならない。** 実際に踏んだ欠陥の回帰テスト。
+
+        かつて ``min(始値 × (1 + 率), 高値)`` としており、
+        始値=高値の陰線ではスリッページが**ゼロ**になっていた。
+        実測で往復20.2bps（設定40bpsの半分）しか払っておらず、
+        規約5に反する方向にモデルが甘くなっていた。
+
+        高値・安値は**約定した**価格であって気配ではない。
+        成行買いが約定する最良売気配は最高約定値より上でありうる。
+        """
+        broker = _broker()
+        # 始値 = 高値（下げただけの足）
+        down_only = _bar("7203", 0, open_=1000.0, high=1000.0, low=990.0)
+        assert broker.fill_price("7203", down_only, Side.LONG, opening=True) > 1000.0
+        # 始値 = 安値（上げただけの足）でも売りはスリッページを払う
+        up_only = _bar("7203", 0, open_=1000.0, high=1010.0, low=1000.0)
+        assert broker.fill_price("7203", up_only, Side.SHORT, opening=True) < 1000.0
+
+    def test_値幅の狭い足でもスリッページが目減りしない(self) -> None:
+        """5分足はレンジが狭いことが多い。**そこで削られると総コストが半減する。**"""
         broker = _broker()
         narrow = _bar("7203", 0, open_=1000.0, high=1000.5, low=999.5)
-        assert broker.fill_price("7203", narrow, Side.LONG, opening=True) == 1000.5
-        assert broker.fill_price("7203", narrow, Side.SHORT, opening=True) == 999.5
+        # 1,000円・呼値1円・2tick なら片道1円。レンジ0.5円に抑えられない
+        assert broker.fill_price("7203", narrow, Side.LONG, opening=True) == pytest.approx(
+            1001.0
+        )
+        assert broker.fill_price("7203", narrow, Side.SHORT, opening=True) == pytest.approx(
+            999.0
+        )
 
     def test_薄い銘柄には厚いスリッページを当てる(self) -> None:
         """流動性下限を下げるぶん、約定モデルは逆に厳しくする。"""

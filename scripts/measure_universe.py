@@ -395,6 +395,14 @@ def report_layer2(
         f"（{eligible / len(candidates):.0%}）"
     )
 
+    pool_costs = sorted(
+        round_trip_cost_atr(c.features.price, c.features.atr_yen) for c in candidates
+    )
+    print(
+        f"  母集団の往復コスト(ATR): 中央値 {pool_costs[len(pool_costs) // 2]:.4f} / "
+        f"最安 {pool_costs[0]:.4f} / 最高 {pool_costs[-1]:.4f}"
+    )
+
     picked = select(candidates, trade_date, selector)
     n_premium = sum(1 for e in picked if e.price_tier is PriceTier.PREMIUM)
     print()
@@ -555,7 +563,12 @@ def sweep_concentration(
         by_code = {sym.code: sym for sym in symbols}
         passed = [by_code[r.symbol] for r in snapshot.passed if r.symbol in by_code]
         tiers = {r.symbol: r.tier for r in snapshot.passed if r.tier is not None}
-        candidates = build_candidates(as_of, passed, bars, tiers, selector)
+        # **翌営業日を売買日とみなす。** as_of をそのまま渡すと
+        # build_candidates が当日を落とし、日足が1本足りず全滅する
+        # （§7 の report_layer2 と揃える）
+        candidates = build_candidates(
+            as_of + timedelta(days=1), passed, bars, tiers, selector
+        )
 
         eligible = [
             c

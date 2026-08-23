@@ -210,6 +210,14 @@ class Position:
     ショート建玉ではこれが None であってはならない
     （docs/05-risk-management.md #3）。
     """
+    entry_reason: str = ""
+    """建玉を作ったシグナル名（``"orb"`` / ``"vwap_reversion"`` など）。
+
+    **竹は複数のシグナルを混ぜている。** どれが効いてどれが効いていないかを
+    分けて測れないと、全体の成績が悪いときに何を直せばよいか分からない。
+    """
+    entry_cost_yen: float = 0.0
+    """建玉時に払ったスリッページ（円）。返済時に合算して `Trade.cost_yen` になる。"""
 
     @property
     def notional(self) -> Decimal:
@@ -272,6 +280,19 @@ class Trade:
     exit_price: float
     exit_reason: str
     """手仕舞いの理由。監査とデバッグのため必須（例: "stop" / "close_all"）。"""
+    entry_reason: str = ""
+    """建玉を作ったシグナル名。シグナル別に損益を分解するのに要る。"""
+    cost_yen: float = 0.0
+    """このトレードで払ったスリッページ（往復・円）。
+
+    **`pnl` は既にこれを引いた後の値。** 二重に引かないこと。
+    コスト前の損益を出すときだけ ``pnl + cost_yen`` を使う。
+    """
+
+    @property
+    def gross_pnl(self) -> float:
+        """コスト**前**の損益（円）。``net = gross - cost`` を解いただけ。"""
+        return self.pnl + self.cost_yen
 
     @property
     def pnl(self) -> float:
