@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import collections
 import logging
+import math
 import sys
 from datetime import date
 from decimal import Decimal
@@ -95,6 +96,13 @@ MIN_BASELINE_SEEDS = 20
 
 **1〜数本では分布にならない。** 竹が「上位20%に入った」と言うには
 少なくともこれくらい要る。少ないシードでの比較は運と区別できない。
+"""
+
+DEFAULT_STRESS_SEEDS = 200
+"""`--stress-test` の既定シード数。解像度0.5%。
+
+多重比較補正後の必要パーセンタイル（99%、`required_percentile` 参照）を
+判定するには最低100シード要る。デフォルトはそれに余裕を持たせてある。
 """
 
 
@@ -397,8 +405,26 @@ def _baseline_probability(
     take: BacktestResult,
     intraday: dict[str, tuple[Bar, ...]],
     watchlist: dict[date, frozenset[str]],
+    days: tuple[date, ...] | None = None,
 ) -> tuple[float, int, int]:
-    n_bars = len({b.timestamp for bars in intraday.values() for b in bars})
+    """竹（または変種）の実測トレード数に合わせるための確率・銘柄数・バー数。
+
+    ``days`` を渡すと、その営業日ぶんのバー数だけで確率を較正する。
+    **期間を分割したストレステストで要る。** 全期間のバー数のまま較正すると
+    確率が薄まりすぎて、窓の中でランダム側がほとんど約定しなくなる。
+    """
+    if days is None:
+        n_bars = len({b.timestamp for bars in intraday.values() for b in bars})
+    else:
+        allowed = set(days)
+        n_bars = len(
+            {
+                b.timestamp
+                for bars in intraday.values()
+                for b in bars
+                if b.timestamp.date() in allowed
+            }
+        )
     n_symbols = max((len(v) for v in watchlist.values()), default=1)
     return entry_probability_for(take.n_trades, n_symbols, n_bars), n_symbols, n_bars
 
@@ -455,6 +481,161 @@ def run_random_baseline(
     print()
     print(f"  注意: {n_days}営業日・パラメータ未検証。これは「竹の否定」ではなく")
     print("        「現パラメータの竹が、この期間で、ランダムと区別できるか」の検定")
+
+
+def required_percentile(n_variants: int) -> float:
+    """多重比較補正（Bonferroni）後に必要なパーセンタイル。
+
+    ``1 − 0.05 / n_variants``。変種数から導出する。**直書きしない** —
+    `EXPERIMENT_VARIANTS` に変種を足せば、ここも自動で厳しくなる。
+
+    Raises:
+        ValueError: 変種数が1未満の場合。
+    """
+    if n_variants < 1:
+        raise ValueError("変種数は1以上である必要がある")
+    return 1.0 - 0.05 / n_variants
+
+
+def required_seeds_for(percentile: float) -> int:
+    """指定パーセンタイルを判定するのに必要な最小シード数。
+
+    n シードの分布で表現できる最高パーセンタイルは ``(n-1)/n``。
+    99% を判定するには最低100シード要る。**測れない閾値で判定しない**ため、
+    シード数が足りなければ呼び出し側でエラーにする。
+
+    Raises:
+        ValueError: パーセンタイルが 0〜1 の範囲外の場合。
+    """
+    if not 0.0 < percentile < 1.0:
+        raise ValueError("パーセンタイルは0〜1の範囲である必要がある")
+    return math.ceil(1.0 / (1.0 - percentile))
+
+
+def _window_watchlist(
+    watchlist: dict[date, frozenset[str]], days: tuple[date, ...]
+) -> dict[date, frozenset[str]]:
+    """指定した営業日だけに絞った監視リスト。
+
+    **バーは切らない。** `run()` は watchlist にない日は1銘柄も建てないので、
+    ここだけを絞れば ATR の助走（過去バー）を保ったまま期間を分割できる。
+    バーそのものを切ると、窓の初日が指標の助走を失って
+    「期間で分けた」のか「指標が変わった」のか分離できなくなる。
+    """
+    allowed = set(days)
+    return {d: v for d, v in watchlist.items() if d in allowed}
+
+
+def run_stress_test(
+    full_result: BacktestResult,
+    strategy_config: TakeIntradayConfig,
+    variant_label: str,
+    intraday: dict[str, tuple[Bar, ...]],
+    config: BacktestConfig,
+    watchlist: dict[date, frozenset[str]],
+    trading_days: tuple[date, ...],
+    n_seeds: int,
+) -> None:
+    """`--experiment` で生き残った1変種を、より厳しい条件で再検定する。
+
+    **新しい変種は探さない。** 対象は呼び出し側（``main``）が
+    ``--disable-breakout`` 等で指定したものを1つだけ受け取る。
+
+    2つの理由で `--experiment` の判定だけでは足りない:
+
+    1. **解像度が粗い。** 20シードの「95%」は「20本中19本を上回った」の意味で、
+       1本負けが増えれば90%になる。95%と80%を区別できない
+    2. **多重比較を補正していない。** `EXPERIMENT_VARIANTS` を複数試した以上、
+       単純な95%ではなく `required_percentile` の閾値が要る
+
+    それに加えて、**前半・後半それぞれでも勝っているか**を見る。
+    全期間で高パーセンタイルでも、前半だけの偏りなら偶然と区別できない。
+    """
+    hr(f"ストレステスト: {variant_label}")
+
+    required_pct = required_percentile(len(EXPERIMENT_VARIANTS))
+    min_seeds = required_seeds_for(required_pct)
+    print(
+        f"  {len(EXPERIMENT_VARIANTS)}変種を試した多重比較補正（Bonferroni）で"
+        f"必要パーセンタイルは {required_pct:.1%}"
+    )
+    print(f"  シード数 {n_seeds}（解像度 {1.0 / n_seeds:.2%} / 必要最小 {min_seeds}）")
+    print()
+
+    half = len(trading_days) // 2
+    windows: tuple[tuple[str, tuple[date, ...], BacktestResult | None], ...] = (
+        ("全期間", trading_days, full_result),
+        ("前半", trading_days[:half], None),
+        ("後半", trading_days[half:], None),
+    )
+
+    print(f"  {'窓':<6} {'営業日':>6} {'件数':>6} {'gross/件':>10} {'順位':>8}")
+    print("  " + "-" * 46)
+
+    verdicts: dict[str, float] = {}
+    engine_logger = logging.getLogger("autotrader.engine.backtest")
+    previous_level = engine_logger.level
+    engine_logger.setLevel(logging.ERROR)
+    try:
+        for label, days, precomputed in windows:
+            # 3窓 × n_seeds 本のバックテストが走る。数分〜十数分かかりうるので、
+            # **無言で止まっているように見えないよう窓ごとに進捗を出す**
+            print(f"  {label} を計算中…", flush=True)
+            window_watchlist = _window_watchlist(watchlist, days)
+            outcome = precomputed or run(
+                TakeIntraday(strategy_config), intraday, config, window_watchlist
+            )
+            if outcome.n_trades == 0:
+                print(f"  {label:<6} {len(days):>6}  —  トレードが出ない")
+                continue
+
+            probability, _, _ = _baseline_probability(
+                outcome, intraday, window_watchlist, days
+            )
+            samples = random_distribution(
+                intraday, config, window_watchlist, n_seeds, probability
+            )
+            if len(samples) < 2:
+                print(f"  {label:<6} {len(days):>6}  —  分布を作れない")
+                continue
+
+            distribution = [v for v, _ in samples]
+            value = _gross_per_trade(outcome)
+            pct = _percentile_of(value, distribution)
+            verdicts[label] = pct
+            print(
+                f"  {label:<6} {len(days):>6} {outcome.n_trades:>6} "
+                f"{value:>+9,.1f}円 {pct:>7.1%}"
+            )
+    finally:
+        engine_logger.setLevel(previous_level)
+
+    print()
+    if len(verdicts) < 3:
+        print("  NG: いずれかの窓でトレードが出ず判定できない")
+        return
+
+    full = verdicts["全期間"]
+    first = verdicts["前半"]
+    second = verdicts["後半"]
+    survives_full = full >= required_pct
+    survives_halves = first > 0.5 and second > 0.5
+    print(
+        f"  全期間 {full:.1%} >= 必要閾値 {required_pct:.1%}: "
+        f"{'○' if survives_full else '×'}"
+    )
+    print(
+        f"  前半 {first:.1%} > 50%: {'○' if first > 0.5 else '×'} / "
+        f"後半 {second:.1%} > 50%: {'○' if second > 0.5 else '×'}"
+    )
+    print()
+    if survives_full and survives_halves:
+        print("  → **仮説は生き残った。** 80営業日たまったら out-of-sample で最終確認する")
+    else:
+        print("  → **棄却。** docs/04 の手法定義に戻る")
+    print()
+    print("  39営業日は依然として in-sample。これは合格を出すための試験ではなく")
+    print("  候補を落とすための試験。生き残っても採用しない。")
 
 
 def run_experiment(
@@ -628,6 +809,25 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--stress-test",
+        action="store_true",
+        help=(
+            "--experiment で生き残った1変種を、多重比較補正した閾値と"
+            "前半/後半の期間分割で再検定する。--disable-breakout 等と"
+            "組み合わせて対象を指定する。新しい変種は探さない"
+        ),
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=DEFAULT_STRESS_SEEDS,
+        metavar="N",
+        help=(
+            f"--stress-test のシード数（既定{DEFAULT_STRESS_SEEDS}）。"
+            "多重比較補正後の閾値を判定できる解像度が要る"
+        ),
+    )
+    parser.add_argument(
         "--max-concurrent",
         type=int,
         default=None,
@@ -647,6 +847,15 @@ def main() -> int:
             f"--random-baseline は {MIN_BASELINE_SEEDS} 以上にする。"
             "少ないシードでは分布にならず、1点対1点の比較と変わらない"
         )
+    if args.stress_test:
+        required_pct = required_percentile(len(EXPERIMENT_VARIANTS))
+        min_seeds = required_seeds_for(required_pct)
+        if args.seeds < min_seeds:
+            parser.error(
+                f"--seeds は {min_seeds} 以上にする"
+                f"（{len(EXPERIMENT_VARIANTS)}変種の多重比較補正で必要な閾値 "
+                f"{required_pct:.1%} を判定するには最低 {min_seeds} シード要る）"
+            )
 
     print("竹を実データでバックテストする")
     print(banner())
@@ -783,7 +992,23 @@ def main() -> int:
     report(result, len(trading_days), "ブレーカー無効" if args.no_breakers else "通常")
     report_by_signal(result)
 
-    if args.experiment:
+    if args.stress_test:
+        variant_label = (
+            f"ブレイク{'切' if args.disable_breakout else '入'}"
+            f" / 反転{'あり' if args.invert_breakout else 'なし'}"
+            f" / VWAP乖離下限{strategy_config.min_deviation_pct:.1%}"
+        )
+        run_stress_test(
+            result,
+            strategy_config,
+            variant_label,
+            intraday,
+            config,
+            watchlist,
+            trading_days,
+            args.seeds,
+        )
+    elif args.experiment:
         run_experiment(result, intraday, config, watchlist, len(trading_days))
     elif args.random_baseline:
         run_random_baseline(
