@@ -170,3 +170,83 @@ class TestEntryProbability:
             RandomEntry(seed=1, entry_probability=0.0)
         with pytest.raises(ValueError, match="エントリー確率"):
             RandomEntry(seed=1, entry_probability=1.5)
+
+class TestDistributionReuse:
+    """`--experiment` はランダム分布を1回だけ計算して全変種に使い回す。
+
+    **その前提が成り立つことをここで固定する。** 成り立たなければ、
+    変種ごとに分布を作り直さないと比較が不正になる。
+    """
+
+    def _run(self, probability: float, seeds: int = 12) -> list[float]:
+        from datetime import date as _date
+        from decimal import Decimal
+
+        from autotrader.engine.backtest import BacktestConfig, run
+
+        # 決定的な価格系列。**乱数はエントリー側だけにする**
+        bars: dict[str, tuple[Bar, ...]] = {}
+        for i in range(8):
+            base = 500.0 + 100.0 * i
+            series = []
+            for k in range(120):
+                p = base * (1.0 + 0.004 * ((k * (i + 3)) % 17 - 8) / 8.0)
+                series.append(
+                    Bar(
+                        symbol=f"S{i}",
+                        timestamp=T0 + timedelta(minutes=5 * k),
+                        open=p,
+                        high=p * 1.006,
+                        low=p * 0.994,
+                        close=p,
+                        volume=50_000,
+                        turnover=2_000_000_000.0,
+                    )
+                )
+            bars[f"S{i}"] = tuple(series)
+
+        days: dict[_date, frozenset[str]] = {
+            b.timestamp.date(): frozenset(bars)
+            for series in bars.values()
+            for b in series
+        }
+        cfg = BacktestConfig(initial_cash=Decimal(500_000), shortable=frozenset(bars))
+
+        values = []
+        for seed in range(seeds):
+            outcome = run(
+                RandomEntry(seed=seed, entry_probability=probability), bars, cfg, days
+            )
+            if outcome.n_trades:
+                values.append(
+                    sum(t.gross_pnl for t in outcome.trades) / outcome.n_trades
+                )
+        return values
+
+    def test_エントリー確率を倍にしても中央値がほぼ動かない(self) -> None:
+        """**1トレードあたりで正規化しているので p に鈍感なはず。**
+
+        鈍感でなければ、変種ごとにトレード数が違う以上、
+        1つの分布を使い回すのは不正になる。
+        """
+        low = sorted(self._run(0.02))
+        high = sorted(self._run(0.04))
+        assert low and high
+
+        low_median = low[len(low) // 2]
+        high_median = high[len(high) // 2]
+        scale = max(abs(low_median), abs(high_median), 1.0)
+        assert abs(low_median - high_median) / scale < 0.5
+
+    def test_確率を上げるとトレードは増える(self) -> None:
+        """鈍感なのは gross/件 であって件数ではない。取り違えないこと。"""
+        from decimal import Decimal
+
+        from autotrader.engine.backtest import BacktestConfig, run
+
+        bars = {"A": _bars("A", n=120)}
+        days = {b.timestamp.date(): frozenset(bars) for b in bars["A"]}
+        cfg = BacktestConfig(initial_cash=Decimal(500_000), shortable=frozenset(bars))
+        sparse = run(RandomEntry(seed=1, entry_probability=0.01), bars, cfg, days)
+        dense = run(RandomEntry(seed=1, entry_probability=1.0), bars, cfg, days)
+        assert dense.n_trades >= sparse.n_trades

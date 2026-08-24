@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import logging
 import sys
 from datetime import date
 from decimal import Decimal
@@ -39,6 +40,7 @@ from autotrader.broker.replay import (
 )
 from autotrader.data.store import BarStore
 from autotrader.engine.backtest import BacktestConfig, BacktestResult, run
+from autotrader.provenance import banner
 from autotrader.report.metrics import TRADING_DAYS_PER_YEAR
 from autotrader.risk.limits import (
     DEFAULT_MAX_CONCURRENT,
@@ -48,7 +50,7 @@ from autotrader.risk.limits import (
 )
 from autotrader.risk.sizing import average_turnover_of, max_affordable_price
 from autotrader.strategy.random_baseline import RandomEntry, entry_probability_for
-from autotrader.strategy.take_intraday import TakeIntraday
+from autotrader.strategy.take_intraday import TakeIntraday, TakeIntradayConfig
 from autotrader.tick import half_spread_bps, round_trip_cost_atr, spread_yen
 from autotrader.types import Bar, PriceTier, Symbol, Trade
 from autotrader.universe.filters import FilterConfig, screen
@@ -61,6 +63,32 @@ from autotrader.universe.selector import (
 
 DATA_ROOT = Path("data")
 CAPITAL = Decimal(500_000)
+
+EXPERIMENT_SEEDS = 20
+"""`--experiment` でランダム分布を作るシード数。"""
+
+DISTRIBUTION_DRIFT_LIMIT = 0.5
+"""ランダム分布をエントリー確率をまたいで使い回してよいずれの上限。
+
+**超えたら使い回さず、変種ごとに作り直す。** 警告を出して不正な比較を
+続けるくらいなら、遅くても正しい比較をする。
+"""
+
+EXPERIMENT_VARIANTS: tuple[tuple[str, TakeIntradayConfig], ...] = (
+    ("竹（現状）", TakeIntradayConfig()),
+    ("ORB 反転", TakeIntradayConfig(invert_breakout=True)),
+    ("VWAP乖離のみ 1.5%", TakeIntradayConfig(enable_breakout=False)),
+    (
+        "VWAP乖離のみ 1.0%",
+        TakeIntradayConfig(enable_breakout=False, min_deviation_pct=0.010),
+    ),
+    (
+        "VWAP乖離のみ 0.7%",
+        TakeIntradayConfig(enable_breakout=False, min_deviation_pct=0.007),
+    ),
+)
+"""検定にかける変種。**閾値を下げるのはサンプルを増やして検定可能にするため**で、
+勝つ値を探しているのではない。勝ち負けはランダム分布との比較でしか判定しない。"""
 
 MIN_BASELINE_SEEDS = 20
 """ランダムベースラインの最小シード数。
@@ -305,6 +333,76 @@ def report(result: BacktestResult, n_days: int, label: str) -> None:
         print("  総リターンを年率換算してはならず、シャープ・最大DDも比較に使えない。")
 
 
+def _gross_per_trade(result: BacktestResult) -> float:
+    """1トレードあたりの gross（円）。**比較はこれで正規化する。**
+
+    総額で比べるとトレード数の差が混ざる。変種ごとにトレード数は揃わない。
+    """
+    if result.n_trades == 0:
+        return 0.0
+    return sum(t.gross_pnl for t in result.trades) / result.n_trades
+
+
+def random_distribution(
+    intraday: dict[str, tuple[Bar, ...]],
+    config: BacktestConfig,
+    watchlist: dict[date, frozenset[str]],
+    n_seeds: int,
+    probability: float,
+) -> list[tuple[float, int]]:
+    """ランダムエントリーの ``(gross/件, トレード数)`` を n_seeds ぶん集める。
+
+    **トレード数も返す。** これがないと、エントリー確率を変えても
+    件数が動いていない（＝確率が効いていない）ことに気づけず、
+    分布の使い回しの妥当性チェックが空回りする。
+
+    **返済拒否の警告を抑える。** 各シードで別々に出るので、
+    20本も回すと本題の結果が埋もれる。本番の1回では抑えない。
+    """
+    engine_logger = logging.getLogger("autotrader.engine.backtest")
+    previous = engine_logger.level
+    engine_logger.setLevel(logging.ERROR)
+    try:
+        values = []
+        for seed in range(n_seeds):
+            outcome = run(
+                RandomEntry(seed=seed, entry_probability=probability),
+                intraday,
+                config,
+                watchlist,
+            )
+            if outcome.n_trades:
+                values.append((_gross_per_trade(outcome), outcome.n_trades))
+        return values
+    finally:
+        engine_logger.setLevel(previous)
+
+
+def _percentile_of(value: float, distribution: list[float]) -> float:
+    """``value`` が分布の何割を上回るか。"""
+    if not distribution:
+        return 0.0
+    return sum(1 for v in distribution if value > v) / len(distribution)
+
+
+def _verdict(pct: float) -> str:
+    if pct >= 0.95:
+        return "仮説が生きている"
+    if pct >= 0.80:
+        return "示唆はあるが決定的でない"
+    return "**棄却**"
+
+
+def _baseline_probability(
+    take: BacktestResult,
+    intraday: dict[str, tuple[Bar, ...]],
+    watchlist: dict[date, frozenset[str]],
+) -> tuple[float, int, int]:
+    n_bars = len({b.timestamp for bars in intraday.values() for b in bars})
+    n_symbols = max((len(v) for v in watchlist.values()), default=1)
+    return entry_probability_for(take.n_trades, n_symbols, n_bars), n_symbols, n_bars
+
+
 def run_random_baseline(
     take: BacktestResult,
     intraday: dict[str, tuple[Bar, ...]],
@@ -320,18 +418,13 @@ def run_random_baseline(
     手仕舞い（1.5×ATR 損切り / 2.5×ATR 利確 / 180分 / 14:50クローズ）は
     それ自体が損益を生む。エントリーが何もしていなくても数字は動くので、
     **比較対象なしに「gross ≈ 0 だから優位がない」とは言えない。**
-
-    総額ではなく**1トレードあたり**で比べる。同時保有数の上限などで
-    ランダム側のトレード数は竹と揃わないため。
     """
     hr(f"ランダムエントリーとの比較（{n_seeds}シード）")
     if take.n_trades == 0:
         print("  竹のトレードが0件。比較できない")
         return
 
-    n_bars = len({b.timestamp for bars in intraday.values() for b in bars})
-    n_symbols = max((len(v) for v in watchlist.values()), default=1)
-    probability = entry_probability_for(take.n_trades, n_symbols, n_bars)
+    probability, n_symbols, n_bars = _baseline_probability(take, intraday, watchlist)
     print(
         f"  エントリー確率 {probability:.5f}"
         f"（竹の{take.n_trades}トレードに合わせた目安。"
@@ -340,55 +433,139 @@ def run_random_baseline(
     print("  手仕舞い・同時保有数・レバレッジ・売建可否はすべて竹と同一")
     print()
 
-    per_trade: list[float] = []
-    totals: list[float] = []
-    counts: list[int] = []
-    for seed in range(n_seeds):
-        outcome = run(
-            RandomEntry(seed=seed, entry_probability=probability),
-            intraday,
-            config,
-            watchlist,
-        )
-        if outcome.n_trades == 0:
-            continue
-        gross = sum(t.gross_pnl for t in outcome.trades)
-        per_trade.append(gross / outcome.n_trades)
-        totals.append(gross)
-        counts.append(outcome.n_trades)
-
-    if len(per_trade) < 2:
+    samples = random_distribution(intraday, config, watchlist, n_seeds, probability)
+    if len(samples) < 2:
         print("  ランダム側がほとんど約定しなかった。確率の見積もりを疑う")
         return
 
-    take_gross = sum(t.gross_pnl for t in take.trades)
-    take_per_trade = take_gross / take.n_trades
+    per_trade = [v for v, _ in samples]
+    take_per_trade = _gross_per_trade(take)
     ordered = sorted(per_trade)
-    # **竹がランダムの何割を上回ったか。** これが検定の答え
-    beaten = sum(1 for v in per_trade if take_per_trade > v)
-    pct = beaten / len(per_trade)
+    pct = _percentile_of(take_per_trade, per_trade)
+    median_count = sorted(n for _, n in samples)[len(samples) // 2]
 
     print(f"  {'':16} {'トレード数':>10} {'gross/件':>12}")
     print(f"  {'竹':16} {take.n_trades:>10} {take_per_trade:>+11,.1f}円")
-    print(
-        f"  {'ランダム 中央値':16} {sum(counts) // len(counts):>10} "
-        f"{ordered[len(ordered) // 2]:>+11,.1f}円"
-    )
+    print(f"  {'ランダム 件数中央値':16} {median_count:>10}")
+    print(f"  {'ランダム 中央値':16} {'':>10} {ordered[len(ordered) // 2]:>+11,.1f}円")
     print(f"  {'ランダム 最低':16} {'':>10} {ordered[0]:>+11,.1f}円")
     print(f"  {'ランダム 最高':16} {'':>10} {ordered[-1]:>+11,.1f}円")
     print()
-    print(f"  **竹はランダム{len(per_trade)}本のうち {beaten} 本を上回った（{pct:.0%}）**")
-    print()
-    if pct >= 0.95:
-        print("  → シグナルに優位がある。Phase 4 に進む価値がある")
-    elif pct >= 0.80:
-        print("  → 示唆はあるが決定的ではない。期間を延ばして再検定する")
-    else:
-        print("  → **シグナルはランダムと区別できない。**")
-        print("     パラメータ探索は過学習を拾うだけになる。手法の再検討に戻る")
+    print(f"  **竹はランダム{len(per_trade)}本の {pct:.0%} を上回った** → {_verdict(pct)}")
     print()
     print(f"  注意: {n_days}営業日・パラメータ未検証。これは「竹の否定」ではなく")
     print("        「現パラメータの竹が、この期間で、ランダムと区別できるか」の検定")
+
+
+def run_experiment(
+    take: BacktestResult,
+    intraday: dict[str, tuple[Bar, ...]],
+    config: BacktestConfig,
+    watchlist: dict[date, frozenset[str]],
+    n_days: int,
+) -> None:
+    """変種をまとめて同じランダム分布に当てる。
+
+    【分布を1回だけ計算する理由】
+
+    変種ごとに20本回すと80バックテストになる。1トレードあたりで
+    正規化しているので、分布はエントリー確率にほとんど依存しない。
+    **依存しないことをここで実際に確かめてから使い回す。**
+    """
+    hr("変種の一括検定（ランダム分布に対するパーセンタイル）")
+    if take.n_trades == 0:
+        print("  竹のトレードが0件。比較できない")
+        return
+
+    probability, n_symbols, n_bars = _baseline_probability(take, intraday, watchlist)
+    reusable = True
+    print(f"  ランダム分布を {EXPERIMENT_SEEDS} シードで作る（p={probability:.5f}）")
+    samples = random_distribution(
+        intraday, config, watchlist, EXPERIMENT_SEEDS, probability
+    )
+    if len(samples) < 2:
+        print("  ランダム側がほとんど約定しなかった。確率の見積もりを疑う")
+        return
+    distribution = [v for v, _ in samples]
+
+    # **使い回してよいかを確かめる。** p を2倍にして中央値が動かないこと
+    doubled = random_distribution(
+        intraday, config, watchlist, EXPERIMENT_SEEDS, min(1.0, probability * 2)
+    )
+    ordered = sorted(distribution)
+    base_median = ordered[len(ordered) // 2]
+    base_count = sorted(n for _, n in samples)[len(samples) // 2]
+    if doubled:
+        other_values = sorted(v for v, _ in doubled)
+        other = other_values[len(other_values) // 2]
+        other_count = sorted(n for _, n in doubled)[len(doubled) // 2]
+        drift = abs(other - base_median)
+        scale = max(abs(base_median), abs(other), 1.0)
+        print(
+            f"  p 倍化の確認: 件数 {base_count} → {other_count} / "
+            f"中央値 {base_median:+.1f}円 → {other:+.1f}円（ずれ {drift / scale:.0%}）"
+        )
+        if other_count == base_count:
+            # **確率を変えても件数が動いていない = 検定になっていない**
+            print("     **件数が動いていない。上限（1銘柄1日1回・同時保有数）で")
+            print("     飽和しており、この確認は成立していない**")
+            reusable = False
+        elif drift / scale > DISTRIBUTION_DRIFT_LIMIT:
+            print("     **分布がエントリー確率に敏感。変種ごとに作り直す**")
+            reusable = False
+
+    print(
+        f"  ランダム: 中央値 {base_median:+.1f}円 / "
+        f"最低 {ordered[0]:+.1f}円 / 最高 {ordered[-1]:+.1f}円"
+    )
+    print()
+    print(f"  {'変種':<26} {'件数':>6} {'gross/件':>10} {'順位':>7}  判定")
+    print("  " + "-" * 70)
+
+    engine_logger = logging.getLogger("autotrader.engine.backtest")
+    previous_level = engine_logger.level
+    engine_logger.setLevel(logging.ERROR)
+    try:
+        for label, cfg in EXPERIMENT_VARIANTS:
+            outcome = run(TakeIntraday(cfg), intraday, config, watchlist)
+            if outcome.n_trades == 0:
+                print(f"  {label:<26} {0:>6}  —  トレードが出ない")
+                continue
+            if reusable:
+                against = distribution
+            else:
+                # **その変種のトレード数に合わせて作り直す。**
+                # 使い回せないと分かっているのに使うのは検定ではない
+                against = [
+                    v
+                    for v, _ in random_distribution(
+                        intraday,
+                        config,
+                        watchlist,
+                        EXPERIMENT_SEEDS,
+                        entry_probability_for(outcome.n_trades, n_symbols, n_bars),
+                    )
+                ]
+                if len(against) < 2:
+                    print(f"  {label:<26} {outcome.n_trades:>6}  —  分布を作れない")
+                    continue
+            value = _gross_per_trade(outcome)
+            pct = _percentile_of(value, against)
+            print(
+                f"  {label:<26} {outcome.n_trades:>6} {value:>+9,.1f}円 "
+                f"{pct:>6.0%}  {_verdict(pct)}"
+            )
+    finally:
+        engine_logger.setLevel(previous_level)
+
+    print()
+    print(f"  **{n_days}営業日は in-sample。ここで勝っても採用しない。**")
+    print(f"  {len(EXPERIMENT_VARIANTS)}変種を試している以上、偶然95%を超えるものが")
+    print(
+        f"  出る確率は約{1 - 0.95 ** len(EXPERIMENT_VARIANTS):.0%}。"
+        "勝った変種は**仮説として記録するだけ**で、"
+    )
+    print("  確認は5分足が80営業日たまってから out-of-sample で行う。")
 
 
 def main() -> int:
@@ -413,6 +590,32 @@ def main() -> int:
             "スコアのボラティリティ項を ATR円 から ATR%% に戻す（差し替え前の挙動）。"
             "選定がコストを見るようになったかの A/B に使う"
         ),
+    )
+    parser.add_argument(
+        "--experiment",
+        action="store_true",
+        help=(
+            "竹と複数の変種（ORB反転・VWAP乖離のみ）を、"
+            "**すべて同じランダム分布に対するパーセンタイル**で並べる。"
+            "39営業日は in-sample なので、勝っても採用せず仮説として記録する"
+        ),
+    )
+    parser.add_argument(
+        "--invert-breakout",
+        action="store_true",
+        help="シグナルA の方向を反転する（上抜けで売り）。**仮説検定用**",
+    )
+    parser.add_argument(
+        "--disable-breakout",
+        action="store_true",
+        help="シグナルA を切って VWAP乖離だけにする",
+    )
+    parser.add_argument(
+        "--min-deviation-pct",
+        type=float,
+        default=None,
+        metavar="P",
+        help="VWAP乖離の下限（既定0.015）。下げるとサンプルが増える",
     )
     parser.add_argument(
         "--random-baseline",
@@ -446,6 +649,7 @@ def main() -> int:
         )
 
     print("竹を実データでバックテストする")
+    print(banner())
 
     hr("1. データの読み込み")
     symbols = load_symbols()
@@ -559,11 +763,29 @@ def main() -> int:
     if args.no_breakers:
         print("  → この成績を採用してはならない。寄与の測定にのみ使う")
 
-    result = run(TakeIntraday(), intraday, config, watchlist)
+    strategy_config = TakeIntradayConfig(
+        enable_breakout=not args.disable_breakout,
+        invert_breakout=args.invert_breakout,
+        **(
+            {"min_deviation_pct": args.min_deviation_pct}
+            if args.min_deviation_pct is not None
+            else {}
+        ),
+    )
+    if args.disable_breakout or args.invert_breakout or args.min_deviation_pct:
+        print(
+            f"  **変種**: ブレイク {'切' if args.disable_breakout else '入'}"
+            f" / 反転 {'あり' if args.invert_breakout else 'なし'}"
+            f" / VWAP乖離下限 {strategy_config.min_deviation_pct:.1%}"
+        )
+
+    result = run(TakeIntraday(strategy_config), intraday, config, watchlist)
     report(result, len(trading_days), "ブレーカー無効" if args.no_breakers else "通常")
     report_by_signal(result)
 
-    if args.random_baseline:
+    if args.experiment:
+        run_experiment(result, intraday, config, watchlist, len(trading_days))
+    elif args.random_baseline:
         run_random_baseline(
             result, intraday, config, watchlist, args.random_baseline, len(trading_days)
         )

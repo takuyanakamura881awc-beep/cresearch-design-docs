@@ -34,6 +34,7 @@ from decimal import Decimal
 from autotrader.config import load_credentials, mask
 from autotrader.data.base import DataSourceError, RateLimitError
 from autotrader.data.jquants import JQuantsDataSource
+from autotrader.provenance import banner
 from autotrader.risk.limits import (
     DEFAULT_DAILY_BREAKER_PCT,
     DEFAULT_STOP_ATR_MULT,
@@ -614,6 +615,7 @@ def sweep_concentration(
 
 def main() -> int:
     print("Layer 1 の通過銘柄数を実測する")
+    print(banner())
     print(f"実行日: {date.today()}")
 
     try:

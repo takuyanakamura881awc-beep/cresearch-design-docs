@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import math
 
+from autotrader.provenance import banner
 from autotrader.tick import round_trip_cost_atr, spread_yen
 
 # --- 戦略とコストの定数（実装から転記。変えたらここも変える） ---
@@ -94,6 +95,7 @@ CAPITAL = 500_000.0
 def main() -> None:
     print("=" * 68)
     print("竹の期待パフォーマンス — 実測からの分析")
+    print(banner())
     print("=" * 68)
 
     print()

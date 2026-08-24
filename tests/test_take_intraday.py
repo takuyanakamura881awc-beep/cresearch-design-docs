@@ -165,6 +165,41 @@ class TestBreakout:
         )
         assert signals[0].side is Side.SHORT
 
+    def test_反転スイッチで向きだけが逆になる(self) -> None:
+        """**仮説検定用のスイッチ。** 発火条件は変えず向きだけ反転する。
+
+        条件も変えてしまうと「順張りが悪いのか条件が悪いのか」が分離できない。
+        """
+        inverted = TakeIntradayConfig(invert_breakout=True)
+        up = TakeIntraday(inverted).generate(
+            datetime(2026, 6, 1, 9, 45), {"7203": self._bars(1020.0)}, ()
+        )
+        down = TakeIntraday(inverted).generate(
+            datetime(2026, 6, 1, 9, 45), {"7203": self._bars(980.0)}, ()
+        )
+        # 上抜けで売り / 下抜けで買い
+        assert up[0].side is Side.SHORT
+        assert down[0].side is Side.LONG
+        # **発火する場面は変わらない**
+        assert up[0].reason == down[0].reason == "orb"
+
+    def test_反転しても発火しない場面は同じ(self) -> None:
+        inverted = TakeIntradayConfig(invert_breakout=True)
+        assert (
+            TakeIntraday(inverted).generate(
+                datetime(2026, 6, 1, 9, 45), {"7203": self._bars(1000.0)}, ()
+            )
+            == ()
+        )
+
+    def test_ブレイクを切るとorbが1件も出ない(self) -> None:
+        """VWAP乖離だけを分離して測るためのスイッチ。"""
+        disabled = TakeIntradayConfig(enable_breakout=False)
+        signals = TakeIntraday(disabled).generate(
+            datetime(2026, 6, 1, 9, 45), {"7203": self._bars(1020.0)}, ()
+        )
+        assert all("orb" not in s.reason for s in signals)
+
     def test_レンジ内では発火しない(self) -> None:
         assert (
             TakeIntraday().generate(

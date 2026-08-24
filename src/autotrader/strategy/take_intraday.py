@@ -81,6 +81,26 @@ class TakeIntradayConfig:
     """
     allow_short: bool = True
     skip_on_conflicting_signals: bool = True
+    enable_breakout: bool = True
+    """シグナルA（オープニングレンジブレイク）を使うか。
+
+    **False にすると VWAP乖離だけになる。** 実測（2026-08-24 / 39営業日）で
+    ORB は538件・gross -10円/件、VWAP乖離は17件・gross +250円/件だった。
+    **順張りが負けて逆張りが勝っている可能性**を分離して測るためのスイッチ。
+    """
+    invert_breakout: bool = False
+    """シグナルA の方向を反転するか（上抜けで売り／下抜けで買い）。
+
+    **これは仮説検定用のスイッチであって、パラメータではない。**
+    ランダム検定で竹が35パーセンタイル（中央値以下）だったとき、
+    負けの本体が ORB だったことから立てた「この期間この銘柄群では
+    順張りが効かない」という仮説を試すためだけにある。
+
+    **out-of-sample の確認なしに True を既定にしてはならない。**
+    39営業日は in-sample で、複数の変種を試せばどれかは偶然勝つ
+    （4変種なら偶然95%を超えるものが出る確率は約19%）。
+    """
+
     stop_loss_atr_mult: float = DEFAULT_STOP_ATR_MULT
     take_profit_atr_mult: float = DEFAULT_TAKE_PROFIT_ATR_MULT
     atr_period: int = DEFAULT_ATR_PERIOD
@@ -262,7 +282,7 @@ class TakeIntraday(Strategy):
         if last.close <= 0:
             return None
 
-        breakout = self._breakout(series, now, last)
+        breakout = self._breakout(series, now, last) if cfg.enable_breakout else None
         reversion = self._reversion(series, now, last)
 
         conflicting = (
@@ -308,10 +328,16 @@ class TakeIntraday(Strategy):
             return None
         buffer = cfg.breakout_buffer_bps / 10_000.0
         if last.close > rng.high * (1 + buffer):
-            return Side.LONG
-        if last.close < rng.low * (1 - buffer):
-            return Side.SHORT
-        return None
+            side = Side.LONG
+        elif last.close < rng.low * (1 - buffer):
+            side = Side.SHORT
+        else:
+            return None
+        if cfg.invert_breakout:
+            # **発火条件は変えず、向きだけを反転する。**
+            # 条件も変えると「順張りが悪いのか条件が悪いのか」が分離できない
+            return Side.SHORT if side is Side.LONG else Side.LONG
+        return side
 
     def _reversion(
         self, series: tuple[Bar, ...], now: datetime, last: Bar
