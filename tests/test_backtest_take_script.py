@@ -226,3 +226,62 @@ class TestBaselineProbabilityWindowed:
         # 窓を絞ればバー数は必ず減り、その分だけ確率は上がる
         assert n_bars_windowed < n_bars_full
         assert p_windowed >= p_full
+
+
+class TestGroupByRegime:
+    """`--by-regime` が使う、トレードを calm/wild に振り分けるロジック。
+
+    **印字関数（`run_by_regime`）自体は直接テストしない。** このファイルの
+    他のテストと同じく、印字の元になる純粋なロジックだけを確認する。
+    """
+
+    def test_calmとwildに振り分けられる(self, bt: ModuleType) -> None:
+        # 前半10日は穏やか（値幅2%）、後半10日は荒れ（値幅10%）にする
+        calm_bars = _series("CALM", 1000.0, n_days=20)
+        wild_bars = _series("WILD", 1000.0, n_days=20)
+        bars = {"CALM": calm_bars, "WILD": wild_bars}
+
+        all_days = tuple(sorted({b.timestamp.date() for b in calm_bars}))
+        watchlist = {d: frozenset({"CALM", "WILD"}) for d in all_days}
+        cfg = BacktestConfig(
+            initial_cash=Decimal(500_000), shortable=frozenset({"CALM", "WILD"})
+        )
+        result = run(TakeIntraday(), bars, cfg, watchlist)
+        assert result.n_trades > 0
+
+        groups = bt._group_by_regime(result.trades, bars)
+
+        # calm と wild の両方のキーが必ず存在する（0件でも空リストで）
+        assert set(groups) == {"calm", "wild"}
+        # 振り分けた総数はトレード総数を超えない（分類できなかった日は捨てる）
+        assert len(groups["calm"]) + len(groups["wild"]) <= result.n_trades
+
+    def test_同じ日を二度分類しない(
+        self, bt: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`classify_days` の呼び出し回数がトレード件数ではなく日数ぶんになること。"""
+        bars = {"A": _series("A", 1000.0, n_days=5)}
+        all_days = tuple(sorted({b.timestamp.date() for b in bars["A"]}))
+        watchlist = {d: frozenset({"A"}) for d in all_days}
+        cfg = BacktestConfig(initial_cash=Decimal(500_000), shortable=frozenset({"A"}))
+        result = run(TakeIntraday(), bars, cfg, watchlist)
+        assert result.n_trades > 0
+
+        call_count = 0
+        original = bt.classify_days
+
+        def counting_classify_days(*args: object, **kwargs: object) -> dict[str, str]:
+            nonlocal call_count
+            call_count += 1
+            return original(*args, **kwargs)  # type: ignore[no-any-return]
+
+        monkeypatch.setattr(bt, "classify_days", counting_classify_days)
+        bt._group_by_regime(result.trades, bars)
+
+        unique_days = {t.entry_time.date() for t in result.trades}
+        assert call_count == len(unique_days)
+
+    def test_トレードがなければ両方空(self, bt: ModuleType) -> None:
+        groups = bt._group_by_regime((), {})
+        assert groups == {"calm": [], "wild": []}
+

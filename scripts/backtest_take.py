@@ -42,6 +42,7 @@ from autotrader.broker.replay import (
 from autotrader.data.store import BarStore
 from autotrader.engine.backtest import BacktestConfig, BacktestResult, run
 from autotrader.provenance import banner
+from autotrader.regime import classify_days
 from autotrader.report.metrics import TRADING_DAYS_PER_YEAR
 from autotrader.risk.limits import (
     DEFAULT_MAX_CONCURRENT,
@@ -103,6 +104,14 @@ DEFAULT_STRESS_SEEDS = 200
 
 多重比較補正後の必要パーセンタイル（99%、`required_percentile` 参照）を
 判定するには最低100シード要る。デフォルトはそれに余裕を持たせてある。
+"""
+
+MIN_REGIME_TRADES = 10
+"""`--by-regime` で1グループ（calm/wild）あたり必要な最低トレード数。
+
+**これ未満なら判定不能とする。** 件数が少ないと数件のノイズで
+gross/件の平均が大きく動き、「calm/wildで差がある」という結論が
+実は数件の偶然だった、ということになりかねない。
 """
 
 
@@ -526,6 +535,84 @@ def _window_watchlist(
     return {d: v for d, v in watchlist.items() if d in allowed}
 
 
+def _group_by_regime(
+    trades: tuple[Trade, ...], intraday: dict[str, tuple[Bar, ...]]
+) -> dict[str, list[Trade]]:
+    """トレードを、そのエントリー日の calm/wild ラベルで振り分ける。
+
+    **日ごとに1回だけ分類する。** 同じ日に複数トレードがあっても
+    `classify_days` をトレードの数だけ呼び直さない。
+    """
+    labels_by_day: dict[date, dict[str, str]] = {}
+    groups: dict[str, list[Trade]] = {"calm": [], "wild": []}
+    for trade in trades:
+        day = trade.entry_time.date()
+        if day not in labels_by_day:
+            labels_by_day[day] = classify_days(intraday, day)
+        label = labels_by_day[day].get(trade.symbol)
+        if label is not None:
+            groups[label].append(trade)
+    return groups
+
+
+def run_by_regime(
+    result: BacktestResult,
+    intraday: dict[str, tuple[Bar, ...]],
+    config: BacktestConfig,
+    watchlist: dict[date, frozenset[str]],
+    n_seeds: int,
+) -> None:
+    """成績を、日次の値動きの荒さ（calm/wild）で事後的に分けて見る。
+
+    **これは診断であって、実戦のフィルタではない。** `regime.classify_days`
+    はその日の高値・安値を使うため、取引前には計算できない
+    （`src/autotrader/regime.py` の docstring 参照）。
+
+    「相場の局面に応じて手法を選ぶべき」というユーザー提案への回答として、
+    10年分の外部データや複雑な局面判定システムを作る前に、**手元のデータ
+    だけで筋の通った理由がありそうかを先に診断する**という位置づけ
+    （`docs/00-overview.md` 意思決定ログ47）。
+
+    見るのは、calm日のトレードと wild日のトレードそれぞれの gross/件が、
+    **同じランダム分布**に対してどのパーセンタイルに位置するか。
+    新しい統計手法は作らず、`--stress-test` と同じ
+    `random_distribution` / `_percentile_of` をそのまま使う。
+    """
+    hr("日次の値動きの荒さで事後的に分ける（診断・実戦フィルタではない）")
+    if result.n_trades == 0:
+        print("  トレードが0件。診断できない")
+        return
+
+    probability, _, _ = _baseline_probability(result, intraday, watchlist)
+    samples = random_distribution(intraday, config, watchlist, n_seeds, probability)
+    if len(samples) < 2:
+        print("  ランダム側がほとんど約定しなかった。確率の見積もりを疑う")
+        return
+    distribution = [v for v, _ in samples]
+
+    groups = _group_by_regime(result.trades, intraday)
+
+    print(f"  {'区分':<6} {'件数':>6} {'gross/件':>10} {'順位':>8}")
+    print("  " + "-" * 36)
+    for label in ("calm", "wild"):
+        trades = groups[label]
+        if len(trades) < MIN_REGIME_TRADES:
+            print(
+                f"  {label:<6} {len(trades):>6}  —  "
+                f"判定不能（件数不足。最低{MIN_REGIME_TRADES}件）"
+            )
+            continue
+        gross = sum(t.gross_pnl for t in trades) / len(trades)
+        pct = _percentile_of(gross, distribution)
+        print(f"  {label:<6} {len(trades):>6} {gross:>+9,.1f}円 {pct:>7.1%}")
+
+    print()
+    print("  **これは事後診断。** その日の高値・安値で分類しているため、")
+    print("  取引前には使えない。calm/wildで順位がはっきり違えば、")
+    print("  前日までの情報で予測する先読み版フィルタの設計に進む価値がある。")
+    print("  違わなければ、この切り口には手がかりがない。")
+
+
 def run_stress_test(
     full_result: BacktestResult,
     strategy_config: TakeIntradayConfig,
@@ -818,13 +905,22 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--by-regime",
+        action="store_true",
+        help=(
+            "成績を日次の値動きの荒さ（calm/wild）で事後的に分けて見る。"
+            "**診断であって実戦のフィルタではない。** --disable-breakout 等と"
+            "組み合わせて対象を指定する"
+        ),
+    )
+    parser.add_argument(
         "--seeds",
         type=int,
         default=DEFAULT_STRESS_SEEDS,
         metavar="N",
         help=(
-            f"--stress-test のシード数（既定{DEFAULT_STRESS_SEEDS}）。"
-            "多重比較補正後の閾値を判定できる解像度が要る"
+            f"--stress-test / --by-regime のシード数（既定{DEFAULT_STRESS_SEEDS}）。"
+            "--stress-test は多重比較補正後の閾値を判定できる解像度が要る"
         ),
     )
     parser.add_argument(
@@ -1008,6 +1104,8 @@ def main() -> int:
             trading_days,
             args.seeds,
         )
+    elif args.by_regime:
+        run_by_regime(result, intraday, config, watchlist, args.seeds)
     elif args.experiment:
         run_experiment(result, intraday, config, watchlist, len(trading_days))
     elif args.random_baseline:
