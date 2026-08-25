@@ -75,7 +75,7 @@ from autotrader.types import Bar
 
 RegimeLabel = Literal["calm", "wild"]
 
-__all__ = ["RegimeLabel", "classify_days", "daily_range_pct"]
+__all__ = ["RegimeLabel", "classify_days", "daily_range_pct", "market_range_by_day"]
 
 
 def daily_range_pct(bars: tuple[Bar, ...]) -> float | None:
@@ -101,15 +101,44 @@ def daily_range_pct(bars: tuple[Bar, ...]) -> float | None:
     return (high - low) / close
 
 
+def market_range_by_day(
+    bars_by_symbol: dict[str, tuple[Bar, ...]], days: tuple[date, ...]
+) -> dict[date, float]:
+    """指定した営業日群それぞれについて、市場全体の荒さを1つの値にする。
+
+    各日の値は、その日値動きを観測できた全銘柄の ``daily_range_pct``
+    の中央値（＝その日1つぶんの「市場全体の荒さ」）。
+
+    Args:
+        bars_by_symbol: 銘柄コード → バー列（複数日ぶんでよい。
+            この関数が対象日に該当する分だけを取り出す）。
+        days: 集計する営業日群。
+
+    Returns:
+        営業日 → 市場全体の荒さ。値動きを観測できた銘柄が
+        1つもない日は含まない。
+    """
+    result: dict[date, float] = {}
+    for day in days:
+        symbol_ranges: list[float] = []
+        for series in bars_by_symbol.values():
+            today = tuple(b for b in series if b.timestamp.date() == day)
+            value = daily_range_pct(today)
+            if value is not None:
+                symbol_ranges.append(value)
+        if symbol_ranges:
+            result[day] = statistics.median(symbol_ranges)
+    return result
+
+
 def classify_days(
     bars_by_symbol: dict[str, tuple[Bar, ...]], days: tuple[date, ...]
 ) -> dict[date, RegimeLabel]:
     """指定した営業日群それぞれについて、市場全体が calm/wild かを判定する。
 
-    **銘柄ごとではなく、日ごとに1つのラベルを付ける。** 各日の値は、
-    その日値動きを観測できた全銘柄の ``daily_range_pct`` の中央値
-    （＝その日1つぶんの「市場全体の荒さ」）。そのうえで、**日をまたいだ
-    中央値**を境界に calm/wild を二分する。
+    **銘柄ごとではなく、日ごとに1つのラベルを付ける。** ``market_range_by_day``
+    が出す「その日1つぶんの市場全体の荒さ」を、**日をまたいだ中央値**を
+    境界に calm/wild へ二分する。
 
     銘柄単位で分類すると、VWAP乖離のようなエントリー条件（その日その
     銘柄が仲間より大きく動いたか）とほぼ同じものを測ってしまい、
@@ -130,22 +159,9 @@ def classify_days(
         **事後診断専用。** 当日の高値・安値を使うため、取引前には
         計算できない（`daily_range_pct` の docstring 参照）。
     """
-    market_range_by_day: dict[date, float] = {}
-    for day in days:
-        symbol_ranges: list[float] = []
-        for series in bars_by_symbol.values():
-            today = tuple(b for b in series if b.timestamp.date() == day)
-            value = daily_range_pct(today)
-            if value is not None:
-                symbol_ranges.append(value)
-        if symbol_ranges:
-            market_range_by_day[day] = statistics.median(symbol_ranges)
-
-    if not market_range_by_day:
+    ranges = market_range_by_day(bars_by_symbol, days)
+    if not ranges:
         return {}
 
-    threshold = statistics.median(market_range_by_day.values())
-    return {
-        day: "wild" if value >= threshold else "calm"
-        for day, value in market_range_by_day.items()
-    }
+    threshold = statistics.median(ranges.values())
+    return {day: "wild" if value >= threshold else "calm" for day, value in ranges.items()}

@@ -42,7 +42,7 @@ from autotrader.broker.replay import (
 from autotrader.data.store import BarStore
 from autotrader.engine.backtest import BacktestConfig, BacktestResult, run
 from autotrader.provenance import banner
-from autotrader.regime import classify_days
+from autotrader.regime import RegimeLabel, classify_days
 from autotrader.report.metrics import TRADING_DAYS_PER_YEAR
 from autotrader.risk.limits import (
     DEFAULT_MAX_CONCURRENT,
@@ -554,6 +554,49 @@ def _group_by_regime(
     return groups
 
 
+def _regime_persistence(
+    labels_by_day: dict[date, RegimeLabel], trading_days: tuple[date, ...]
+) -> tuple[float | None, float | None, int, int]:
+    """前日のラベルから当日のラベルを予測できるかを、条件付き確率で見る。
+
+    先読み版フィルタ（前日までの情報で今日を予測する）は「市場の荒さは
+    日をまたいで持続する」という前提の上に成り立つ。この前提自体を
+    検証せずにフィルタを設計しても、持続しなければ手がかりにならない。
+
+    **`trading_days` の並び順で「前日」を決める。** 暦日ではなく、
+    その間にラベルのない日（値動きを観測できなかった日）を挟む場合は、
+    それを「連続」として扱わずペアから除く。
+
+    Returns:
+        ``(前日wild→当日wildの確率, 前日calm→当日wildの確率,
+        前日wildだった日数, 前日calmだった日数)``。
+        母数が0件の側は確率を ``None`` にする（0除算を避ける）。
+    """
+    wild_after_wild = 0
+    wild_after_calm = 0
+    n_prev_wild = 0
+    n_prev_calm = 0
+    # trading_days と1つずらした trading_days[1:] は長さが1違うのが意図
+    # （隣接ペアを作るため）なので strict=False
+    for prev_day, day in zip(trading_days, trading_days[1:], strict=False):
+        prev_label = labels_by_day.get(prev_day)
+        label = labels_by_day.get(day)
+        if prev_label is None or label is None:
+            continue
+        if prev_label == "wild":
+            n_prev_wild += 1
+            if label == "wild":
+                wild_after_wild += 1
+        else:
+            n_prev_calm += 1
+            if label == "wild":
+                wild_after_calm += 1
+
+    p_wild_after_wild = wild_after_wild / n_prev_wild if n_prev_wild > 0 else None
+    p_wild_after_calm = wild_after_calm / n_prev_calm if n_prev_calm > 0 else None
+    return p_wild_after_wild, p_wild_after_calm, n_prev_wild, n_prev_calm
+
+
 def run_by_regime(
     result: BacktestResult,
     intraday: dict[str, tuple[Bar, ...]],
@@ -616,6 +659,20 @@ def run_by_regime(
     print("  取引前には使えない。calm/wildで順位がはっきり違えば、")
     print("  前日までの情報で予測する先読み版フィルタの設計に進む価値がある。")
     print("  違わなければ、この切り口には手がかりがない。")
+
+    labels_by_day = classify_days(intraday, trading_days)
+    p_ww, p_wc, n_prev_wild, n_prev_calm = _regime_persistence(labels_by_day, trading_days)
+    print()
+    if p_ww is None or p_wc is None:
+        print("  持続性: 前日wild/calmのどちらかが0件で算出できない")
+    else:
+        print(
+            f"  持続性: 前日wild→当日wild {p_ww:.1%}（n={n_prev_wild}）/ "
+            f"前日calm→当日wild {p_wc:.1%}（n={n_prev_calm}）"
+        )
+        print("  はっきり違えば先読み版フィルタに進む価値がある。大差なければ、")
+        print("  「市場全体の荒さで成績が分かれる」こと自体は事実として記録に")
+        print("  残すが、前日情報からの予測はできないのでここで打ち止め。")
 
 
 def run_stress_test(

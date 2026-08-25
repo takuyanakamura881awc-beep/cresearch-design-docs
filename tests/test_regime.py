@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from autotrader.regime import classify_days, daily_range_pct
+from autotrader.regime import classify_days, daily_range_pct, market_range_by_day
 from autotrader.types import Bar
 
 DAY = date(2026, 6, 1)
@@ -59,6 +59,31 @@ class TestDailyRangePct:
 
 
 THIRD_DAY = date(2026, 6, 3)
+
+
+class TestMarketRangeByDay:
+    def test_日ごとに全銘柄のdaily_range_pctの中央値になる(self) -> None:
+        bars_by_symbol: dict[str, tuple[Bar, ...]] = {
+            "A": (_bar("A", DAY, 0, high=1010.0, low=990.0, close=1000.0),),  # 2.0%
+            "B": (_bar("B", DAY, 0, high=1020.0, low=980.0, close=1000.0),),  # 4.0%
+            "C": (_bar("C", DAY, 0, high=1030.0, low=970.0, close=1000.0),),  # 6.0%
+        }
+        result = market_range_by_day(bars_by_symbol, (DAY,))
+        assert result[DAY] == pytest.approx(0.04)
+
+    def test_対象日リスト外の日は含まれない(self) -> None:
+        bars_by_symbol: dict[str, tuple[Bar, ...]] = {
+            "A": (_bar("A", DAY, 0, high=1010.0, low=990.0, close=1000.0),),
+            "B": (_bar("B", OTHER_DAY, 0, high=1020.0, low=980.0, close=1000.0),),
+        }
+        result = market_range_by_day(bars_by_symbol, (DAY,))
+        assert set(result) == {DAY}
+
+    def test_値動きを観測できる銘柄が1つもない日は含まれない(self) -> None:
+        bars_by_symbol: dict[str, tuple[Bar, ...]] = {
+            "A": (_bar("A", OTHER_DAY, 0, high=10.0, low=5.0, close=8.0),)
+        }
+        assert market_range_by_day(bars_by_symbol, (DAY,)) == {}
 
 
 class TestClassifyDays:

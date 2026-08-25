@@ -328,3 +328,59 @@ class TestGroupByRegime:
         groups = bt._group_by_regime((), {}, ())
         assert groups == {"calm": [], "wild": []}
 
+
+class TestRegimePersistence:
+    """先読み版フィルタに進む前提（市場の荒さが日をまたいで持続するか）の診断。
+
+    フィルタを設計する前に、この前提自体が成り立つかを安く確認する
+    （`_regime_persistence` は `classify_days` の出力だけで完結し、
+    新しいデータもロジックも要らない）。
+    """
+
+    def test_完全に持続する列でP_wild_after_wildが1になる(self, bt: ModuleType) -> None:
+        days = tuple(date(2026, 6, 1) + timedelta(days=i) for i in range(5))
+        labels_by_day = {d: "wild" for d in days}
+
+        p_ww, p_wc, n_prev_wild, n_prev_calm = bt._regime_persistence(labels_by_day, days)
+
+        assert p_ww == pytest.approx(1.0)
+        assert p_wc is None
+        assert n_prev_wild == 4
+        assert n_prev_calm == 0
+
+    def test_完全に交互する列でP_wild_after_wildが0になる(self, bt: ModuleType) -> None:
+        days = tuple(date(2026, 6, 1) + timedelta(days=i) for i in range(6))
+        labels_by_day = {d: ("wild" if i % 2 == 0 else "calm") for i, d in enumerate(days)}
+
+        p_ww, p_wc, n_prev_wild, n_prev_calm = bt._regime_persistence(labels_by_day, days)
+
+        # wild の翌日は必ず calm、calm の翌日は必ず wild になる列
+        assert p_ww == pytest.approx(0.0)
+        assert p_wc == pytest.approx(1.0)
+        assert n_prev_wild == 3
+        assert n_prev_calm == 2
+
+    def test_ラベルのない日を挟むと連続として扱わない(self, bt: ModuleType) -> None:
+        d1, d2, d3, d4 = (date(2026, 6, 1) + timedelta(days=i) for i in range(4))
+        # d2 は値動きを観測できなかった日（classify_days の出力に含まれない）
+        labels_by_day = {d1: "wild", d3: "calm", d4: "wild"}
+
+        p_ww, p_wc, n_prev_wild, n_prev_calm = bt._regime_persistence(
+            labels_by_day, (d1, d2, d3, d4)
+        )
+
+        # d1(wild) と d3(calm) を「連続」として橋渡ししていれば n_prev_wild が
+        # 1件増えるはず。実際に数えられるのは (d3, d4) の1ペアだけ
+        assert n_prev_wild == 0
+        assert n_prev_calm == 1
+        assert p_wc == pytest.approx(1.0)
+
+    def test_母数がなければNoneを返す(self, bt: ModuleType) -> None:
+        d1 = date(2026, 6, 1)
+        p_ww, p_wc, n_prev_wild, n_prev_calm = bt._regime_persistence({d1: "wild"}, (d1,))
+
+        assert p_ww is None
+        assert p_wc is None
+        assert n_prev_wild == 0
+        assert n_prev_calm == 0
+
