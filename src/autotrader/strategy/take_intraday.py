@@ -115,6 +115,19 @@ class TakeIntradayConfig:
     シグナルAが再発火して入り直す往復が起き、**1日28.6トレード**まで膨らんだ
     （想定は3〜5）。損切り83件の多くがこの往復だった。
     """
+    volume_confirmation_mult: float | None = None
+    """出来高確認のスイッチ。設定すると、直近バーの出来高が当日の
+    それまでの平均バー出来高のこの倍数以上でなければシグナルB
+    （VWAP乖離）を発火しない。
+
+    **仮説検定用のフィルタ。** 乖離が大きくても薄商いなら、本当に
+    売買を伴った動きか疑わしくノイズの可能性が高い。出来高を伴う
+    乖離ほど平均回帰の力が働きやすい、という仮説を試す
+    （`docs/00-overview.md` 意思決定ログ51）。
+
+    **既定は None（無効）。** 既存変種の結果を変えない。
+    """
+
     max_entries_per_symbol_per_day: int = 1
     """1銘柄あたり1日の最大エントリー回数。
 
@@ -136,6 +149,8 @@ class TakeIntradayConfig:
             )
         if self.min_deviation_pct <= 0:
             raise ValueError("min_deviation_pct は正の値")
+        if self.volume_confirmation_mult is not None and self.volume_confirmation_mult <= 0:
+            raise ValueError("volume_confirmation_mult は正の値")
         if self.stop_loss_atr_mult <= 0 or self.take_profit_atr_mult <= 0:
             raise ValueError("ATR 倍率は正の値")
         if self.take_profit_atr_mult <= self.stop_loss_atr_mult:
@@ -363,6 +378,15 @@ class TakeIntraday(Strategy):
             prev_deviation = (previous[-1].close - prev_vwap) / prev_vwap
             if abs(deviation) >= abs(prev_deviation):
                 # まだ拡大中。落ちるナイフを掴まない
+                return None
+
+        if cfg.volume_confirmation_mult is not None:
+            previous = today[:-1]
+            if not previous:
+                return None
+            avg_volume = sum(b.volume for b in previous) / len(previous)
+            if avg_volume <= 0 or last.volume < avg_volume * cfg.volume_confirmation_mult:
+                # 薄商いの乖離はノイズの可能性が高い。出来高で確認できない
                 return None
 
         return Side.SHORT if deviation > 0 else Side.LONG

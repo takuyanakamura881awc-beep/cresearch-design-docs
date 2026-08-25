@@ -88,6 +88,14 @@ EXPERIMENT_VARIANTS: tuple[tuple[str, TakeIntradayConfig], ...] = (
         "VWAP乖離のみ 0.7%",
         TakeIntradayConfig(enable_breakout=False, min_deviation_pct=0.007),
     ),
+    (
+        "VWAP乖離のみ 2.0%",
+        TakeIntradayConfig(enable_breakout=False, min_deviation_pct=0.020),
+    ),
+    (
+        "VWAP乖離1.5%+出来高確認1.5倍",
+        TakeIntradayConfig(enable_breakout=False, volume_confirmation_mult=1.5),
+    ),
 )
 """検定にかける変種。**閾値を下げるのはサンプルを増やして検定可能にするため**で、
 勝つ値を探しているのではない。勝ち負けはランダム分布との比較でしか判定しない。"""
@@ -948,6 +956,16 @@ def main() -> int:
         help="VWAP乖離の下限（既定0.015）。下げるとサンプルが増える",
     )
     parser.add_argument(
+        "--volume-confirmation-mult",
+        type=float,
+        default=None,
+        metavar="M",
+        help=(
+            "VWAP乖離の出来高確認倍率。直近バーの出来高が当日それまでの"
+            "平均のこの倍数未満なら見送る（既定は無効）"
+        ),
+    )
+    parser.add_argument(
         "--random-baseline",
         type=int,
         default=0,
@@ -1138,12 +1156,28 @@ def main() -> int:
             if args.min_deviation_pct is not None
             else {}
         ),
+        **(
+            {"volume_confirmation_mult": args.volume_confirmation_mult}
+            if args.volume_confirmation_mult is not None
+            else {}
+        ),
     )
-    if args.disable_breakout or args.invert_breakout or args.min_deviation_pct:
+    volume_suffix = (
+        f" / 出来高確認 {strategy_config.volume_confirmation_mult:.1f}倍"
+        if strategy_config.volume_confirmation_mult is not None
+        else ""
+    )
+    if (
+        args.disable_breakout
+        or args.invert_breakout
+        or args.min_deviation_pct
+        or args.volume_confirmation_mult
+    ):
         print(
             f"  **変種**: ブレイク {'切' if args.disable_breakout else '入'}"
             f" / 反転 {'あり' if args.invert_breakout else 'なし'}"
             f" / VWAP乖離下限 {strategy_config.min_deviation_pct:.1%}"
+            f"{volume_suffix}"
         )
 
     result = run(TakeIntraday(strategy_config), intraday, config, watchlist)
@@ -1155,6 +1189,7 @@ def main() -> int:
             f"ブレイク{'切' if args.disable_breakout else '入'}"
             f" / 反転{'あり' if args.invert_breakout else 'なし'}"
             f" / VWAP乖離下限{strategy_config.min_deviation_pct:.1%}"
+            f"{volume_suffix}"
         )
         run_stress_test(
             result,

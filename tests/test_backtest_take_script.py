@@ -157,9 +157,13 @@ class TestRequiredSeeds:
             bt.required_seeds_for(0.0)
 
     def test_実際の変種数と整合する(self, bt: ModuleType) -> None:
-        """--stress-test の CLI バリデーションが使う値そのもの。"""
+        """--stress-test の CLI バリデーションが使う値そのもの。
+
+        変種を足すたびにここも自動で厳しくなる（7変種 → 141シード必要。
+        浮動小数点の誤差で理論値140より1大きく出る）。
+        """
         required = bt.required_percentile(len(bt.EXPERIMENT_VARIANTS))
-        assert bt.required_seeds_for(required) == 100
+        assert bt.required_seeds_for(required) == 141
 
 
 class TestWindowWatchlist:

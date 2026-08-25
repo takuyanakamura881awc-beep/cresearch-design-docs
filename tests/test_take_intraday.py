@@ -139,6 +139,11 @@ class TestConfig:
         assert cfg.stop_loss_atr_mult == 1.5
         assert cfg.take_profit_atr_mult == 2.5
         assert cfg.max_holding_minutes == 180
+        assert cfg.volume_confirmation_mult is None
+
+    def test_出来高確認倍率をゼロ以下にできない(self) -> None:
+        with pytest.raises(ValueError, match="volume_confirmation_mult"):
+            TakeIntradayConfig(volume_confirmation_mult=0.0)
 
 
 class TestBreakout:
@@ -324,6 +329,33 @@ class TestReversion:
             _bar(10, 1080.0, volume=1_000),
         ]
         strategy = TakeIntraday(TakeIntradayConfig(require_deviation_shrinking=False))
+        assert strategy._reversion(
+            (*_history(), *session), datetime(2026, 6, 1, 9, 15), session[-1]
+        ) is Side.SHORT
+
+    def test_出来高が平均未満なら見送る(self) -> None:
+        """**薄商いの乖離はノイズの可能性が高い。** 出来高で確認できなければ入らない。"""
+        session = [
+            _bar(0, 1000.0, volume=5_000),
+            _bar(5, 1030.0, volume=5_000),
+            _bar(10, 1080.0, volume=1_000),  # それまでの平均5,000の1.5倍(7,500)未満
+        ]
+        strategy = TakeIntraday(
+            TakeIntradayConfig(require_deviation_shrinking=False, volume_confirmation_mult=1.5)
+        )
+        assert strategy._reversion(
+            (*_history(), *session), datetime(2026, 6, 1, 9, 15), session[-1]
+        ) is None
+
+    def test_出来高が平均以上なら発火する(self) -> None:
+        session = [
+            _bar(0, 1000.0, volume=1_000),
+            _bar(5, 1030.0, volume=1_000),
+            _bar(10, 1080.0, volume=5_000),  # それまでの平均1,000の1.5倍(1,500)以上
+        ]
+        strategy = TakeIntraday(
+            TakeIntradayConfig(require_deviation_shrinking=False, volume_confirmation_mult=1.5)
+        )
         assert strategy._reversion(
             (*_history(), *session), datetime(2026, 6, 1, 9, 15), session[-1]
         ) is Side.SHORT
