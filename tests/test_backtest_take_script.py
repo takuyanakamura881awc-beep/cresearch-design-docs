@@ -22,7 +22,7 @@ import pytest
 
 from autotrader.engine.backtest import BacktestConfig, run
 from autotrader.strategy.take_intraday import TakeIntraday
-from autotrader.types import Bar
+from autotrader.types import Bar, Side, Trade
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "backtest_take.py"
 
@@ -99,6 +99,36 @@ def _series(code: str, price: float, n_days: int) -> tuple[Bar, ...]:
                 )
             )
     return tuple(out)
+
+
+def _day_bar(symbol: str, day: date, *, high: float, low: float, close: float = 1000.0) -> Bar:
+    """1日1本ぶんのバー。`_group_by_regime` のテストは日ごとの実現レンジ
+    （高値・安値）しか見ないので、1本で足りる。"""
+    return Bar(
+        symbol=symbol,
+        timestamp=datetime(day.year, day.month, day.day, 9, 0),
+        open=close,
+        high=high,
+        low=low,
+        close=close,
+        volume=10_000,
+        turnover=2_000_000_000.0,
+    )
+
+
+def _trade(symbol: str, day: date, entry_minute: int = 30) -> Trade:
+    """`_group_by_regime` のテスト用の、中身の値には意味を持たせない1トレード。"""
+    entry = datetime(day.year, day.month, day.day, 9, 0) + timedelta(minutes=entry_minute)
+    return Trade(
+        symbol=symbol,
+        side=Side.LONG,
+        quantity=100,
+        entry_time=entry,
+        entry_price=1000.0,
+        exit_time=entry + timedelta(minutes=5),
+        exit_price=1010.0,
+        exit_reason="time_exit",
+    )
 
 
 class TestRequiredPercentile:
@@ -229,59 +259,72 @@ class TestBaselineProbabilityWindowed:
 
 
 class TestGroupByRegime:
-    """`--by-regime` が使う、トレードを calm/wild に振り分けるロジック。
+    """`--by-regime` が使う、トレードを市場全体の calm/wild に振り分けるロジック。
 
     **印字関数（`run_by_regime`）自体は直接テストしない。** このファイルの
     他のテストと同じく、印字の元になる純粋なロジックだけを確認する。
+
+    calm/wild は**銘柄ごとではなく日ごとに1つ**決まる（意思決定ログ48）。
+    最初の実装は銘柄ごとに分類しており、それだとエントリー条件と
+    ほぼ同義になってトレードのほぼ全部が同じラベルに集まってしまった。
     """
 
     def test_calmとwildに振り分けられる(self, bt: ModuleType) -> None:
-        # 前半10日は穏やか（値幅2%）、後半10日は荒れ（値幅10%）にする
-        calm_bars = _series("CALM", 1000.0, n_days=20)
-        wild_bars = _series("WILD", 1000.0, n_days=20)
-        bars = {"CALM": calm_bars, "WILD": wild_bars}
+        calm1, calm2 = date(2026, 6, 1), date(2026, 6, 2)
+        wild1, wild2 = date(2026, 6, 3), date(2026, 6, 4)
+        trading_days = (calm1, calm2, wild1, wild2)
 
-        all_days = tuple(sorted({b.timestamp.date() for b in calm_bars}))
-        watchlist = {d: frozenset({"CALM", "WILD"}) for d in all_days}
-        cfg = BacktestConfig(
-            initial_cash=Decimal(500_000), shortable=frozenset({"CALM", "WILD"})
+        bars = {
+            "A": (
+                _day_bar("A", calm1, high=1010.0, low=990.0),  # 2.0%
+                _day_bar("A", calm2, high=1010.0, low=990.0),  # 2.0%
+                _day_bar("A", wild1, high=1050.0, low=950.0),  # 10.0%
+                _day_bar("A", wild2, high=1050.0, low=950.0),  # 10.0%
+            ),
+        }
+        # 日をまたいだ中央値は (2.0+10.0)/2=6.0%。calm1/calm2(2.0%)は calm、
+        # wild1/wild2(10.0%)は wild になるはず
+        trades = tuple(
+            _trade("A", day, entry_minute=m)
+            for day in trading_days
+            for m in (0, 30, 60)  # 各日3トレードずつ
         )
-        result = run(TakeIntraday(), bars, cfg, watchlist)
-        assert result.n_trades > 0
 
-        groups = bt._group_by_regime(result.trades, bars)
+        groups = bt._group_by_regime(trades, bars, trading_days)
 
-        # calm と wild の両方のキーが必ず存在する（0件でも空リストで）
-        assert set(groups) == {"calm", "wild"}
-        # 振り分けた総数はトレード総数を超えない（分類できなかった日は捨てる）
-        assert len(groups["calm"]) + len(groups["wild"]) <= result.n_trades
+        assert len(groups["calm"]) == 6
+        assert len(groups["wild"]) == 6
+        assert {t.entry_time.date() for t in groups["calm"]} == {calm1, calm2}
+        assert {t.entry_time.date() for t in groups["wild"]} == {wild1, wild2}
 
-    def test_同じ日を二度分類しない(
+    def test_classify_daysの呼び出しは1回だけ(
         self, bt: ModuleType, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`classify_days` の呼び出し回数がトレード件数ではなく日数ぶんになること。"""
-        bars = {"A": _series("A", 1000.0, n_days=5)}
-        all_days = tuple(sorted({b.timestamp.date() for b in bars["A"]}))
-        watchlist = {d: frozenset({"A"}) for d in all_days}
-        cfg = BacktestConfig(initial_cash=Decimal(500_000), shortable=frozenset({"A"}))
-        result = run(TakeIntraday(), bars, cfg, watchlist)
-        assert result.n_trades > 0
+        """トレード件数分でもユニーク日数分でもなく、日単位バッチ処理として1回。"""
+        day1, day2 = date(2026, 6, 1), date(2026, 6, 2)
+        trading_days = (day1, day2)
+        bars = {
+            "A": (
+                _day_bar("A", day1, high=1010.0, low=990.0),
+                _day_bar("A", day2, high=1050.0, low=950.0),
+            ),
+        }
+        trades = (_trade("A", day1), _trade("A", day1), _trade("A", day2))
 
         call_count = 0
         original = bt.classify_days
 
-        def counting_classify_days(*args: object, **kwargs: object) -> dict[str, str]:
+        def counting_classify_days(*args: object, **kwargs: object) -> dict[date, str]:
             nonlocal call_count
             call_count += 1
             return original(*args, **kwargs)  # type: ignore[no-any-return]
 
         monkeypatch.setattr(bt, "classify_days", counting_classify_days)
-        bt._group_by_regime(result.trades, bars)
+        bt._group_by_regime(trades, bars, trading_days)
 
-        unique_days = {t.entry_time.date() for t in result.trades}
-        assert call_count == len(unique_days)
+        assert call_count == 1
 
     def test_トレードがなければ両方空(self, bt: ModuleType) -> None:
-        groups = bt._group_by_regime((), {})
+        groups = bt._group_by_regime((), {}, ())
         assert groups == {"calm": [], "wild": []}
 

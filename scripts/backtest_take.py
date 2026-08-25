@@ -536,20 +536,19 @@ def _window_watchlist(
 
 
 def _group_by_regime(
-    trades: tuple[Trade, ...], intraday: dict[str, tuple[Bar, ...]]
+    trades: tuple[Trade, ...],
+    intraday: dict[str, tuple[Bar, ...]],
+    trading_days: tuple[date, ...],
 ) -> dict[str, list[Trade]]:
-    """トレードを、そのエントリー日の calm/wild ラベルで振り分ける。
+    """トレードを、そのエントリー日の市場全体 calm/wild ラベルで振り分ける。
 
-    **日ごとに1回だけ分類する。** 同じ日に複数トレードがあっても
-    `classify_days` をトレードの数だけ呼び直さない。
+    **`classify_days` を1回だけ呼ぶ。** 日ごとのラベルは対象期間全体で
+    1つに決まるので、トレードの数やユニーク日数ぶん呼び直す必要はない。
     """
-    labels_by_day: dict[date, dict[str, str]] = {}
+    labels_by_day = classify_days(intraday, trading_days)
     groups: dict[str, list[Trade]] = {"calm": [], "wild": []}
     for trade in trades:
-        day = trade.entry_time.date()
-        if day not in labels_by_day:
-            labels_by_day[day] = classify_days(intraday, day)
-        label = labels_by_day[day].get(trade.symbol)
+        label = labels_by_day.get(trade.entry_time.date())
         if label is not None:
             groups[label].append(trade)
     return groups
@@ -560,9 +559,10 @@ def run_by_regime(
     intraday: dict[str, tuple[Bar, ...]],
     config: BacktestConfig,
     watchlist: dict[date, frozenset[str]],
+    trading_days: tuple[date, ...],
     n_seeds: int,
 ) -> None:
-    """成績を、日次の値動きの荒さ（calm/wild）で事後的に分けて見る。
+    """成績を、日次の値動きの荒さ（市場全体・calm/wild）で事後的に分けて見る。
 
     **これは診断であって、実戦のフィルタではない。** `regime.classify_days`
     はその日の高値・安値を使うため、取引前には計算できない
@@ -573,12 +573,17 @@ def run_by_regime(
     だけで筋の通った理由がありそうかを先に診断する**という位置づけ
     （`docs/00-overview.md` 意思決定ログ47）。
 
+    **calm/wild は銘柄ごとではなく日ごとに1つ決まる**（市場全体の荒さ）。
+    最初は銘柄ごとに分類していたが、それだとエントリー条件（その日
+    その銘柄が仲間より大きく動いたか）とほぼ同義になり、トレードの
+    ほぼ全部が機械的に同じラベルに集まってしまった（意思決定ログ48）。
+
     見るのは、calm日のトレードと wild日のトレードそれぞれの gross/件が、
     **同じランダム分布**に対してどのパーセンタイルに位置するか。
     新しい統計手法は作らず、`--stress-test` と同じ
     `random_distribution` / `_percentile_of` をそのまま使う。
     """
-    hr("日次の値動きの荒さで事後的に分ける（診断・実戦フィルタではない）")
+    hr("日次の値動きの荒さ（市場全体）で事後的に分ける（診断・実戦フィルタではない）")
     if result.n_trades == 0:
         print("  トレードが0件。診断できない")
         return
@@ -590,7 +595,7 @@ def run_by_regime(
         return
     distribution = [v for v, _ in samples]
 
-    groups = _group_by_regime(result.trades, intraday)
+    groups = _group_by_regime(result.trades, intraday, trading_days)
 
     print(f"  {'区分':<6} {'件数':>6} {'gross/件':>10} {'順位':>8}")
     print("  " + "-" * 36)
@@ -1105,7 +1110,7 @@ def main() -> int:
             args.seeds,
         )
     elif args.by_regime:
-        run_by_regime(result, intraday, config, watchlist, args.seeds)
+        run_by_regime(result, intraday, config, watchlist, trading_days, args.seeds)
     elif args.experiment:
         run_experiment(result, intraday, config, watchlist, len(trading_days))
     elif args.random_baseline:
