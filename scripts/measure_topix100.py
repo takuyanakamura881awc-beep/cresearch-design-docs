@@ -191,6 +191,58 @@ def load_master() -> tuple[Symbol, ...] | None:
     )
 
 
+CAPITAL_SWEEP = (
+    Decimal(500_000),
+    Decimal(800_000),
+    Decimal(1_200_000),
+    Decimal(2_000_000),
+    Decimal(3_000_000),
+    Decimal(5_000_000),
+)
+"""資金をいくらにすれば何銘柄使えるようになるかを見るための刻み。"""
+
+
+def _report_capital_sweep(
+    topix100: tuple[Symbol, ...], store: BarStore
+) -> None:
+    """**何が制約なのかを分離する。**
+
+    株価上限は市場の性質ではなく ``資金 × 1銘柄上限比率 ÷ 単元`` の
+    逆算値（`docs/00` 意思決定ログ21）。TOPIX100 が使えないのが
+    「呼値の話」なのか「資金の話」なのかは、資金を振ってみれば分かる。
+
+    **これは増資を勧めるものではない。** 投入額は人間が決めること
+    （`CLAUDE.md`）。ここで出すのは判断材料だけ。
+    """
+    prices: list[float] = []
+    for s in topix100:
+        bars = store.read(s.code, "1d")
+        if not bars:
+            continue
+        price = sorted(bars, key=lambda b: b.timestamp)[-1].close
+        if price > 0:
+            prices.append(price)
+    if not prices:
+        return
+
+    hr("3.5 資金をいくらにすれば何銘柄使えるか")
+    print("  株価上限 = 資金 × 25%（安全装置#7）÷ 100株")
+    print("  **市場の性質ではなく資金の制約**なので、資金を振れば動く。")
+    print()
+    print(f"  {'資金':>12}{'株価上限':>12}{'使える銘柄':>12}{'割合':>8}")
+    print("  " + "-" * 46)
+    for capital in CAPITAL_SWEEP:
+        ceiling = float(max_affordable_price(capital, DEFAULT_MAX_WEIGHT_PER_SYMBOL, 100))
+        usable = sum(1 for p in prices if p <= ceiling)
+        marker = "  ← 現在" if capital == CAPITAL else ""
+        print(
+            f"  {int(capital):>11,}円{ceiling:>10,.0f}円"
+            f"{usable:>10}銘柄{usable / len(prices):>7.0%}{marker}"
+        )
+    print()
+    print(f"  （TOPIX100 のうち日足が取れた {len(prices)}銘柄が母数）")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -325,6 +377,8 @@ def main() -> int:
     print()
     print(f"  往復コスト中央値: 通常 {statistics.median(regular_bps):.1f}bps"
           f" → TOPIX100 {statistics.median(fine_bps):.1f}bps")
+
+    _report_capital_sweep(topix100, store)
 
     hr("4. 判定")
     print(f"  通過銘柄: {len(passed)} / TOPIX100 {len(topix100)}銘柄")
