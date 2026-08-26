@@ -42,7 +42,7 @@ from pathlib import Path
 
 from autotrader.data.store import BarStore
 from autotrader.provenance import banner
-from autotrader.tick import spread_yen
+from autotrader.tick import DEFAULT_SPREAD_TICKS, spread_yen
 from autotrader.types import Bar, Symbol
 
 DATA_ROOT = Path("data")
@@ -105,14 +105,21 @@ def fade_score(pair: GapFadePair) -> float:
     return 0.0
 
 
-def round_trip_cost_bps(pair: GapFadePair) -> float:
+def round_trip_cost_bps(
+    pair: GapFadePair, n_ticks: float = DEFAULT_SPREAD_TICKS
+) -> float:
     """この銘柄・この日に建てたときの往復コスト（bps）。
 
     `autotrader.tick.spread_yen` をそのまま使う——**約定コストの
     モデルを診断ごとに作り直さない**（`docs/00` 意思決定ログ33以降で
     呼値ベースに統一済み）。往復でスプレッド1本ぶんを払う。
+
+    ``n_ticks`` を変えられるのは**感度を見るため**。スプレッドは
+    Stage A では実測できず（意思決定ログ57〜60）、この1つの数値が
+    net を線形に動かすので、「想定を変えたら結論が変わるのか」を
+    確かめられるようにしてある。**既定値は動かさない。**
     """
-    return float(spread_yen(pair.open_price)) / pair.open_price * 10_000.0
+    return float(spread_yen(pair.open_price, n_ticks)) / pair.open_price * 10_000.0
 
 
 @dataclass(frozen=True)
@@ -145,7 +152,11 @@ class BucketStats:
         return self.gross_bps / self.stderr_bps
 
 
-def bucket_stats(pairs: tuple[GapFadePair, ...], threshold: float) -> BucketStats | None:
+def bucket_stats(
+    pairs: tuple[GapFadePair, ...],
+    threshold: float,
+    n_ticks: float = DEFAULT_SPREAD_TICKS,
+) -> BucketStats | None:
     """``|gap_pct| >= threshold`` の日だけを集計する。
 
     Returns:
@@ -156,7 +167,7 @@ def bucket_stats(pairs: tuple[GapFadePair, ...], threshold: float) -> BucketStat
         return None
 
     scores_bps = [fade_score(p) * 10_000.0 for p in bucket]
-    costs_bps = [round_trip_cost_bps(p) for p in bucket]
+    costs_bps = [round_trip_cost_bps(p, n_ticks) for p in bucket]
     mean = statistics.fmean(scores_bps)
     stderr = statistics.stdev(scores_bps) / math.sqrt(len(scores_bps))
     return BucketStats(
@@ -235,6 +246,38 @@ def report(pairs: tuple[GapFadePair, ...]) -> None:
     print("  往復コストは呼値2tick想定（`autotrader.tick`）。始値で建てて")
     print("  引けで手仕舞う前提の、最も楽観的な見積り——実際は寄り付き直後の")
     print("  スプレッドはこれより広い。**net が僅差で正でも安心できない。**")
+
+    _report_spread_sensitivity(pairs)
+
+
+def _report_spread_sensitivity(pairs: tuple[GapFadePair, ...]) -> None:
+    """スプレッド想定を変えたときに net の符号が変わるかを見る。
+
+    **スプレッドは Stage A では実測できない**（意思決定ログ57〜60で
+    Corwin-Schultz を試したが、この銘柄群では推定がノイズ床に埋もれた）。
+    だとしても「想定を変えたら結論が変わるのか」は測れる。
+    **変わらないなら、スプレッドの精密化に投資する意味はない。**
+    """
+    print()
+    print("  【スプレッド想定に対する感度】")
+    print("  **gross はコストモデルに依存しない**ので、この表は確実。")
+    print()
+    candidates = (2.0, 1.5, 1.0, 0.5)
+    header = "  ".join(f"{t:.1f}本" for t in candidates)
+    print(f"  {'|ギャップ|下限':<12} {'gross':>8}   net: {header}")
+    print("  " + "-" * 62)
+    for threshold in GAP_BUCKETS_PCT:
+        base = bucket_stats(pairs, threshold)
+        if base is None:
+            continue
+        nets = "  ".join(
+            f"{s.net_bps:>+7.1f}b" if (s := bucket_stats(pairs, threshold, t)) else "    —"
+            for t in candidates
+        )
+        print(f"  {threshold:>10.1%}  {base.gross_bps:>+7.2f}b        {nets}")
+    print()
+    print("  **どの想定でも net が負なら、スプレッドの精密化は不要。**")
+    print("  優位そのものが足りていないので、コストではなく手法側の問題。")
 
 
 def main() -> int:
