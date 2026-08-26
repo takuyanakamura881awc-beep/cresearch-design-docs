@@ -295,11 +295,25 @@ def _report_spread_sensitivity(pairs: tuple[GapFadePair, ...]) -> None:
     print("  優位そのものが足りていないので、コストではなく手法側の問題。")
 
 
-def load_topix100() -> tuple[Symbol, ...]:
-    """TOPIX100 構成銘柄。`scripts/measure_topix100.py` が作るキャッシュを読む。"""
+def load_topix100(*, historical: bool) -> tuple[tuple[Symbol, ...], str]:
+    """TOPIX100 構成銘柄。`scripts/measure_topix100.py` が作るキャッシュを読む。
+
+    Args:
+        historical: ``True`` なら**検証期間の開始時点**の一覧を使う。
+
+            **既定でこちらを使うべき。** 現在の一覧は「2年間 大型で
+            居続けた勝ち組」なので、それで過去を測ると成績が構造的に
+            過大評価される（`docs/03-universe.md` §4.2 が明示的に禁じている）。
+            `False` は「今の一覧で測るとどれだけ甘くなるか」を
+            比較するためだけに使う。
+
+    Returns:
+        ``(TOPIX100 の銘柄, 基準日の説明)``。
+    """
     import json
 
-    path = DATA_ROOT / "master_scale.json"
+    name = "master_scale_historical.json" if historical else "master_scale.json"
+    path = DATA_ROOT / name
     if not path.is_file():
         raise SystemExit(
             f"{path} がない。先に python scripts/measure_topix100.py --refresh を実行する"
@@ -316,7 +330,8 @@ def load_topix100() -> tuple[Symbol, ...]:
         )
         for r in payload["symbols"]
     )
-    return tuple(s for s in symbols if s.is_topix100)
+    as_of = payload.get("as_of", "不明")
+    return tuple(s for s in symbols if s.is_topix100), as_of
 
 
 def main() -> int:
@@ -329,6 +344,15 @@ def main() -> int:
             "**大型株でも優位が残るか**を、資金の判断より先に確かめる"
         ),
     )
+    parser.add_argument(
+        "--survivorship",
+        action="store_true",
+        help=(
+            "**現在**の TOPIX100 一覧で過去を測る（既定は検証期間の開始時点）。"
+            "サバイバーシップバイアスがどれだけ効くかの比較用。"
+            "**この結果を採用してはならない**（docs/03 §4.2）"
+        ),
+    )
     args = parser.parse_args()
 
     print("ギャップ・フェード診断（日足のみ・安価な予備検証）")
@@ -336,9 +360,15 @@ def main() -> int:
 
     store = BarStore(DATA_ROOT)
     if args.topix100:
-        symbols = load_topix100()
+        symbols, as_of = load_topix100(historical=not args.survivorship)
         topix100_codes = frozenset(s.code for s in symbols)
         print(f"  **TOPIX100 のみ**（呼値0.1〜0.5円）: {len(symbols)}銘柄")
+        if args.survivorship:
+            print(f"  **現在の一覧（{as_of}）で過去を測っている。**")
+            print("  → サバイバーシップバイアスあり。**採用してはならない**")
+        else:
+            print(f"  構成銘柄は検証期間の開始時点（{as_of}）のものを使う")
+            print("  → 今の勝ち組で過去を測らない（docs/03 §4.2）")
     else:
         symbols = load_symbols()
         topix100_codes = frozenset()
@@ -352,11 +382,60 @@ def main() -> int:
     report(pairs)
 
     if args.topix100:
+        _report_tick_decomposition(pairs)
         print()
         print("  **これは「資金があれば使えたか」を測っている。** 資金50万円では")
         print("  99銘柄中92銘柄が株価上限を超える（意思決定ログ64）。")
         print("  net が負ならその資金判断自体が不要になる。")
     return 0
+
+
+def _report_tick_decomposition(pairs: tuple[GapFadePair, ...]) -> None:
+    """コストが下がった理由を「細かい呼値」と「株価が高い」に分解する。
+
+    **この2つは別物。** TOPIX100 の呼値が細かいのは事実だが、
+    TOPIX100 は株価も高い。呼値が絶対額である以上、**株価が高いだけでも
+    bps 換算のコストは下がる**（3,000円の通常銘柄なら呼値1円で6.7bps、
+    600円なら33bps）。
+
+    どちらが効いているかを分けないと、「TOPIX100 だから安い」と
+    誤解して、通常銘柄の高株価帯という選択肢を見落とす。
+    """
+    if not pairs:
+        return
+    # 同じ銘柄・同じ日を、通常銘柄の呼値で評価し直す
+    as_regular = tuple(
+        GapFadePair(
+            symbol=p.symbol,
+            gap_pct=p.gap_pct,
+            intraday_return_pct=p.intraday_return_pct,
+            open_price=p.open_price,
+            topix100=False,
+        )
+        for p in pairs
+    )
+    print()
+    print("  【コスト低下の内訳: 呼値が細かい / 株価が高い】")
+    print("  同じ銘柄・同じ日を、通常銘柄の呼値で評価し直す。")
+    print()
+    print(
+        f"  {'|ギャップ|下限':<12} {'gross':>9} "
+        f"{'TOPIX100呼値':>13} {'通常呼値':>11} {'net(通常)':>11}"
+    )
+    print("  " + "-" * 60)
+    for threshold in GAP_BUCKETS_PCT:
+        fine = bucket_stats(pairs, threshold)
+        plain = bucket_stats(as_regular, threshold)
+        if fine is None or plain is None:
+            continue
+        print(
+            f"  {threshold:>10.1%}  {fine.gross_bps:>+8.2f}b "
+            f"{fine.cost_bps:>12.2f}b {plain.cost_bps:>10.2f}b "
+            f"{plain.net_bps:>+10.2f}b"
+        )
+    print()
+    print("  **右端が正なら、細かい呼値がなくても成立する。**")
+    print("  その場合の本質は「株価の高い銘柄を扱えるか」＝資金の問題。")
 
 
 if __name__ == "__main__":

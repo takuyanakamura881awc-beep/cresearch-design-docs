@@ -128,6 +128,65 @@ def save_master(symbols: tuple[Symbol, ...]) -> None:
     print(f"  保存: {MASTER_PATH}（{len(symbols)}銘柄）")
 
 
+HISTORICAL_PATH = DATA_ROOT / "master_scale_historical.json"
+"""**検証期間の開始時点**の規模区分。サバイバーシップバイアス対策。
+
+`docs/03-universe.md` §4.2:「現在の一覧を過去に適用してはならない」。
+今 TOPIX100 に入っている銘柄は「2年間 大型で居続けた勝ち組」なので、
+その一覧で過去を測ると成績が構造的に過大評価される。
+"""
+
+
+def fetch_master_at(
+    source: JQuantsDataSource, as_of: date, path: Path, label: str
+) -> tuple[Symbol, ...] | None:
+    """指定日時点の銘柄一覧を取って保存する。"""
+    print(f"  {label}（{as_of}）を取得する")
+    try:
+        symbols = source.list_symbols(as_of)
+    except SubscriptionRangeError as exc:
+        print(f"  NG: 契約範囲外 — {exc}")
+        return None
+    except DataSourceError as exc:
+        print(f"  NG: {exc}")
+        return None
+    if not symbols:
+        print("  NG: 空の応答")
+        return None
+    _write_master(symbols, path, as_of, label)
+    return symbols
+
+
+def _write_master(
+    symbols: tuple[Symbol, ...], path: Path, as_of: date, note: str
+) -> None:
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "as_of": as_of.isoformat(),
+                "note": note,
+                "symbols": [
+                    {
+                        "code": s.code,
+                        "name": s.name,
+                        "market": s.market,
+                        "margin_type": s.margin_type,
+                        "sector": s.sector,
+                        "scale_category": s.scale_category,
+                    }
+                    for s in symbols
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    n_topix100 = sum(1 for s in symbols if s.is_topix100)
+    print(f"    保存: {path}（{len(symbols)}銘柄 / TOPIX100 {n_topix100}）")
+
+
 def fetch_master(source: JQuantsDataSource) -> tuple[Symbol, ...] | None:
     """規模区分つきの銘柄一覧を取る。**基準日を自分で決める必要がある。**
 
@@ -267,10 +326,22 @@ def main() -> int:
             print("  JQUANTS_API_KEY がない（.env を確認する）")
             return 1
         print(f"  JQUANTS_API_KEY: {mask(creds.jquants_api_key)}")
-        symbols = fetch_master(JQuantsDataSource(creds.jquants_api_key))
+        source = JQuantsDataSource(creds.jquants_api_key)
+        symbols = fetch_master(source)
         if not symbols:
             return 1
         save_master(symbols)
+
+        # **検証期間の開始時点の一覧も取る。** これがないと
+        # 「今の勝ち組で過去を測る」サバイバーシップバイアスになる
+        # （`docs/03-universe.md` §4.2）
+        historical_as_of = date.today() - timedelta(days=DAILY_LOOKBACK_DAYS)
+        fetch_master_at(
+            source,
+            historical_as_of,
+            HISTORICAL_PATH,
+            "検証期間の開始時点の規模区分（サバイバーシップ対策）",
+        )
 
     hr("1. 規模区分の内訳")
     counts: dict[str, int] = {}
