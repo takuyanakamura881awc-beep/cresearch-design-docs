@@ -34,12 +34,15 @@ ORB・VWAP乖離という手元の手がかりは使い切ったので、新し�
 
 from __future__ import annotations
 
+import math
+import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from autotrader.data.store import BarStore
 from autotrader.provenance import banner
+from autotrader.tick import spread_yen
 from autotrader.types import Bar, Symbol
 
 DATA_ROOT = Path("data")
@@ -57,6 +60,12 @@ class GapFadePair:
     """(当日始値 - 前日終値) / 前日終値。"""
     intraday_return_pct: float
     """(当日終値 - 当日始値) / 当日始値。"""
+    open_price: float
+    """当日始値。**コストは株価で決まる**ので必要（`autotrader.tick`）。
+
+    ギャップ・フェード戦略として実装するなら始値付近で建てることになるので、
+    往復コストの見積りもこの価格を基準にする。
+    """
 
 
 def gap_fade_pairs(daily_bars: dict[str, tuple[Bar, ...]]) -> tuple[GapFadePair, ...]:
@@ -78,6 +87,7 @@ def gap_fade_pairs(daily_bars: dict[str, tuple[Bar, ...]]) -> tuple[GapFadePair,
                     symbol=symbol,
                     gap_pct=gap_pct,
                     intraday_return_pct=intraday_return_pct,
+                    open_price=today.open,
                 )
             )
     return tuple(pairs)
@@ -93,6 +103,68 @@ def fade_score(pair: GapFadePair) -> float:
     if pair.gap_pct < 0:
         return pair.intraday_return_pct
     return 0.0
+
+
+def round_trip_cost_bps(pair: GapFadePair) -> float:
+    """この銘柄・この日に建てたときの往復コスト（bps）。
+
+    `autotrader.tick.spread_yen` をそのまま使う——**約定コストの
+    モデルを診断ごとに作り直さない**（`docs/00` 意思決定ログ33以降で
+    呼値ベースに統一済み）。往復でスプレッド1本ぶんを払う。
+    """
+    return float(spread_yen(pair.open_price)) / pair.open_price * 10_000.0
+
+
+@dataclass(frozen=True)
+class BucketStats:
+    """1バケット（|ギャップ| がある下限以上の日）の集計。"""
+
+    n: int
+    gross_bps: float
+    """fade_score の平均を bps にしたもの。**コスト前**。"""
+    cost_bps: float
+    """往復コストの平均（bps）。"""
+    stderr_bps: float
+    """gross の標準誤差（bps）。件数が増えるほど小さくなる。"""
+
+    @property
+    def net_bps(self) -> float:
+        """コストを引いた後。**これが正でなければ取引する意味がない。**"""
+        return self.gross_bps - self.cost_bps
+
+    @property
+    def t_stat(self) -> float:
+        """gross がゼロと区別できるか。標準誤差が0なら0を返す。
+
+        **統計的な有意性と、コスト後に残るかは別の話。** 有意でも
+        コストに負けることはある（このプロジェクトでは実際にそうなった
+        ——`docs/00` 意思決定ログ36の「損益分岐の勝率」と同じ構造）。
+        """
+        if self.stderr_bps <= 0:
+            return 0.0
+        return self.gross_bps / self.stderr_bps
+
+
+def bucket_stats(pairs: tuple[GapFadePair, ...], threshold: float) -> BucketStats | None:
+    """``|gap_pct| >= threshold`` の日だけを集計する。
+
+    Returns:
+        該当が2件未満なら ``None``（標準偏差が計算できない）。
+    """
+    bucket = [p for p in pairs if abs(p.gap_pct) >= threshold]
+    if len(bucket) < 2:
+        return None
+
+    scores_bps = [fade_score(p) * 10_000.0 for p in bucket]
+    costs_bps = [round_trip_cost_bps(p) for p in bucket]
+    mean = statistics.fmean(scores_bps)
+    stderr = statistics.stdev(scores_bps) / math.sqrt(len(scores_bps))
+    return BucketStats(
+        n=len(bucket),
+        gross_bps=mean,
+        cost_bps=statistics.fmean(costs_bps),
+        stderr_bps=stderr,
+    )
 
 
 def load_symbols() -> tuple[Symbol, ...]:
@@ -132,24 +204,37 @@ def report(pairs: tuple[GapFadePair, ...]) -> None:
         print("  データがない。先に python scripts/fetch_bars.py を実行する")
         return
 
-    baseline = sum(fade_score(p) for p in pairs) / len(pairs)
-    print(f"  全日ベースライン: 件数 {len(pairs):>6} / fade_score平均 {baseline:>+8.4%}")
+    baseline = bucket_stats(pairs, 0.0)
+    if baseline is not None:
+        print(
+            f"  全日ベースライン: 件数 {baseline.n:>6} / "
+            f"gross {baseline.gross_bps:>+7.2f}bps"
+        )
     print()
-    print(f"  {'|ギャップ|下限':<14} {'件数':>8} {'fade_score平均':>14}")
-    print("  " + "-" * 40)
+    print(
+        f"  {'|ギャップ|下限':<12} {'件数':>7} {'gross':>9} {'コスト':>9} "
+        f"{'net':>9} {'t値':>7}"
+    )
+    print("  " + "-" * 60)
     for threshold in GAP_BUCKETS_PCT:
-        bucket = [p for p in pairs if abs(p.gap_pct) >= threshold]
-        if not bucket:
-            print(f"  {threshold:>12.1%}  {0:>8}  —（該当なし）")
+        stats = bucket_stats(pairs, threshold)
+        if stats is None:
+            print(f"  {threshold:>10.1%}  {0:>7}  —（該当なし）")
             continue
-        avg = sum(fade_score(p) for p in bucket) / len(bucket)
-        print(f"  {threshold:>12.1%}  {len(bucket):>8}  {avg:>+13.4%}")
+        print(
+            f"  {threshold:>10.1%}  {stats.n:>7} "
+            f"{stats.gross_bps:>+8.2f}b {stats.cost_bps:>8.2f}b "
+            f"{stats.net_bps:>+8.2f}b {stats.t_stat:>6.1f}"
+        )
 
     print()
-    print("  **まだ合否判定はしない。** 閾値を上げるほどベースラインより")
-    print("  はっきりフェード側（正）に振れるか、目視で確認する診断。")
-    print("  一貫していれば実際の戦略として実装する価値がある。")
-    print("  一貫しなければこの切り口には手がかりがない。")
+    print("  **gross はコスト前、net はコストを引いた後。** t値は gross が")
+    print("  ゼロと区別できるかで、**コスト後に残るかとは別の話**。")
+    print("  net が負なら、傾向が統計的に本物でも取引する意味はない。")
+    print()
+    print("  往復コストは呼値2tick想定（`autotrader.tick`）。始値で建てて")
+    print("  引けで手仕舞う前提の、最も楽観的な見積り——実際は寄り付き直後の")
+    print("  スプレッドはこれより広い。**net が僅差で正でも安心できない。**")
 
 
 def main() -> int:

@@ -3,11 +3,15 @@
 **スクリプトファイルなので `pythonpath` には乗らない。** importlib で
 直接読み込む（`tests/test_backtest_take_script.py` と同じパターン）。
 
-重点は3つ:
+重点は5つ:
 
 1. `gap_pct` / `intraday_return_pct` が正しい式で計算されること
 2. 銘柄の初日（前日終値がない）を除外すること
 3. `fade_score` の符号がフェード方向で正、ギャップ&ゴー方向で負になること
+4. **往復コストが `autotrader.tick` と同じ値になること**（診断ごとに
+   コストモデルを作り直していないことの確認）
+5. **`net_bps` が gross からコストを引いた値であること**——ここを
+   取り違えると「コスト後に残る」という誤った結論を出しかねない
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from types import ModuleType
 
 import pytest
 
+from autotrader.tick import spread_yen
 from autotrader.types import Bar
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "measure_gap_fade.py"
@@ -128,22 +133,109 @@ class TestGapFadePairs:
 class TestFadeScore:
     def test_ギャップアップして戻れば正(self, gf: ModuleType) -> None:
         """フェード（ギャップ方向と逆に動いた）は正のスコア。"""
-        pair = gf.GapFadePair(symbol="A", gap_pct=0.02, intraday_return_pct=-0.01)
+        pair = gf.GapFadePair(
+            open_price=1000.0, symbol="A", gap_pct=0.02, intraday_return_pct=-0.01
+        )
         assert gf.fade_score(pair) == pytest.approx(0.01)
 
     def test_ギャップアップしてさらに伸びれば負(self, gf: ModuleType) -> None:
         """ギャップ&ゴー（ギャップ方向にさらに伸びた）は負のスコア。"""
-        pair = gf.GapFadePair(symbol="A", gap_pct=0.02, intraday_return_pct=0.01)
+        pair = gf.GapFadePair(open_price=1000.0, symbol="A", gap_pct=0.02, intraday_return_pct=0.01)
         assert gf.fade_score(pair) == pytest.approx(-0.01)
 
     def test_ギャップダウンして戻れば正(self, gf: ModuleType) -> None:
-        pair = gf.GapFadePair(symbol="A", gap_pct=-0.02, intraday_return_pct=0.01)
+        pair = gf.GapFadePair(
+            open_price=1000.0, symbol="A", gap_pct=-0.02, intraday_return_pct=0.01
+        )
         assert gf.fade_score(pair) == pytest.approx(0.01)
 
     def test_ギャップダウンしてさらに下げれば負(self, gf: ModuleType) -> None:
-        pair = gf.GapFadePair(symbol="A", gap_pct=-0.02, intraday_return_pct=-0.01)
+        pair = gf.GapFadePair(
+            open_price=1000.0, symbol="A", gap_pct=-0.02, intraday_return_pct=-0.01
+        )
         assert gf.fade_score(pair) == pytest.approx(-0.01)
 
     def test_ギャップがゼロなら符号を持たずゼロ(self, gf: ModuleType) -> None:
-        pair = gf.GapFadePair(symbol="A", gap_pct=0.0, intraday_return_pct=0.01)
+        pair = gf.GapFadePair(open_price=1000.0, symbol="A", gap_pct=0.0, intraday_return_pct=0.01)
         assert gf.fade_score(pair) == 0.0
+
+
+class TestOpenPrice:
+    def test_当日始値を保持する(self, gf: ModuleType) -> None:
+        """コストは株価で決まるので、始値を持っていないと見積れない。"""
+        daily_bars = {
+            "A": (
+                _daily_bar("A", DAY1, open_=1000.0, close=1000.0),
+                _daily_bar("A", DAY2, open_=1050.0, close=990.0),
+            ),
+        }
+        pairs = gf.gap_fade_pairs(daily_bars)
+        assert pairs[0].open_price == pytest.approx(1050.0)
+
+
+class TestRoundTripCostBps:
+    def test_tickモジュールと同じ値になる(self, gf: ModuleType) -> None:
+        """**コストモデルを診断ごとに作り直していない**ことの確認。"""
+        price = 1000.0
+        pair = gf.GapFadePair(
+            open_price=price, symbol="A", gap_pct=0.02, intraday_return_pct=-0.01
+        )
+        expected = float(spread_yen(price)) / price * 10_000.0
+        assert gf.round_trip_cost_bps(pair) == pytest.approx(expected)
+
+    def test_安い株ほど往復コストが高い(self, gf: ModuleType) -> None:
+        """呼値は絶対額なので、株価が低いほど比率としては重くなる。"""
+        cheap = gf.GapFadePair(
+            open_price=500.0, symbol="A", gap_pct=0.02, intraday_return_pct=-0.01
+        )
+        pricey = gf.GapFadePair(
+            open_price=2500.0, symbol="B", gap_pct=0.02, intraday_return_pct=-0.01
+        )
+        assert gf.round_trip_cost_bps(cheap) > gf.round_trip_cost_bps(pricey)
+
+
+class TestBucketStats:
+    def _pairs(self, gf: ModuleType) -> tuple[object, ...]:
+        # |gap| が 1%/2%/3% の3件。intraday はすべてギャップと逆方向1%（フェード）
+        return tuple(
+            gf.GapFadePair(
+                open_price=1000.0,
+                symbol=f"S{i}",
+                gap_pct=gap,
+                intraday_return_pct=-0.01,
+            )
+            for i, gap in enumerate((0.01, 0.02, 0.03))
+        )
+
+    def test_閾値で絞り込む(self, gf: ModuleType) -> None:
+        pairs = self._pairs(gf)
+        assert gf.bucket_stats(pairs, 0.0).n == 3
+        assert gf.bucket_stats(pairs, 0.015).n == 2
+
+    def test_該当が2件未満ならNone(self, gf: ModuleType) -> None:
+        """標準偏差が計算できないので、無理に数字を出さない。"""
+        pairs = self._pairs(gf)
+        assert gf.bucket_stats(pairs, 0.025) is None
+        assert gf.bucket_stats(pairs, 0.99) is None
+
+    def test_gross_bpsはfade_scoreの平均をbpsにしたもの(self, gf: ModuleType) -> None:
+        pairs = self._pairs(gf)
+        stats = gf.bucket_stats(pairs, 0.0)
+        # 全件が「ギャップと逆に1%」＝ fade_score +0.01 = +100bps
+        assert stats.gross_bps == pytest.approx(100.0)
+
+    def test_netはgrossからコストを引いた値(self, gf: ModuleType) -> None:
+        """**取り違えると「コスト後に残る」という誤った結論になる。**"""
+        pairs = self._pairs(gf)
+        stats = gf.bucket_stats(pairs, 0.0)
+        assert stats.net_bps == pytest.approx(stats.gross_bps - stats.cost_bps)
+        assert stats.cost_bps > 0
+
+    def test_ばらつきがなければt値は無限大にせずstderrゼロで0を返す(
+        self, gf: ModuleType
+    ) -> None:
+        """全件が同じ値だと標準誤差が0になる。ゼロ除算を外に漏らさない。"""
+        pairs = self._pairs(gf)
+        stats = gf.bucket_stats(pairs, 0.0)
+        assert stats.stderr_bps == pytest.approx(0.0)
+        assert stats.t_stat == 0.0
