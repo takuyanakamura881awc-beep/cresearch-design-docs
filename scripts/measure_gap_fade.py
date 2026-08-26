@@ -34,6 +34,7 @@ ORB・VWAP乖離という手元の手がかりは使い切ったので、新し�
 
 from __future__ import annotations
 
+import argparse
 import math
 import statistics
 import sys
@@ -66,13 +67,24 @@ class GapFadePair:
     ギャップ・フェード戦略として実装するなら始値付近で建てることになるので、
     往復コストの見積りもこの価格を基準にする。
     """
+    topix100: bool = False
+    """TOPIX100 構成銘柄か。**呼値が1桁違うのでコストに直接効く**
+    （`autotrader.types.Symbol.is_topix100`・意思決定ログ61）。"""
 
 
-def gap_fade_pairs(daily_bars: dict[str, tuple[Bar, ...]]) -> tuple[GapFadePair, ...]:
+def gap_fade_pairs(
+    daily_bars: dict[str, tuple[Bar, ...]],
+    topix100_codes: frozenset[str] = frozenset(),
+) -> tuple[GapFadePair, ...]:
     """銘柄ごとの日足から、ギャップと当日の値動きのペアを作る。
 
     **銘柄の初日（前日終値がない）は除外する。** 始値・前日終値が0以下の
     日も除外する（0除算対策。`autotrader.regime.daily_range_pct` と同じ規律）。
+
+    Args:
+        daily_bars: 銘柄コード → 日足。
+        topix100_codes: TOPIX100 構成銘柄のコード。**呼値が1桁違う**ので
+            コスト計算で区別する（意思決定ログ61・64）。
     """
     pairs: list[GapFadePair] = []
     for symbol, series in daily_bars.items():
@@ -88,6 +100,7 @@ def gap_fade_pairs(daily_bars: dict[str, tuple[Bar, ...]]) -> tuple[GapFadePair,
                     gap_pct=gap_pct,
                     intraday_return_pct=intraday_return_pct,
                     open_price=today.open,
+                    topix100=symbol in topix100_codes,
                 )
             )
     return tuple(pairs)
@@ -119,7 +132,8 @@ def round_trip_cost_bps(
     net を線形に動かすので、「想定を変えたら結論が変わるのか」を
     確かめられるようにしてある。**既定値は動かさない。**
     """
-    return float(spread_yen(pair.open_price, n_ticks)) / pair.open_price * 10_000.0
+    spread = spread_yen(pair.open_price, n_ticks, topix100=pair.topix100)
+    return float(spread) / pair.open_price * 10_000.0
 
 
 @dataclass(frozen=True)
@@ -281,19 +295,67 @@ def _report_spread_sensitivity(pairs: tuple[GapFadePair, ...]) -> None:
     print("  優位そのものが足りていないので、コストではなく手法側の問題。")
 
 
+def load_topix100() -> tuple[Symbol, ...]:
+    """TOPIX100 構成銘柄。`scripts/measure_topix100.py` が作るキャッシュを読む。"""
+    import json
+
+    path = DATA_ROOT / "master_scale.json"
+    if not path.is_file():
+        raise SystemExit(
+            f"{path} がない。先に python scripts/measure_topix100.py --refresh を実行する"
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    symbols = tuple(
+        Symbol(
+            code=r["code"],
+            name=r["name"],
+            market=r.get("market"),
+            margin_type=r.get("margin_type"),
+            sector=r.get("sector"),
+            scale_category=r.get("scale_category"),
+        )
+        for r in payload["symbols"]
+    )
+    return tuple(s for s in symbols if s.is_topix100)
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--topix100",
+        action="store_true",
+        help=(
+            "TOPIX100 構成銘柄だけで測る（呼値0.1〜0.5円）。"
+            "**大型株でも優位が残るか**を、資金の判断より先に確かめる"
+        ),
+    )
+    args = parser.parse_args()
+
     print("ギャップ・フェード診断（日足のみ・安価な予備検証）")
     print(banner())
 
-    symbols = load_symbols()
     store = BarStore(DATA_ROOT)
+    if args.topix100:
+        symbols = load_topix100()
+        topix100_codes = frozenset(s.code for s in symbols)
+        print(f"  **TOPIX100 のみ**（呼値0.1〜0.5円）: {len(symbols)}銘柄")
+    else:
+        symbols = load_symbols()
+        topix100_codes = frozenset()
+
     daily = {s.code: store.read(s.code, "1d") for s in symbols}
     daily = {c: b for c, b in daily.items() if b}
     print(f"  日足あり: {len(daily)}銘柄")
 
-    pairs = gap_fade_pairs(daily)
+    pairs = gap_fade_pairs(daily, topix100_codes)
     hr("結果")
     report(pairs)
+
+    if args.topix100:
+        print()
+        print("  **これは「資金があれば使えたか」を測っている。** 資金50万円では")
+        print("  99銘柄中92銘柄が株価上限を超える（意思決定ログ64）。")
+        print("  net が負ならその資金判断自体が不要になる。")
     return 0
 
 
