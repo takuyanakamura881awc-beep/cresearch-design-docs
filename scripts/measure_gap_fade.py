@@ -39,7 +39,7 @@ import math
 import statistics
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 
@@ -237,6 +237,45 @@ def trade_side(pair: GapFadePair) -> str:
     return "売建" if pair.gap_pct > 0 else "買建"
 
 
+def market_drift_bps(pairs: tuple[GapFadePair, ...]) -> float:
+    """全ペアの平均 ``始値→終値``（bps）。**日中の相場ドリフト。**
+
+    これが正だと、**ギャップダウンをフェードする側（買建）だけが
+    自動的に得をする**——`fade_score` はギャップダウン日には
+    `始値→終値` そのものだから。フェードの効果ではなく相場の上昇を
+    測っているだけかもしれない、という疑いの出発点。
+    """
+    if not pairs:
+        return 0.0
+    return statistics.fmean(p.intraday_return_pct for p in pairs) * 10_000.0
+
+
+def demean_by_day(pairs: tuple[GapFadePair, ...]) -> tuple[GapFadePair, ...]:
+    """その日の全銘柄の平均 ``始値→終値`` を各銘柄から差し引く。
+
+    **市場全体がその日どちらに動いたかを取り除き、銘柄固有の動きだけを残す。**
+    上昇局面を切り取っただけの見かけの優位と、本物の平均回帰を分けるための操作。
+
+    **事後診断であって、実戦の変種ではない。** その日の市場平均は
+    引けまで分からないので、この控除を実際の売買で行うことはできない
+    （`autotrader.regime` の calm/wild 分類と同じ位置づけ——
+    「なぜ効いたか」の説明には使えるが、エントリー判断には使えない）。
+    先物やETFでヘッジすれば近似はできるが、資金50万円・Stage A では
+    別の話なのでここでは踏み込まない。
+    """
+    by_day: dict[date, list[GapFadePair]] = defaultdict(list)
+    for pair in pairs:
+        by_day[pair.day].append(pair)
+
+    out: list[GapFadePair] = []
+    for group in by_day.values():
+        mean_move = statistics.fmean(p.intraday_return_pct for p in group)
+        out.extend(
+            replace(p, intraday_return_pct=p.intraday_return_pct - mean_move) for p in group
+        )
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class CapacityStats:
     """ある資金額で、この戦略が実際に何をどれだけ建てられるか。
@@ -264,6 +303,7 @@ def capacity_stats(
     capital_yen: int,
     threshold: float = CAPACITY_THRESHOLD_PCT,
     n_ticks: float = DEFAULT_SPREAD_TICKS,
+    universe_days: frozenset[date] | None = None,
 ) -> CapacityStats | None:
     """資金額を固定して、日ごとに枠を埋めていく建玉シミュレーション。
 
@@ -277,6 +317,11 @@ def capacity_stats(
     シグナルが多い日は**ギャップの大きい順**に埋める。乖離が大きいほど
     成績が良いという観測（意思決定ログ56・66）に従った並びで、
     ここで新しいパラメータを作らない。
+
+    ``universe_days`` は営業日の分母を外から与える。**片方の方向だけを
+    渡すとき（買建のみなど）に要る**——その方向のシグナルが1件も出ない日が
+    黙って分母から消えると、建てなかった日を「なかったこと」にしてしまい、
+    月利が過大に出る。
 
     **これは上限見積りであって、バックテストではない。**
 
@@ -297,7 +342,8 @@ def capacity_stats(
     by_day: dict[date, list[GapFadePair]] = defaultdict(list)
     for pair in pairs:
         by_day[pair.day].append(pair)
-    if not by_day:
+    days = sorted(universe_days) if universe_days is not None else sorted(by_day)
+    if not days:
         return None
 
     used_symbols: set[str] = set()
@@ -305,7 +351,7 @@ def capacity_stats(
     slots: list[int] = []
     deployed: list[float] = []
 
-    for day in sorted(by_day):
+    for day in days:
         candidates = sorted(
             (p for p in by_day[day] if abs(p.gap_pct) >= threshold),
             key=lambda p: abs(p.gap_pct),
@@ -414,6 +460,7 @@ def report(pairs: tuple[GapFadePair, ...]) -> None:
     print("  スプレッドはこれより広い。**net が僅差で正でも安心できない。**")
 
     _report_by_side(pairs)
+    _report_drift_adjusted(pairs)
     _report_spread_sensitivity(pairs)
 
 
@@ -447,6 +494,50 @@ def _report_by_side(pairs: tuple[GapFadePair, ...]) -> None:
     print("  分だけ比較の数が増えており、偶然に片寄る余地が生まれている。")
 
 
+def _report_drift_adjusted(pairs: tuple[GapFadePair, ...]) -> None:
+    """買建の優位が銘柄固有なのか、相場の上昇ドリフトなのかを切り分ける。
+
+    **疑う理由**: 方向別に見ると買建だけが閾値とともに単調に伸びた。
+    だが `fade_score` はギャップダウン日には `始値→終値` そのものなので、
+    **日中に平均して上昇するドリフトがあれば買建だけが自動的に得をする**。
+    検証期間（2年）が上昇局面なら、フェードではなく相場を測っただけになる。
+
+    **判定基準（結果を見る前に固定した）**:
+
+    - 控除しても買建の優位がおおむね残り、閾値との単調性も保たれる
+      → 銘柄固有の効果。ギャップは本物の手がかり
+    - 控除で買建が売建の水準まで落ちる
+      → 非対称の正体は相場ドリフト。「ギャップ・フェード」という
+        枠組み自体が誤りで、上昇局面を測っていただけ
+    """
+    if not pairs:
+        return
+    adjusted = demean_by_day(pairs)
+    print()
+    print("  【市場ドリフトの控除】その日の全銘柄の平均 始値→終値 を差し引く")
+    print(f"  全ペアの平均 始値→終値: {market_drift_bps(pairs):+.2f}bps")
+    print("  正なら、ギャップダウンをフェードする側（買建）だけが自動的に得をする。")
+    print()
+    print(
+        f"  {'|ギャップ|下限':<12} {'買建(素)':>10} {'買建(控除)':>11} "
+        f"{'売建(素)':>10} {'売建(控除)':>11}"
+    )
+    print("  " + "-" * 62)
+    for threshold in GAP_BUCKETS_PCT:
+        cells: list[str] = []
+        for subset in (pairs, adjusted):
+            for sign in (-1, 1):
+                side = tuple(p for p in subset if p.gap_pct * sign > 0)
+                stats = bucket_stats(side, threshold)
+                cells.append(f"{stats.net_bps:>+9.2f}b" if stats else f"{'—':>10}")
+        # cells は [買建(素), 売建(素), 買建(控除), 売建(控除)] の順
+        print(f"  {threshold:>10.1%}  {cells[0]} {cells[2]}  {cells[1]} {cells[3]}")
+    print()
+    print("  **これは事後診断であって、実戦の変種ではない。** その日の市場平均は")
+    print("  引けまで分からないので、この控除を実際の売買では行えない。")
+    print("  「なぜ効いたか」の説明に使うだけで、エントリー判断には使えない。")
+
+
 def _report_capacity(pairs: tuple[GapFadePair, ...]) -> None:
     """資金額 → 実際に建てられる量 → 月利、に変換する。
 
@@ -467,6 +558,26 @@ def _report_capacity(pairs: tuple[GapFadePair, ...]) -> None:
     print("  " + "-" * 52)
     for capital in CAPITAL_CANDIDATES_YEN:
         stats = capacity_stats(pairs, capital)
+        if stats is None:
+            continue
+        print(
+            f"  {capital:>9,}円 {stats.symbols_used:>9}銘柄 "
+            f"{stats.mean_slots_filled:>6.2f} "
+            f"{stats.mean_deployed_pct:>7.1f}% "
+            f"{stats.monthly_return_pct:>+9.2f}%"
+        )
+
+    longs = tuple(p for p in pairs if p.gap_pct < 0)
+    all_days = frozenset(p.day for p in pairs)
+    print()
+    print("  【買建のみ】ギャップダウンのフェードだけを建てる")
+    print("  **安全装置#3（ショートのストップ必須）と売建可能銘柄リストを回避できる。**")
+    print("  そのぶんシグナルが半減するので、枠が埋まらず建玉率が落ちる。")
+    print()
+    print(f"  {'資金':>10} {'使えた銘柄':>10} {'枠/日':>7} {'建玉率':>8} {'月利(net)':>10}")
+    print("  " + "-" * 52)
+    for capital in CAPITAL_CANDIDATES_YEN:
+        stats = capacity_stats(longs, capital, universe_days=all_days)
         if stats is None:
             continue
         print(

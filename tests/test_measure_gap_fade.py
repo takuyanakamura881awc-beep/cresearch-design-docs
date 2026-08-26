@@ -21,6 +21,7 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -387,3 +388,127 @@ class TestCapacityStats:
 
     def test_対象日がなければNone(self, gf: ModuleType) -> None:
         assert gf.capacity_stats((), 1_000_000) is None
+
+
+class TestMarketDrift:
+    """買建の優位が銘柄固有か、相場の上昇ドリフトかを切り分ける診断のテスト。
+
+    **ここが壊れると、上昇局面を切り取っただけの見かけの優位を
+    「本物の平均回帰」と誤認する。**
+    """
+
+    def _pair(
+        self,
+        gf: ModuleType,
+        symbol: str,
+        day: date,
+        *,
+        gap: float,
+        move: float,
+    ) -> Any:
+        return gf.GapFadePair(
+            symbol=symbol,
+            day=day,
+            gap_pct=gap,
+            intraday_return_pct=move,
+            open_price=1_000.0,
+        )
+
+    def test_平均の始値から終値をbpsで返す(self, gf: ModuleType) -> None:
+        pairs = (
+            self._pair(gf, "A", DAY1, gap=0.02, move=0.01),
+            self._pair(gf, "B", DAY1, gap=-0.02, move=0.03),
+        )
+        assert gf.market_drift_bps(pairs) == pytest.approx(200.0)
+
+    def test_ペアがなければゼロ(self, gf: ModuleType) -> None:
+        assert gf.market_drift_bps(()) == 0.0
+
+    def test_控除するとその日の平均がゼロになる(self, gf: ModuleType) -> None:
+        pairs = (
+            self._pair(gf, "A", DAY1, gap=0.02, move=0.01),
+            self._pair(gf, "B", DAY1, gap=-0.02, move=0.03),
+        )
+        assert gf.market_drift_bps(gf.demean_by_day(pairs)) == pytest.approx(0.0)
+
+    def test_控除は日ごとに行う(self, gf: ModuleType) -> None:
+        """**日をまたいで平均すると、その日の市場の動きが残ってしまう。**"""
+        pairs = (
+            self._pair(gf, "A", DAY1, gap=0.02, move=0.10),
+            self._pair(gf, "B", DAY1, gap=0.02, move=0.10),
+            self._pair(gf, "A", DAY2, gap=0.02, move=-0.10),
+            self._pair(gf, "B", DAY2, gap=0.02, move=-0.10),
+        )
+        adjusted = gf.demean_by_day(pairs)
+        # 各日で全銘柄が同じ動き ＝ すべて市場要因。控除後は全件ゼロになる
+        assert all(p.intraday_return_pct == pytest.approx(0.0) for p in adjusted)
+
+    def test_控除しても銘柄固有の差は残る(self, gf: ModuleType) -> None:
+        pairs = (
+            self._pair(gf, "A", DAY1, gap=0.02, move=0.03),
+            self._pair(gf, "B", DAY1, gap=0.02, move=0.01),
+        )
+        adjusted = {p.symbol: p.intraday_return_pct for p in gf.demean_by_day(pairs)}
+        assert adjusted["A"] == pytest.approx(0.01)
+        assert adjusted["B"] == pytest.approx(-0.01)
+
+    def test_ギャップと始値は変えない(self, gf: ModuleType) -> None:
+        """控除するのは値動きだけ。**バケット分けの基準を動かさない。**"""
+        pairs = (
+            self._pair(gf, "A", DAY1, gap=0.02, move=0.03),
+            self._pair(gf, "B", DAY1, gap=-0.05, move=0.01),
+        )
+        adjusted = {p.symbol: p for p in gf.demean_by_day(pairs)}
+        assert adjusted["A"].gap_pct == pytest.approx(0.02)
+        assert adjusted["B"].gap_pct == pytest.approx(-0.05)
+        assert adjusted["A"].open_price == pytest.approx(1_000.0)
+
+    def test_上昇ドリフトだけなら控除で買建の優位が消える(self, gf: ModuleType) -> None:
+        """**この診断が答えるべき問いそのもの。**
+
+        全銘柄が一律に +1% 動いた日を作る。素の `fade_score` では
+        ギャップダウン側（買建）が +1%、ギャップアップ側（売建）が -1% に
+        なるが、これはフェードではなく相場が上がっただけ。控除後は
+        両方ゼロになるのが正しい。
+        """
+        pairs = (
+            self._pair(gf, "UP", DAY1, gap=0.03, move=0.01),
+            self._pair(gf, "DOWN", DAY1, gap=-0.03, move=0.01),
+        )
+        raw = {p.symbol: gf.fade_score(p) for p in pairs}
+        assert raw["DOWN"] == pytest.approx(0.01)
+        assert raw["UP"] == pytest.approx(-0.01)
+
+        adjusted = {p.symbol: gf.fade_score(p) for p in gf.demean_by_day(pairs)}
+        assert adjusted["DOWN"] == pytest.approx(0.0)
+        assert adjusted["UP"] == pytest.approx(0.0)
+
+
+class TestCapacityUniverseDays:
+    def test_方向を絞っても営業日の分母が縮まない(self, gf: ModuleType) -> None:
+        """**ここを落とすと月利が過大に出る。**
+
+        買建のシグナルが DAY1 にしかなくても、DAY2 は「建てなかった日」
+        として分母に残さなければならない。
+        """
+        pairs = (
+            gf.GapFadePair(
+                symbol="A", day=DAY1, gap_pct=-0.03, intraday_return_pct=0.01, open_price=1_000.0
+            ),
+            gf.GapFadePair(
+                symbol="A", day=DAY2, gap_pct=0.03, intraday_return_pct=-0.01, open_price=1_000.0
+            ),
+        )
+        longs = tuple(p for p in pairs if p.gap_pct < 0)
+        all_days = frozenset(p.day for p in pairs)
+
+        without = gf.capacity_stats(longs, 1_000_000, threshold=0.02)
+        with_denominator = gf.capacity_stats(
+            longs, 1_000_000, threshold=0.02, universe_days=all_days
+        )
+        assert without.days == 1
+        assert with_denominator.days == 2
+        # 分母が2倍になれば月利は半分になる
+        assert with_denominator.monthly_return_pct == pytest.approx(
+            without.monthly_return_pct / 2
+        )
