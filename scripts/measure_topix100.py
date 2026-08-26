@@ -60,6 +60,7 @@ from autotrader.data.base import (
 )
 from autotrader.data.jquants import FREE_PLAN_DELAY_DAYS, JQuantsDataSource
 from autotrader.data.store import BarStore
+from autotrader.data.yahoo import YahooDataSource
 from autotrader.provenance import banner
 from autotrader.risk.limits import DEFAULT_MAX_WEIGHT_PER_SYMBOL
 from autotrader.risk.sizing import max_affordable_price
@@ -75,6 +76,13 @@ MIN_TURNOVER_YEN = 300_000_000
 """流動性の下限（20日平均売買代金）。`docs/00` 意思決定ログ22 の実測値。"""
 
 TURNOVER_DAYS = 20
+
+DAILY_LOOKBACK_DAYS = 730
+"""日足を遡る暦日数。`scripts/fetch_bars.py` と同じ約2年。
+
+yfinance の日足は期間による追加コストがほぼないので、
+流動性の判定（20営業日）に必要な分より多めに取っておく。
+"""
 
 
 def hr(title: str) -> None:
@@ -235,6 +243,29 @@ def main() -> int:
     print()
 
     store = BarStore(DATA_ROOT)
+
+    # **日足を持っていない銘柄を先に取りに行く。**
+    # `universe.json` は Layer 1 を通った銘柄だけなので、TOPIX100 の
+    # 大半は日足を持っていない。それを「条件で落ちた」と数えると
+    # **測定のアーティファクトを結論と取り違える**（実際に一度踏んだ）。
+    missing = tuple(s.code for s in topix100 if not store.read(s.code, "1d"))
+    if missing:
+        print(f"  日足がない {len(missing)}銘柄を取得する（yfinance・日足は期間の追加コストなし）")
+        yahoo = YahooDataSource()
+        end = date.today()
+        start = end - timedelta(days=DAILY_LOOKBACK_DAYS)
+        try:
+            fetched = yahoo.get_bars_batch(missing, "1d", start, end)
+        except DataSourceError as exc:
+            print(f"  NG: {exc}")
+            return 1
+        saved = 0
+        for code, bars in fetched.items():
+            if bars:
+                store.write(code, "1d", bars)
+                saved += 1
+        print(f"    保存 {saved}銘柄 / 取得できず {len(missing) - saved}銘柄")
+
     passed: list[tuple[Symbol, float, float]] = []
     n_no_bars = 0
     n_too_expensive = 0
@@ -296,8 +327,16 @@ def main() -> int:
           f" → TOPIX100 {statistics.median(fine_bps):.1f}bps")
 
     hr("4. 判定")
-    print(f"  通過銘柄: {len(passed)}")
+    print(f"  通過銘柄: {len(passed)} / TOPIX100 {len(topix100)}銘柄")
     print()
+    if n_no_bars > len(topix100) // 4:
+        # **「データがない」を「条件で落ちた」と混同しない。**
+        # 一度これで「4銘柄しか通らない」と誤読しかけた（意思決定ログ63）
+        print(f"  → **判定不能。** {n_no_bars}銘柄の日足が取れていない。")
+        print("     株価・流動性で落ちたのではなくデータ不足なので、")
+        print("     この数字を「通らなかった」と読んではいけない。")
+        print("     再実行して日足を揃えてから判定する。")
+        return 1
     if len(passed) >= 20:
         print("  → **十分な数が通る。** 既存の手法をこの銘柄群で再検定する価値がある。")
         print("     優位10〜16bps に対しコストが1桁下がるので net の符号が変わりうる。")
