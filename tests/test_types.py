@@ -165,3 +165,40 @@ class TestUniverseEntryStage:
             premarket_volume_ratio=2.1,
         )
         assert entry.gap_pct == 0.012
+
+
+class TestSymbolIsTopix100:
+    """**呼値がTOPIX100かどうかで変わる**ので、判定はコストに直結する。
+
+    900円の銘柄なら通常は呼値1円で往復22bps、TOPIX100 は 0.1円で往復2.2bps
+    （`docs/00-overview.md` 意思決定ログ61）。
+    """
+
+    def test_Core30とLarge70をTOPIX100とみなす(self) -> None:
+        from autotrader.types import Symbol
+
+        for category in ("TOPIX Core30", "TOPIX Large70"):
+            assert Symbol(code="7203", name="x", scale_category=category).is_topix100
+
+    def test_Mid400やSmallは含まない(self) -> None:
+        from autotrader.types import Symbol
+
+        for category in ("TOPIX Mid400", "TOPIX Small 1", "TOPIX Small 2", "-"):
+            assert not Symbol(code="7203", name="x", scale_category=category).is_topix100
+
+    def test_規模区分が不明ならFalse(self) -> None:
+        """**取れていないものを「細かい呼値」と誤認しない。**
+
+        判定を誤ると、コストを実際より小さく見積もる側に倒れる。
+        """
+        from autotrader.types import Symbol
+
+        assert not Symbol(code="7203", name="x").is_topix100
+        assert not Symbol(code="7203", name="x", scale_category="").is_topix100
+
+    def test_表記揺れに耐える(self) -> None:
+        """空白の有無・大文字小文字で判定が変わらないこと。"""
+        from autotrader.types import Symbol
+
+        for category in ("TOPIXCore30", "topix core30", "TOPIX　Large70"):
+            assert Symbol(code="7203", name="x", scale_category=category).is_topix100

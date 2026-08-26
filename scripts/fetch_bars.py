@@ -113,6 +113,9 @@ def save_universe(as_of: date, symbols: tuple[Symbol, ...]) -> None:
                         "market": s.market,
                         "margin_type": s.margin_type,
                         "sector": s.sector,
+                        # **呼値に効く**（TOPIX100 は 0.1〜0.5円）。
+                        # `autotrader.types.Symbol.is_topix100` が判定に使う
+                        "scale_category": s.scale_category,
                     }
                     for s in symbols
                 ],

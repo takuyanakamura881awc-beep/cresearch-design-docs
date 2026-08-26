@@ -144,6 +144,7 @@ def load_symbols() -> tuple[Symbol, ...]:
             market=r.get("market"),
             margin_type=r.get("margin_type"),
             sector=r.get("sector"),
+            scale_category=r.get("scale_category"),
         )
         for r in payload["symbols"]
     )

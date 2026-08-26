@@ -102,6 +102,7 @@ _FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "market": ("MktNm", "MarketCodeName", "MarketName"),
     "margin": ("MrgnNm", "MarginCodeName"),
     "sector": ("S33Nm", "Sector33CodeName"),
+    "scale": ("ScaleCat", "ScaleCategory"),
 }
 """レスポンス項目名の候補。左から順に試し、最初に見つかった値を使う。
 
@@ -437,6 +438,7 @@ class JQuantsDataSource(BarDataSource):
                     market=_as_text(_pick(item, "market")),
                     margin_type=_as_text(_pick(item, "margin")),
                     sector=_as_text(_pick(item, "sector")),
+                    scale_category=_as_text(_pick(item, "scale")),
                 )
             )
         return tuple(symbols)

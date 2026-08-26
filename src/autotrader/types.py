@@ -113,6 +113,34 @@ class Symbol:
     """
     sector: str | None = None
     """33業種区分名。将来のセクター分散に使う"""
+    scale_category: str | None = None
+    """規模区分名（J-Quants の ``ScaleCat``）。
+
+    例: ``"TOPIX Core30"`` / ``"TOPIX Large70"`` / ``"TOPIX Mid400"`` /
+    ``"TOPIX Small 1"`` / ``"TOPIX Small 2"`` / ``"-"``。
+
+    **呼値（`autotrader.tick`）が変わるので、コストに直接効く。**
+    TOPIX100（Core30 + Large70）は呼値が 0.1〜0.5円 と細かく、
+    通常銘柄の1円に対して往復コストが最大10分の1になる
+    （`is_topix100` 参照）。
+    """
+
+    @property
+    def is_topix100(self) -> bool:
+        """TOPIX100（Core30 + Large70）構成銘柄か。
+
+        **呼値が細かい＝往復コストが小さい。** 900円の銘柄なら
+        通常は呼値1円で往復22bps だが、TOPIX100 は 0.1円で往復2.2bps。
+        これまでの実験で見つかった優位が 0〜16bps だったので、
+        **この差は結論を変えうる**（`docs/00-overview.md` 意思決定ログ61）。
+
+        判定は区分名に ``Core30`` / ``Large70`` が含まれるかで行う。
+        表記揺れ（全角・空白の有無）に備えて緩く見る。
+        """
+        if not self.scale_category:
+            return False
+        normalized = self.scale_category.replace(" ", "").replace("　", "").lower()
+        return "core30" in normalized or "large70" in normalized
 
 
 @dataclass(frozen=True)
