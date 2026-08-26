@@ -18,11 +18,16 @@ from __future__ import annotations
 
 import math
 import random
+import statistics
 from datetime import datetime, timedelta
 
 import pytest
 
-from autotrader.spread import corwin_schultz, spread_from_beta_gamma
+from autotrader.spread import (
+    corwin_schultz,
+    corwin_schultz_pooled,
+    spread_from_beta_gamma,
+)
 from autotrader.types import Bar
 
 T0 = datetime(2026, 1, 1)
@@ -245,6 +250,57 @@ class TestCorwinSchultz:
         estimate = corwin_schultz(bars)
         assert estimate is not None
         assert estimate.spread_pct == pytest.approx(0.0, abs=1e-9)
+
+
+class TestCorwinSchultzPooled:
+    """**銘柄ごとに推定して正だけ平均すると壊れる**ので、まとめて解く経路。"""
+
+    def test_合成データで真のスプレッドを復元する(self) -> None:
+        bars_by_symbol = {
+            f"S{i}": _synthetic(0.002, n_days=400, seed=i) for i in range(8)
+        }
+        pooled = corwin_schultz_pooled(bars_by_symbol)
+        assert pooled is not None
+        assert pooled.usable
+        assert 0.0015 < pooled.spread_pct <= 0.0022
+
+    def test_負を捨てないので銘柄ごとの平均より低く出る(self) -> None:
+        """**これがこの関数の存在理由。**
+
+        銘柄ごとの推定は半分近くが負になる。正だけ拾うとノイズで
+        上振れした銘柄だけが残るので、まとめて解いた値より高く出る。
+        真のスプレッドが十分小さいときにその差が現れる。
+        """
+        bars_by_symbol = {
+            f"S{i}": _synthetic(0.0, n_days=300, seed=100 + i) for i in range(12)
+        }
+        pooled = corwin_schultz_pooled(bars_by_symbol)
+        assert pooled is not None
+
+        per_symbol = [
+            e.spread_pct
+            for bars in bars_by_symbol.values()
+            if (e := corwin_schultz(bars)) is not None
+        ]
+        positives = [v for v in per_symbol if v > 0]
+        if positives:
+            # 真が0なのに「正のみ」は正の値を返す。まとめた方が真に近い
+            assert pooled.spread_pct < statistics.median(positives)
+
+    def test_n_pairsは全銘柄の合計(self) -> None:
+        bars_by_symbol = {
+            "A": tuple(_bar(d, high=1010.0 + d, low=990.0 + d) for d in range(5)),
+            "B": tuple(_bar(d, high=2010.0 + d, low=1990.0 + d) for d in range(4)),
+        }
+        pooled = corwin_schultz_pooled(bars_by_symbol)
+        assert pooled is not None
+        assert pooled.n_pairs == 4 + 3
+
+    def test_銘柄が空ならNone(self) -> None:
+        assert corwin_schultz_pooled({}) is None
+
+    def test_使えるペアがなければNone(self) -> None:
+        assert corwin_schultz_pooled({"A": (_bar(0, high=1010.0, low=990.0),)}) is None
 
 
 class TestSpreadEstimate:

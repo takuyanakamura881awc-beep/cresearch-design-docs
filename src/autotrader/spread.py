@@ -96,7 +96,12 @@ from dataclasses import dataclass
 
 from autotrader.types import Bar
 
-__all__ = ["SpreadEstimate", "corwin_schultz", "spread_from_beta_gamma"]
+__all__ = [
+    "SpreadEstimate",
+    "corwin_schultz",
+    "corwin_schultz_pooled",
+    "spread_from_beta_gamma",
+]
 
 _K = 3.0 - 2.0 * math.sqrt(2.0)
 """原著の定数 ``3 − 2√2``。α の式の分母。"""
@@ -203,8 +208,66 @@ class SpreadEstimate:
         return self.spread_pct > 0.0
 
 
+def corwin_schultz_pooled(
+    bars_by_symbol: dict[str, tuple[Bar, ...]],
+) -> SpreadEstimate | None:
+    """複数銘柄をまとめて1つの比例スプレッドに推定する。
+
+    【なぜ銘柄ごとに推定して平均してはいけないのか】
+
+    銘柄ごとの推定値は**半分近くが負になる**（実データで132銘柄中67）。
+    そこで「負を捨てて正だけ平均」すると、**ノイズで上振れした銘柄
+    だけが生き残る**ので推定が壊れる。ペア単位の切り捨てで踏んだのと
+    同じ罠を、銘柄単位で踏むことになる。
+
+    合成データでの実測（銘柄132・各480ペア）:
+
+        真のスプレッド   負の割合   正のみの中央値
+             0bps         87%         +4.8bps
+             5bps         78%         +6.1bps
+            10bps         61%         +5.6bps
+
+    **真が 0bps でも「正のみ」は +4.8bps を返す。** つまり
+    「正のみの中央値」は真の値をほとんど反映しない。
+
+    **全銘柄の β・γ をまとめて平均し、最後に1回だけ解けば、
+    切り捨てが起きないのでこのバイアスは生じない。** 銘柄ごとの
+    ボラティリティの差は残るが、censoring による系統誤差よりはるかに小さい。
+
+    Args:
+        bars_by_symbol: 銘柄コード → 日足列。
+
+    Returns:
+        全銘柄をまとめた推定。使えるペアが1つもなければ ``None``。
+        ``n_pairs`` は全銘柄の合計ペア数。
+    """
+    total_beta = 0.0
+    total_gamma = 0.0
+    n_pairs = 0
+    for bars in bars_by_symbol.values():
+        ordered = sorted(bars, key=lambda b: b.timestamp)
+        for prev, cur in zip(ordered, ordered[1:], strict=False):
+            value = _beta_gamma(prev, cur)
+            if value is None:
+                continue
+            beta, gamma = value
+            total_beta += beta
+            total_gamma += gamma
+            n_pairs += 1
+
+    if n_pairs == 0:
+        return None
+    return SpreadEstimate(
+        n_pairs=n_pairs,
+        spread_pct=spread_from_beta_gamma(total_beta / n_pairs, total_gamma / n_pairs),
+    )
+
+
 def corwin_schultz(bars: tuple[Bar, ...]) -> SpreadEstimate | None:
     """1銘柄の日足列から比例スプレッドを推定する。
+
+    **銘柄ごとの値を集計するときは `corwin_schultz_pooled` を使うこと。**
+    個別の推定値は半分近くが負になり、正だけ拾うと大きく上振れする。
 
     **β・γ を先に平均してから1回だけ解く。** 1ペアずつ解いて平均すると
     推定が壊れる（モジュール docstring の実測を参照）。

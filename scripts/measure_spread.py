@@ -44,9 +44,9 @@ from pathlib import Path
 
 from autotrader.data.store import BarStore
 from autotrader.provenance import banner
-from autotrader.spread import corwin_schultz
+from autotrader.spread import corwin_schultz, corwin_schultz_pooled
 from autotrader.tick import DEFAULT_SPREAD_TICKS, tick_size
-from autotrader.types import Symbol
+from autotrader.types import Bar, Symbol
 
 DATA_ROOT = Path("data")
 
@@ -95,9 +95,10 @@ def main() -> int:
     symbols = load_symbols()
     store = BarStore(DATA_ROOT)
 
-    ticks: list[float] = []
-    bps_values: list[float] = []
-    n_unusable = 0
+    daily: dict[str, tuple[Bar, ...]] = {}
+    prices: list[float] = []
+    per_symbol_bps: list[float] = []
+    n_negative = 0
     n_short = 0
 
     for symbol in symbols:
@@ -110,68 +111,64 @@ def main() -> int:
         if estimate.n_pairs < MIN_PAIRS:
             n_short += 1
             continue
-        if not estimate.usable:
-            # 負の推定値。**0とみなさず、推定不能として数える**
-            n_unusable += 1
-            continue
 
-        # 直近の終値を代表価格にして、呼値の何本ぶんかへ換算する
+        daily[symbol.code] = bars
+        # **負も含めて集める。** 正だけ拾うと上振れする（下記）
+        per_symbol_bps.append(estimate.spread_bps)
+        if not estimate.usable:
+            n_negative += 1
         price = sorted(bars, key=lambda b: b.timestamp)[-1].close
-        if price <= 0:
-            continue
-        spread_yen_estimated = estimate.spread_pct * price
-        ticks.append(spread_yen_estimated / float(tick_size(price)))
-        bps_values.append(estimate.spread_bps)
+        if price > 0:
+            prices.append(price)
 
     hr("結果")
-    print(f"  推定できた銘柄: {len(ticks)}")
-    print(f"  推定不能（負の値）: {n_unusable}")
-    print(f"  日数不足（{MIN_PAIRS}ペア未満）: {n_short}")
+    print(f"  対象銘柄: {len(daily)}（日数不足で除外: {n_short}）")
 
-    if not ticks:
+    if not daily or not prices:
         print()
-        if n_unusable > 0:
-            # **「データがない」と「推定が効かない」を混同しない。**
-            # 前者は取り直せば直るが、後者は推定量が
-            # この銘柄群に合っていないという別の問題
-            print("  **推定が効いていない**（負の値ばかり）。データ不足ではない。")
-            print("  γ（2日通しの高安）が β（各日の高安の和）を上回り続けている。")
-            print("  夜間ギャップの補正が効いていない可能性が高い")
-            print("  （`autotrader.spread` の docstring 参照）。")
-        else:
-            print("  **推定できた銘柄がない。** 先に日足を貯める:")
-            print("    python scripts/fetch_bars.py")
+        print("  **推定できる銘柄がない。** 先に日足を貯める:")
+        print("    python scripts/fetch_bars.py")
         return 1
 
-    print()
-    print(f"  {'':16}{'中央値':>10}{'平均':>10}{'下位25%':>10}{'上位25%':>10}")
-    print("  " + "-" * 56)
-    quantiles_bps = statistics.quantiles(bps_values, n=4) if len(bps_values) >= 4 else None
-    quantiles_ticks = statistics.quantiles(ticks, n=4) if len(ticks) >= 4 else None
-    if quantiles_bps and quantiles_ticks:
-        print(
-            f"  {'スプレッド(bps)':16}{statistics.median(bps_values):>10.1f}"
-            f"{statistics.fmean(bps_values):>10.1f}"
-            f"{quantiles_bps[0]:>10.1f}{quantiles_bps[2]:>10.1f}"
-        )
-        print(
-            f"  {'呼値の本数':16}{statistics.median(ticks):>10.2f}"
-            f"{statistics.fmean(ticks):>10.2f}"
-            f"{quantiles_ticks[0]:>10.2f}{quantiles_ticks[2]:>10.2f}"
-        )
-    else:
-        print(f"  スプレッド(bps) 中央値 {statistics.median(bps_values):.1f}")
-        print(f"  呼値の本数     中央値 {statistics.median(ticks):.2f}")
+    pooled = corwin_schultz_pooled(daily)
+    if pooled is None:
+        print("  **推定できなかった。** 使えるペアが1つもない")
+        return 1
 
-    median_ticks = statistics.median(ticks)
+    median_price = statistics.median(prices)
+    pooled_ticks = pooled.spread_pct * median_price / float(tick_size(median_price))
+
     print()
-    print(f"  **現行の想定: {DEFAULT_SPREAD_TICKS:.1f}本** / 推定の中央値: {median_ticks:.2f}本")
+    print("  【全銘柄をまとめた推定（これを見る）】")
+    print(f"    ペア数        : {pooled.n_pairs:,}")
+    print(f"    スプレッド    : {pooled.spread_bps:.1f}bps")
+    print(f"    呼値の本数    : {pooled_ticks:.2f}本   （代表株価 {median_price:,.0f}円）")
+
     print()
-    if median_ticks < DEFAULT_SPREAD_TICKS * 0.75:
+    print("  【参考: 銘柄ごとに推定した場合】")
+    print(f"    負の推定値    : {n_negative}/{len(per_symbol_bps)}銘柄")
+    positive = [v for v in per_symbol_bps if v > 0]
+    if positive:
+        print(
+            f"    正のみの中央値: {statistics.median(positive):.1f}bps"
+            "  ← **上振れする。使わない**"
+        )
+    print("    **負を捨てて正だけ平均すると、ノイズで上振れした銘柄だけが残る。**")
+    print("    合成データでは真0bpsでも「正のみ」は+4.8bpsを返した。")
+    print("    負の割合そのものは、推定がノイズ床にどれだけ近いかの目安になる。")
+
+    print()
+    print(f"  **現行の想定: {DEFAULT_SPREAD_TICKS:.1f}本** / 推定: {pooled_ticks:.2f}本")
+    print()
+    if not pooled.usable:
+        print("  → **まとめても負。** この銘柄群では推定が効いていない。")
+        print("     想定を動かす根拠にはできない。")
+    elif pooled_ticks < DEFAULT_SPREAD_TICKS * 0.75:
         print("  → 想定より**狭い**。コストを過大に見積もっていた可能性がある。")
         print("     既存の実験は gross は変わらないが net が変わるので再評価が要る。")
-        print("     **ただし推定は下振れする側なので、鵜呑みにして楽観側へ倒さない。**")
-    elif median_ticks > DEFAULT_SPREAD_TICKS * 1.25:
+        print("     **ただし推定は下振れする側。鵜呑みにして楽観側へ倒さない。**")
+        print("     既定値は変えず、まず --spread-ticks で感度を見る。")
+    elif pooled_ticks > DEFAULT_SPREAD_TICKS * 1.25:
         print("  → 想定より**広い**。コストはさらに重く、デイトレの往復は不利。")
         print("     保有期間を延ばすか、コスト構造そのものを見直す段階。")
     else:
