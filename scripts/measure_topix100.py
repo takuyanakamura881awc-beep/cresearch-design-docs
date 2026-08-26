@@ -48,11 +48,17 @@ import argparse
 import json
 import statistics
 import sys
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from autotrader.config import load_credentials, mask
-from autotrader.data.jquants import JQuantsDataSource
+from autotrader.data.base import (
+    DataSourceError,
+    EmptyResponseError,
+    SubscriptionRangeError,
+)
+from autotrader.data.jquants import FREE_PLAN_DELAY_DAYS, JQuantsDataSource
 from autotrader.data.store import BarStore
 from autotrader.provenance import banner
 from autotrader.risk.limits import DEFAULT_MAX_WEIGHT_PER_SYMBOL
@@ -114,6 +120,52 @@ def save_master(symbols: tuple[Symbol, ...]) -> None:
     print(f"  保存: {MASTER_PATH}（{len(symbols)}銘柄）")
 
 
+def fetch_master(source: JQuantsDataSource) -> tuple[Symbol, ...] | None:
+    """規模区分つきの銘柄一覧を取る。**基準日を自分で決める必要がある。**
+
+    `list_symbols` は ``as_of`` を必須にしている（現在の一覧を過去に
+    適用するとサバイバーシップバイアスになるため）。契約範囲は
+    400応答から自動学習されるので、**範囲外を叩いて学習させてから
+    範囲内へ寄せる**のが一番少ないリクエストで済む。
+
+    `fetch_bars.py` は日足を叩いて基準日を探しているが、こちらは
+    銘柄一覧しか要らないので**日足を取りに行かない**（5件/分の制約下で
+    リクエストを無駄にしない）。
+    """
+    probe = date.today() - timedelta(days=FREE_PLAN_DELAY_DAYS)
+    for _ in range(12):
+        while probe.weekday() >= 5:  # 土日は照会しない
+            probe -= timedelta(days=1)
+        try:
+            symbols = source.list_symbols(probe)
+        except SubscriptionRangeError as exc:
+            if exc.covered_to is None:
+                # **範囲を学習できていない。** 手探りで叩き続けない
+                print(f"  NG: 契約範囲が判明しなかった — {exc}")
+                return None
+            # 範囲を学習できたので、その終端へ寄せて仕切り直す
+            print(f"  契約範囲: {exc.covered_from} 〜 {exc.covered_to}")
+            if probe <= exc.covered_to:
+                # 既に範囲内なのに弾かれた＝これ以上寄せても同じ
+                print("  NG: 範囲内のはずが照会できなかった")
+                return None
+            probe = exc.covered_to
+            continue
+        except EmptyResponseError:
+            # 休日など。1日戻して再挑戦する
+            probe -= timedelta(days=1)
+            continue
+        except DataSourceError as exc:
+            print(f"  NG: {exc}")
+            return None
+        if symbols:
+            print(f"  基準日: {probe}")
+            return symbols
+        probe -= timedelta(days=1)
+    print("  NG: 基準日を決められなかった")
+    return None
+
+
 def load_master() -> tuple[Symbol, ...] | None:
     if not MASTER_PATH.is_file():
         return None
@@ -155,8 +207,9 @@ def main() -> int:
             print("  JQUANTS_API_KEY がない（.env を確認する）")
             return 1
         print(f"  JQUANTS_API_KEY: {mask(creds.jquants_api_key)}")
-        source = JQuantsDataSource(creds.jquants_api_key)
-        symbols = source.list_symbols()
+        symbols = fetch_master(JQuantsDataSource(creds.jquants_api_key))
+        if not symbols:
+            return 1
         save_master(symbols)
 
     hr("1. 規模区分の内訳")

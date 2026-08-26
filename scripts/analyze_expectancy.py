@@ -78,7 +78,7 @@ def required_win_rate(edge_per_trade_atr: float) -> float:
 def edge_for_monthly_target(monthly_return: float) -> float:
     """月利目標から1トレードあたりに要る優位（ATR単位）を逆算する。"""
     trades_per_month = TRADES_PER_DAY * BUSINESS_DAYS_PER_MONTH
-    per_trade_equity = (1.0 + monthly_return) ** (1.0 / trades_per_month) - 1.0
+    per_trade_equity = float((1.0 + monthly_return) ** (1.0 / trades_per_month)) - 1.0
     # 建玉は資金の 25%。資金に対する利益率を建玉に対する値幅へ戻す
     per_trade_position = per_trade_equity / MAX_WEIGHT_PER_SYMBOL
     return per_trade_position / MEDIAN_ATR_PCT
@@ -86,7 +86,7 @@ def edge_for_monthly_target(monthly_return: float) -> float:
 
 def monthly_from_period(total_return: float, days: int) -> float:
     """期間リターンを月次（20営業日）に換算する。"""
-    return (1.0 + total_return) ** (BUSINESS_DAYS_PER_MONTH / days) - 1.0
+    return float((1.0 + total_return) ** (BUSINESS_DAYS_PER_MONTH / days)) - 1.0
 
 
 CAPITAL = 500_000.0
@@ -123,7 +123,9 @@ def main() -> None:
     )
 
     measured = MEASURED["ブレーカー無効"]
-    lo, hi = wilson_interval(measured["win_rate"] * measured["trades"], measured["trades"])
+    lo, hi = wilson_interval(
+        measured["win_rate"] * measured["trades"], int(measured["trades"])
+    )
     verdict = "外側（構造的に負けている）" if hi < breakeven else "内側（判定不能）"
     print(f"  実測 {measured['win_rate']:.1%} の信頼区間 [{lo:.1%}, {hi:.1%}] は分岐点の{verdict}")
 

@@ -32,6 +32,13 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# py.typed を同梱して、インストール後も型情報が見えるようにする。
+# これがないと scripts/ から autotrader を import したときに
+# mypy が中身を解析できず、**引数漏れのような単純な誤りを見逃す**
+# （実際に measure_topix100.py の list_symbols() で踏んだ）。
+[tool.setuptools.package-data]
+"autotrader" = ["py.typed"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
@@ -47,7 +54,9 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests"]
+# **scripts も検査する。** 手元で回す実測スクリプトとはいえ、
+# 引数漏れで実行時に落ちるのは検査対象から外していたせい。
+files = ["src", "tests", "scripts"]
 
 # yfinance は型スタブを提供していない（非公式ライブラリ）。
 # 呼び出し箇所は data/yahoo.py に閉じており、境界で Bar に変換している。

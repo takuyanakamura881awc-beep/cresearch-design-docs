@@ -60,12 +60,18 @@ PROBE_SYMBOLS = ("7203", "8306", "9432")
 _WEEKDAYS = "月火水木金土日"
 
 
-def fmt_date(d: date) -> str:
+def fmt_date(d: date | None) -> str:
     """曜日つきで日付を表示する（``2026-05-29(金)``）。
 
     土日が絡む測定値は「ずれた」ように見えるため、曜日を明示して
     誤解を防ぐ。実測の遅延が86日と出たのは 5/31 が日曜だったため。
+
+    ``None`` も受ける。呼び出し側は `SubscriptionRangeError.has_range` で
+    絞り込んでいるが、**それはプロパティなので型検査では追えない**。
+    ここで受けておけば、万一 ``None`` が来ても落ちずにそう表示される。
     """
+    if d is None:
+        return "(不明)"
     return f"{d.isoformat()}({_WEEKDAYS[d.weekday()]})"
 
 
