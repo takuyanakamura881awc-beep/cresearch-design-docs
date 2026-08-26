@@ -38,7 +38,9 @@ import argparse
 import math
 import statistics
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from autotrader.data.store import BarStore
@@ -51,12 +53,42 @@ DATA_ROOT = Path("data")
 GAP_BUCKETS_PCT: tuple[float, ...] = (0.005, 0.010, 0.015, 0.020)
 """ギャップの下限バケット。VWAP乖離のスイープ（0.7/1.0/1.5/2.0%）と同じ刻み方。"""
 
+CAPITAL_CANDIDATES_YEN: tuple[int, ...] = (
+    500_000,
+    800_000,
+    1_200_000,
+    2_000_000,
+    3_000_000,
+)
+"""資金スイープの候補。`scripts/measure_topix100.py` の刻みと揃えてある。"""
+
+MAX_CONCURRENT = 5
+"""同時保有の上限（安全装置#7）。"""
+
+MAX_POSITION_PCT = 0.25
+"""1銘柄あたりの建玉上限（安全装置#7）。**動かさない**（意思決定ログ21）。"""
+
+LOT_SIZE = 100
+"""単元株数。"""
+
+TRADING_DAYS_PER_MONTH = 20
+"""月利への換算に使う営業日数。"""
+
+CAPACITY_THRESHOLD_PCT = 0.020
+"""建玉シミュレーションで使うギャップ下限。**最も net の良いバケット**を使う。"""
+
 
 @dataclass(frozen=True)
 class GapFadePair:
     """1銘柄・1営業日ぶんのギャップとその日の値動き。"""
 
     symbol: str
+    day: date
+    """当日の日付。**同じ日のシグナルをまとめる**ために要る。
+
+    1日に何件シグナルが出るか・同時保有5枠（安全装置#7）が埋まるかは、
+    日をまたいで平均した bps からは分からない。
+    """
     gap_pct: float
     """(当日始値 - 前日終値) / 前日終値。"""
     intraday_return_pct: float
@@ -97,6 +129,7 @@ def gap_fade_pairs(
             pairs.append(
                 GapFadePair(
                     symbol=symbol,
+                    day=today.timestamp.date(),
                     gap_pct=gap_pct,
                     intraday_return_pct=intraday_return_pct,
                     open_price=today.open,
@@ -192,6 +225,124 @@ def bucket_stats(
     )
 
 
+def trade_side(pair: GapFadePair) -> str:
+    """このギャップをフェードするなら、買建と売建のどちらになるか。
+
+    **この区別は集計の都合ではなく、安全装置の適用範囲が変わる。**
+    ギャップアップをフェードする＝**売建**であり、安全装置#3
+    （ショート建玉はストップ注文なしで作らない）と、一般信用デイトレの
+    売建可能銘柄リスト（Stage A では取得できない・`docs/09` §2.5）の
+    両方に縛られる。買建だけで成立するなら、その両方を回避できる。
+    """
+    return "売建" if pair.gap_pct > 0 else "買建"
+
+
+@dataclass(frozen=True)
+class CapacityStats:
+    """ある資金額で、この戦略が実際に何をどれだけ建てられるか。
+
+    **bps は「1回の取引でいくら取れるか」しか言わない。** 月利は
+    「1日に何回建てられるか」「資金のうち何割が建玉になるか」で決まり、
+    それは資金額（＝買える銘柄の株価上限）に強く依存する。
+    """
+
+    capital_yen: int
+    symbols_used: int
+    """実際に1回以上建てられた銘柄数。**分散が効くかの目安**（安全装置#7）。"""
+    days: int
+    """対象営業日数。**シグナルが1件も出ない日も分母に入れる。**"""
+    mean_slots_filled: float
+    """1日あたりに埋まった枠数（上限は ``MAX_CONCURRENT``）。"""
+    mean_deployed_pct: float
+    """1日あたり、資金のうち建玉になった割合。レバ1倍なので100%が上限。"""
+    monthly_return_pct: float
+    """net の月利（%）。**ストップもブレーカーも含まない上限見積り。**"""
+
+
+def capacity_stats(
+    pairs: tuple[GapFadePair, ...],
+    capital_yen: int,
+    threshold: float = CAPACITY_THRESHOLD_PCT,
+    n_ticks: float = DEFAULT_SPREAD_TICKS,
+) -> CapacityStats | None:
+    """資金額を固定して、日ごとに枠を埋めていく建玉シミュレーション。
+
+    守るもの（**安全装置をバイパスしない**）:
+
+    - 1銘柄の建玉 ≤ ``capital_yen × MAX_POSITION_PCT``（安全装置#7）
+    - 同時保有 ≤ ``MAX_CONCURRENT``（安全装置#7）
+    - 建玉総額 ≤ 現金残高（レバレッジ1倍の不変条件）
+    - 単元株（100株）単位でしか建てられない
+
+    シグナルが多い日は**ギャップの大きい順**に埋める。乖離が大きいほど
+    成績が良いという観測（意思決定ログ56・66）に従った並びで、
+    ここで新しいパラメータを作らない。
+
+    **これは上限見積りであって、バックテストではない。**
+
+    - 損切り・利確を含まない（始値で建てて引けで手仕舞うだけ）
+    - ブレーカー三層（安全装置#4〜6）を含まない
+    - 5分足の約定モデルを通していない（日足の始値＝約定価格と仮定）
+    - 売建の可否（一般信用の在庫）を確認していない
+
+    どれも**成績を良い側に倒す**方向の単純化なので、ここで出る月利は
+    実際に得られる値の上限として読む（規約「検証できないものは
+    保守的な側に倒す」の裏返し——楽観側の数字はそう明示する）。
+
+    Returns:
+        対象日が1日もなければ ``None``。
+    """
+    per_position_cap = capital_yen * MAX_POSITION_PCT
+
+    by_day: dict[date, list[GapFadePair]] = defaultdict(list)
+    for pair in pairs:
+        by_day[pair.day].append(pair)
+    if not by_day:
+        return None
+
+    used_symbols: set[str] = set()
+    daily_returns: list[float] = []
+    slots: list[int] = []
+    deployed: list[float] = []
+
+    for day in sorted(by_day):
+        candidates = sorted(
+            (p for p in by_day[day] if abs(p.gap_pct) >= threshold),
+            key=lambda p: abs(p.gap_pct),
+            reverse=True,
+        )
+        cash = float(capital_yen)
+        filled = 0
+        pnl_yen = 0.0
+        exposure = 0.0
+        for pair in candidates:
+            if filled >= MAX_CONCURRENT:
+                break
+            budget = min(per_position_cap, cash)
+            lots = int(budget // (pair.open_price * LOT_SIZE))
+            if lots < 1:
+                continue
+            value = lots * LOT_SIZE * pair.open_price
+            net_pct = fade_score(pair) - round_trip_cost_bps(pair, n_ticks) / 10_000.0
+            pnl_yen += value * net_pct
+            cash -= value
+            exposure += value
+            filled += 1
+            used_symbols.add(pair.symbol)
+        daily_returns.append(pnl_yen / capital_yen)
+        slots.append(filled)
+        deployed.append(exposure / capital_yen)
+
+    return CapacityStats(
+        capital_yen=capital_yen,
+        symbols_used=len(used_symbols),
+        days=len(daily_returns),
+        mean_slots_filled=statistics.fmean(slots),
+        mean_deployed_pct=statistics.fmean(deployed) * 100.0,
+        monthly_return_pct=statistics.fmean(daily_returns) * TRADING_DAYS_PER_MONTH * 100.0,
+    )
+
+
 def load_symbols() -> tuple[Symbol, ...]:
     """`scripts/backtest_take.py` の同名関数と同じ読み込み。
 
@@ -262,7 +413,73 @@ def report(pairs: tuple[GapFadePair, ...]) -> None:
     print("  引けで手仕舞う前提の、最も楽観的な見積り——実際は寄り付き直後の")
     print("  スプレッドはこれより広い。**net が僅差で正でも安心できない。**")
 
+    _report_by_side(pairs)
     _report_spread_sensitivity(pairs)
+
+
+def _report_by_side(pairs: tuple[GapFadePair, ...]) -> None:
+    """買建（ギャップダウンのフェード）と売建（ギャップアップのフェード）に分ける。
+
+    **売建には買建にない制約が2つ乗る**（`trade_side` の docstring 参照）。
+    買建だけで成立するなら、安全装置#3 と売建可能銘柄リストの両方を
+    回避できるので、実装の難易度が大きく下がる。
+
+    **これは診断であって、片方を選ぶ根拠にはまだしない。** 方向で分けた
+    時点で比較の数が増えており、片方が良く見えるのは偶然でも起きる
+    （意思決定ログ45の多重比較補正と同じ問題）。
+    """
+    longs = tuple(p for p in pairs if p.gap_pct < 0)
+    shorts = tuple(p for p in pairs if p.gap_pct > 0)
+    print()
+    print("  【方向別】買建=ギャップダウンのフェード / 売建=ギャップアップのフェード")
+    print("  売建は安全装置#3（ストップ必須）と売建可能銘柄リストに縛られる。")
+    print()
+    print(f"  {'|ギャップ|下限':<12} {'買建 件数':>9} {'net':>9}   {'売建 件数':>9} {'net':>9}")
+    print("  " + "-" * 60)
+    for threshold in GAP_BUCKETS_PCT:
+        lo = bucket_stats(longs, threshold)
+        sh = bucket_stats(shorts, threshold)
+        lo_txt = f"{lo.n:>9} {lo.net_bps:>+8.2f}b" if lo else f"{'—':>9} {'—':>9}"
+        sh_txt = f"{sh.n:>9} {sh.net_bps:>+8.2f}b" if sh else f"{'—':>9} {'—':>9}"
+        print(f"  {threshold:>10.1%}  {lo_txt}   {sh_txt}")
+    print()
+    print("  **片方だけが良くても、それだけで方向を絞らない。** 方向で分けた")
+    print("  分だけ比較の数が増えており、偶然に片寄る余地が生まれている。")
+
+
+def _report_capacity(pairs: tuple[GapFadePair, ...]) -> None:
+    """資金額 → 実際に建てられる量 → 月利、に変換する。
+
+    **これが資金判断に必要だった数字。** これまでの表は bps（1回の
+    取引の取り分）までしか出しておらず、「1日に何回建てられるか」
+    「資金のうち何割が建玉になるか」が抜けていた。月利はその積で決まる。
+    """
+    if not pairs:
+        return
+    print()
+    print(f"  【資金 → 月利】ギャップ下限 {CAPACITY_THRESHOLD_PCT:.1%}・"
+          f"同時{MAX_CONCURRENT}銘柄・1銘柄{MAX_POSITION_PCT:.0%}上限・レバ1倍")
+    print()
+    print(
+        f"  {'資金':>10} {'使えた銘柄':>10} {'枠/日':>7} "
+        f"{'建玉率':>8} {'月利(net)':>10}"
+    )
+    print("  " + "-" * 52)
+    for capital in CAPITAL_CANDIDATES_YEN:
+        stats = capacity_stats(pairs, capital)
+        if stats is None:
+            continue
+        print(
+            f"  {capital:>9,}円 {stats.symbols_used:>9}銘柄 "
+            f"{stats.mean_slots_filled:>6.2f} "
+            f"{stats.mean_deployed_pct:>7.1f}% "
+            f"{stats.monthly_return_pct:>+9.2f}%"
+        )
+    print()
+    print("  **これは上限見積りであって、バックテストではない。**")
+    print("  損切り・ブレーカー三層・5分足の約定モデル・売建の在庫確認を")
+    print("  どれも含んでおらず、すべて成績を良い側に倒す単純化になっている。")
+    print("  **ここで月利が目標に届かないなら、実装すれば必ず下回る。**")
 
 
 def _report_spread_sensitivity(pairs: tuple[GapFadePair, ...]) -> None:
@@ -383,10 +600,13 @@ def main() -> int:
 
     if args.topix100:
         _report_tick_decomposition(pairs)
+
+    hr("資金はいくら要るのか")
+    _report_capacity(pairs)
+    if args.topix100:
         print()
-        print("  **これは「資金があれば使えたか」を測っている。** 資金50万円では")
-        print("  99銘柄中92銘柄が株価上限を超える（意思決定ログ64）。")
-        print("  net が負ならその資金判断自体が不要になる。")
+        print("  資金50万円では TOPIX100 99銘柄中92銘柄が株価上限を超える")
+        print("  （意思決定ログ64）。上の表の「使えた銘柄」がそれを反映する。")
     return 0
 
 
@@ -407,6 +627,7 @@ def _report_tick_decomposition(pairs: tuple[GapFadePair, ...]) -> None:
     as_regular = tuple(
         GapFadePair(
             symbol=p.symbol,
+            day=p.day,
             gap_pct=p.gap_pct,
             intraday_return_pct=p.intraday_return_pct,
             open_price=p.open_price,

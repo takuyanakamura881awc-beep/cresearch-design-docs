@@ -134,29 +134,33 @@ class TestFadeScore:
     def test_ギャップアップして戻れば正(self, gf: ModuleType) -> None:
         """フェード（ギャップ方向と逆に動いた）は正のスコア。"""
         pair = gf.GapFadePair(
-            open_price=1000.0, symbol="A", gap_pct=0.02, intraday_return_pct=-0.01
+            open_price=1000.0, symbol="A", day=DAY1, gap_pct=0.02, intraday_return_pct=-0.01
         )
         assert gf.fade_score(pair) == pytest.approx(0.01)
 
     def test_ギャップアップしてさらに伸びれば負(self, gf: ModuleType) -> None:
         """ギャップ&ゴー（ギャップ方向にさらに伸びた）は負のスコア。"""
-        pair = gf.GapFadePair(open_price=1000.0, symbol="A", gap_pct=0.02, intraday_return_pct=0.01)
+        pair = gf.GapFadePair(
+            open_price=1000.0, symbol="A", day=DAY1, gap_pct=0.02, intraday_return_pct=0.01
+        )
         assert gf.fade_score(pair) == pytest.approx(-0.01)
 
     def test_ギャップダウンして戻れば正(self, gf: ModuleType) -> None:
         pair = gf.GapFadePair(
-            open_price=1000.0, symbol="A", gap_pct=-0.02, intraday_return_pct=0.01
+            open_price=1000.0, symbol="A", day=DAY1, gap_pct=-0.02, intraday_return_pct=0.01
         )
         assert gf.fade_score(pair) == pytest.approx(0.01)
 
     def test_ギャップダウンしてさらに下げれば負(self, gf: ModuleType) -> None:
         pair = gf.GapFadePair(
-            open_price=1000.0, symbol="A", gap_pct=-0.02, intraday_return_pct=-0.01
+            open_price=1000.0, symbol="A", day=DAY1, gap_pct=-0.02, intraday_return_pct=-0.01
         )
         assert gf.fade_score(pair) == pytest.approx(-0.01)
 
     def test_ギャップがゼロなら符号を持たずゼロ(self, gf: ModuleType) -> None:
-        pair = gf.GapFadePair(open_price=1000.0, symbol="A", gap_pct=0.0, intraday_return_pct=0.01)
+        pair = gf.GapFadePair(
+            open_price=1000.0, symbol="A", day=DAY1, gap_pct=0.0, intraday_return_pct=0.01
+        )
         assert gf.fade_score(pair) == 0.0
 
 
@@ -178,7 +182,7 @@ class TestRoundTripCostBps:
         """**コストモデルを診断ごとに作り直していない**ことの確認。"""
         price = 1000.0
         pair = gf.GapFadePair(
-            open_price=price, symbol="A", gap_pct=0.02, intraday_return_pct=-0.01
+            open_price=price, symbol="A", day=DAY1, gap_pct=0.02, intraday_return_pct=-0.01
         )
         expected = float(spread_yen(price)) / price * 10_000.0
         assert gf.round_trip_cost_bps(pair) == pytest.approx(expected)
@@ -186,10 +190,10 @@ class TestRoundTripCostBps:
     def test_安い株ほど往復コストが高い(self, gf: ModuleType) -> None:
         """呼値は絶対額なので、株価が低いほど比率としては重くなる。"""
         cheap = gf.GapFadePair(
-            open_price=500.0, symbol="A", gap_pct=0.02, intraday_return_pct=-0.01
+            open_price=500.0, symbol="A", day=DAY1, gap_pct=0.02, intraday_return_pct=-0.01
         )
         pricey = gf.GapFadePair(
-            open_price=2500.0, symbol="B", gap_pct=0.02, intraday_return_pct=-0.01
+            open_price=2500.0, symbol="B", day=DAY1, gap_pct=0.02, intraday_return_pct=-0.01
         )
         assert gf.round_trip_cost_bps(cheap) > gf.round_trip_cost_bps(pricey)
 
@@ -201,6 +205,7 @@ class TestBucketStats:
             gf.GapFadePair(
                 open_price=1000.0,
                 symbol=f"S{i}",
+                day=DAY1,
                 gap_pct=gap,
                 intraday_return_pct=-0.01,
             )
@@ -239,3 +244,146 @@ class TestBucketStats:
         stats = gf.bucket_stats(pairs, 0.0)
         assert stats.stderr_bps == pytest.approx(0.0)
         assert stats.t_stat == 0.0
+
+
+class TestDay:
+    def test_当日の日付を保持する(self, gf: ModuleType) -> None:
+        """**同じ日のシグナルをまとめる**ために要る（枠が埋まるかの判定）。"""
+        daily_bars = {
+            "A": (
+                _daily_bar("A", DAY1, open_=1000.0, close=1000.0),
+                _daily_bar("A", DAY2, open_=1050.0, close=990.0),
+            ),
+        }
+        pairs = gf.gap_fade_pairs(daily_bars)
+        # ペアは「前日終値 → 当日」なので、日付は**当日**（DAY2）
+        assert pairs[0].day == DAY2
+
+
+class TestTradeSide:
+    def test_ギャップアップのフェードは売建(self, gf: ModuleType) -> None:
+        """**安全装置#3（ストップ必須）が適用される側。**"""
+        pair = gf.GapFadePair(
+            symbol="A", day=DAY1, gap_pct=0.02, intraday_return_pct=-0.01, open_price=1000.0
+        )
+        assert gf.trade_side(pair) == "売建"
+
+    def test_ギャップダウンのフェードは買建(self, gf: ModuleType) -> None:
+        pair = gf.GapFadePair(
+            symbol="A", day=DAY1, gap_pct=-0.02, intraday_return_pct=0.01, open_price=1000.0
+        )
+        assert gf.trade_side(pair) == "買建"
+
+
+class TestCapacityStats:
+    """建玉シミュレーションが安全装置をバイパスしていないことを固定する。
+
+    **ここが緩むと月利が過大に出る。** 1銘柄25%・同時5銘柄・レバ1倍は
+    どれも建てられる量を減らす制約なので、外れると成績が良い側にずれる。
+    """
+
+    def _pair(
+        self,
+        gf: ModuleType,
+        symbol: str,
+        day: date,
+        *,
+        gap: float,
+        move: float,
+        price: float = 1000.0,
+    ) -> object:
+        return gf.GapFadePair(
+            symbol=symbol,
+            day=day,
+            gap_pct=gap,
+            intraday_return_pct=move,
+            open_price=price,
+        )
+
+    def test_同時保有は5銘柄を超えない(self, gf: ModuleType) -> None:
+        """同じ日に10銘柄シグナルが出ても、埋まる枠は5（安全装置#7）。
+
+        資金50万円・株価1,000円なら1単元＝10万円＝資金の20%。5枠で
+        ちょうど100%になるので、**枠の上限だけが効く**状況を作れる。
+        """
+        pairs = tuple(self._pair(gf, f"S{i}", DAY1, gap=0.03, move=-0.01) for i in range(10))
+        stats = gf.capacity_stats(pairs, 500_000, threshold=0.02)
+        assert stats.mean_slots_filled == pytest.approx(5.0)
+        assert stats.mean_deployed_pct == pytest.approx(100.0)
+
+    def test_建玉総額は現金を超えない(self, gf: ModuleType) -> None:
+        """レバレッジ1倍の不変条件。5枠 × 25% = 125% になってはいけない。
+
+        1銘柄上限(25%)だけを守って5枠埋めると125%になる。現金でも
+        止めているので、**枠は4つで打ち止めになるのが正しい**。
+        """
+        pairs = tuple(self._pair(gf, f"S{i}", DAY1, gap=0.03, move=-0.01) for i in range(10))
+        stats = gf.capacity_stats(pairs, 10_000_000, threshold=0.02)
+        assert stats.mean_deployed_pct == pytest.approx(100.0)
+        assert stats.mean_slots_filled == pytest.approx(4.0)
+
+    def test_1銘柄の建玉は資金の四分の一を超えない(self, gf: ModuleType) -> None:
+        """安全装置#7。1銘柄しかシグナルがなくても資金を全部は入れない。"""
+        pairs = (self._pair(gf, "A", DAY1, gap=0.03, move=-0.01, price=1000.0),)
+        stats = gf.capacity_stats(pairs, 1_000_000, threshold=0.02)
+        # 100万円の25% = 25万円 → 1000円 × 100株 = 10万円 なので2単元まで
+        assert stats.mean_deployed_pct == pytest.approx(20.0)
+
+    def test_1単元も買えない株価の銘柄は使われない(self, gf: ModuleType) -> None:
+        """株価上限は資金 × 25% ÷ 100株。**これが TOPIX100 を阻んだ制約。**"""
+        pairs = (self._pair(gf, "A", DAY1, gap=0.03, move=-0.01, price=2_000.0),)
+        # 資金50万円 → 25% = 12.5万円 < 2,000円 × 100株 = 20万円
+        stats = gf.capacity_stats(pairs, 500_000, threshold=0.02)
+        assert stats.symbols_used == 0
+        assert stats.mean_slots_filled == pytest.approx(0.0)
+
+    def test_資金を増やすと使える銘柄が増える(self, gf: ModuleType) -> None:
+        pairs = (
+            self._pair(gf, "CHEAP", DAY1, gap=0.03, move=-0.01, price=1_000.0),
+            self._pair(gf, "PRICEY", DAY1, gap=0.03, move=-0.01, price=3_000.0),
+        )
+        assert gf.capacity_stats(pairs, 500_000, threshold=0.02).symbols_used == 1
+        assert gf.capacity_stats(pairs, 2_000_000, threshold=0.02).symbols_used == 2
+
+    def test_シグナルが出ない日も分母に入る(self, gf: ModuleType) -> None:
+        """**ここを落とすと月利が跳ね上がる。** 建てなかった日はゼロ%の日。"""
+        pairs = (
+            self._pair(gf, "A", DAY1, gap=0.03, move=-0.01),
+            self._pair(gf, "A", DAY2, gap=0.001, move=-0.01),  # 閾値未満
+        )
+        stats = gf.capacity_stats(pairs, 1_000_000, threshold=0.02)
+        assert stats.days == 2
+        assert stats.mean_slots_filled == pytest.approx(0.5)
+
+    def test_ギャップの大きい順に枠を埋める(self, gf: ModuleType) -> None:
+        """候補が枠より多いとき、**|ギャップ| の大きい順**に採る。
+
+        並び順に新しいパラメータを作らず、「乖離が大きいほど良い」という
+        既存の観測（意思決定ログ56・66）に従う。
+
+        検証は結果で行う: 候補6件・枠5件で、**最小ギャップの1件だけが
+        大損する**データを与える。大きい順なら最小ギャップは溢れて
+        除外されるので、損は残らない。順序が逆なら大損が入る。
+        """
+        pairs = (
+            self._pair(gf, "WORST", DAY1, gap=0.021, move=+0.10, price=1_000.0),
+            *(
+                self._pair(gf, f"S{i}", DAY1, gap=gap, move=0.0, price=1_000.0)
+                for i, gap in enumerate((0.03, 0.04, 0.05, 0.06, 0.07))
+            ),
+        )
+        stats = gf.capacity_stats(pairs, 500_000, threshold=0.02)
+        assert stats.mean_slots_filled == pytest.approx(5.0)
+        # 残った5件は値動きゼロなので、損益は往復コスト（1,000円・呼値1円×2本=20bps）だけ。
+        # 100%建玉 × 20bps × 20営業日 = -4%。WORST が入っていれば -40% 規模になる
+        assert stats.monthly_return_pct == pytest.approx(-4.0, abs=0.05)
+
+    def test_コストを引いた後の月利を返す(self, gf: ModuleType) -> None:
+        """**gross ではなく net。** ここを取り違えると全部が正に見える。"""
+        # フェード幅0.01%（=1bps）はコスト（1,000円で呼値1円=10bps）に負ける
+        pairs = (self._pair(gf, "A", DAY1, gap=0.03, move=-0.0001),)
+        stats = gf.capacity_stats(pairs, 1_000_000, threshold=0.02)
+        assert stats.monthly_return_pct < 0
+
+    def test_対象日がなければNone(self, gf: ModuleType) -> None:
+        assert gf.capacity_stats((), 1_000_000) is None
