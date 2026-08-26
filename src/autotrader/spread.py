@@ -51,6 +51,30 @@ Spreads from Daily High and Low Prices.* Journal of Finance, 67(2).
 
 この形で実装している（`corwin_schultz`）。
 
+【実装上の要点2: 夜間ギャップは終値→始値で正確に除く】
+
+**原著どおりの補正（高安が重ならないときだけ平行移動）では、この
+銘柄群では推定不能になる。** 実データ133銘柄すべてが負の推定値を
+返した（意思決定ログ58）。
+
+γ は「2日を通した高安」なので夜間に飛んだぶんがそのまま入るが、
+β は各日の日中レンジの和なので入らない。日本株は夜間（海外市場・
+ニュース）の飛びが大きく、**日中レンジと部分的に重なったまま γ だけを
+押し上げる**ため、原著の条件「完全に離れている」に当てはまらず
+補正が発動しない。結果 γ ≫ β となり α が負に振り切れる。
+
+合成データでの実測（真のスプレッド20bps・日中ボラ2%）:
+
+    夜間ボラ    原著の補正    終値→始値で補正
+      0.0%        18.6bps        18.6bps
+      0.5%         2.9bps        18.6bps
+      1.0%       -34.5bps        18.6bps
+      2.0%      -120.0bps        18.6bps
+
+**原著が高値・安値しか使わないのは、それ以外が無い前提での一般性の
+ためであって、あれば使ってよい。** ``前日終値 → 当日始値`` の比で
+当日の高安を割り戻し、夜間の飛びを正確に除いている（`_beta_gamma`）。
+
 【限界（過信しない）】
 
 - **推定量であって実測ではない。** 板を録れるようになったら
@@ -81,13 +105,34 @@ _K = 3.0 - 2.0 * math.sqrt(2.0)
 def _beta_gamma(previous: Bar, current: Bar) -> tuple[float, float] | None:
     """隣接2日から β（日数に比例する成分）と γ（2日通しの高安）を出す。
 
-    **夜間ギャップを補正する。** 前日の高安と当日の高安が重ならない
-    （ギャップで飛んだ）場合、2日通しの高安がギャップぶんだけ広がり、
-    スプレッドを過大推定する。原著どおり、重ならない分だけ当日の
-    高安を平行移動してから2日通しの高安を取る。
+    【夜間ギャップの除去がこの推定量の生死を分ける】
+
+    γ は「2日を通した高安」なので、**夜間に飛んだぶんがそのまま γ を
+    膨らませる**。一方 β は各日の日中レンジの和なので夜間の飛びを含まない。
+    補正しないと γ ≫ β となり、α が負に振り切れて**推定不能になる**。
+
+    合成データでの実測（真のスプレッド20bps・日中ボラ2%）:
+
+        夜間ボラ    原著の補正    終値→始値で補正
+          0.0%        18.6bps        18.6bps
+          0.5%         2.9bps        18.6bps
+          1.0%       -34.5bps        18.6bps
+          2.0%      -120.0bps        18.6bps
+
+    **原著の補正（高安が重ならないときだけ平行移動）では足りない。**
+    実データで133銘柄すべてが負になり、推定不能だった（意思決定ログ58）。
+    日本株は夜間（海外市場・ニュース）の飛びが大きく、日中レンジと
+    部分的に重なったまま γ だけを押し上げるため、原著の条件
+    「完全に離れている」に当てはまらず補正が発動しない。
+
+    **原著が高値・安値しか使わないのは、それ以外が無い前提での一般性の
+    ためであって、あれば使ってよい。** 我々は始値・終値も持っているので、
+    ``前日終値 → 当日始値`` の比で当日の高安を割り戻し、
+    **夜間の飛びを正確に除く**。これにより2日が連続した価格パスになり、
+    γ が本来意図した「2日ぶんの値動き＋スプレッド」を表すようになる。
 
     Returns:
-        ``(beta, gamma)``。高値・安値が0以下、または高値 < 安値なら ``None``。
+        ``(beta, gamma)``。価格が0以下、または高値 < 安値なら ``None``。
     """
     if previous.low <= 0 or current.low <= 0:
         return None
@@ -97,17 +142,23 @@ def _beta_gamma(previous: Bar, current: Bar) -> tuple[float, float] | None:
     prev_high, prev_low = previous.high, previous.low
     cur_high, cur_low = current.high, current.low
 
-    # 夜間ギャップの補正。重ならないぶんだけ当日を前日側へ寄せる
-    if cur_low > prev_high:
-        shift = cur_low - prev_high
-        cur_high -= shift
-        cur_low -= shift
-    elif cur_high < prev_low:
-        shift = prev_low - cur_high
-        cur_high += shift
-        cur_low += shift
+    if previous.close > 0 and current.open > 0:
+        # **夜間の飛びを比率で正確に除く。** 当日を前日終値の水準へ揃える
+        factor = previous.close / current.open
+        cur_high *= factor
+        cur_low *= factor
+    else:
+        # 始値・終値が使えないときだけ、原著の近似（重ならない分だけ平行移動）
+        if cur_low > prev_high:
+            shift = cur_low - prev_high
+            cur_high -= shift
+            cur_low -= shift
+        elif cur_high < prev_low:
+            shift = prev_low - cur_high
+            cur_high += shift
+            cur_low += shift
 
-    if cur_low <= 0:
+    if cur_low <= 0 or cur_high < cur_low:
         return None
 
     beta = math.log(prev_high / prev_low) ** 2 + math.log(cur_high / cur_low) ** 2

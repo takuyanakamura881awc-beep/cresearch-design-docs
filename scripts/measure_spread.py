@@ -130,8 +130,17 @@ def main() -> int:
 
     if not ticks:
         print()
-        print("  **推定できた銘柄がない。** 先に日足を貯める:")
-        print("    python scripts/fetch_bars.py")
+        if n_unusable > 0:
+            # **「データがない」と「推定が効かない」を混同しない。**
+            # 前者は取り直せば直るが、後者は推定量が
+            # この銘柄群に合っていないという別の問題
+            print("  **推定が効いていない**（負の値ばかり）。データ不足ではない。")
+            print("  γ（2日通しの高安）が β（各日の高安の和）を上回り続けている。")
+            print("  夜間ギャップの補正が効いていない可能性が高い")
+            print("  （`autotrader.spread` の docstring 参照）。")
+        else:
+            print("  **推定できた銘柄がない。** 先に日足を貯める:")
+            print("    python scripts/fetch_bars.py")
         return 1
 
     print()
