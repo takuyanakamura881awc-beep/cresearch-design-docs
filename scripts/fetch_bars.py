@@ -53,11 +53,20 @@ DATA_ROOT = Path("data")
 UNIVERSE_PATH = DATA_ROOT / "universe.json"
 TURNOVER_DAYS = 20
 
-DAILY_LOOKBACK_DAYS = 120
+DAILY_LOOKBACK_DAYS = 730
 """日足を遡る暦日数。
 
-Layer 2 の指標に20営業日ぶん要る（`SelectorConfig.min_bars`）。
-5分足の期間の先頭よりさらに前から確保しないと、検証初日に選定できない。
+**Layer 2 の指標そのものは20営業日ぶんで足りる**（`SelectorConfig.min_bars`）。
+5分足の期間の先頭よりさらに前から確保しないと、検証初日に選定できない、
+というのが本来の下限。
+
+**それより大きく（約2年）取っているのは `measure_gap_fade.py` のため。**
+120日（約85営業日）のままでは、日足診断の強み（J-Quants無料の
+2年分という桁違いの母数）を活かせない——実測でも1銘柄あたり約78日
+しか貯まっておらず、5分足の検証窓（39〜80営業日）に対して2倍程度の
+優位しかなかった。yfinance の日足取得は期間による追加コストが
+ほぼない（`docs/09-data-sources.md` §2.1: 1d=制限なし）ので、
+毎週の取得コストを増やさずに済む。
 """
 
 
