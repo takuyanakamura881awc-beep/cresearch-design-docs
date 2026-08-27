@@ -118,6 +118,13 @@ class IntradayPath:
     """
     prev_close: float | None
     """前日の日足終値。ギャップの計算に要る。銘柄の初日は ``None``。"""
+    entry_prices: tuple[tuple[int, float], ...] = ()
+    """``(遅延分, その時点で建てられる価格)``。
+
+    遅延0は日足の始値（板寄せの約定値）。遅延Nは **9:00 + N分 以降に
+    始まる最初のバーの始値**——それが実際に建てられる最も早い価格。
+    該当するバーが無い遅延は含まない。
+    """
     topix100: bool = False
     """TOPIX100 構成銘柄か。**net 正が出たのはこの銘柄群だけ**（意思決定ログ67）。
 
@@ -179,6 +186,51 @@ class IntradayPath:
         move = (exit_price - entry) / entry * 10_000.0
         return -move if gap > 0 else move
 
+    def fade_with_delay_bps(self, delay_min: int) -> float | None:
+        """``delay_min`` 分遅れて建て、14:50 で手仕舞ったときのフェード（bps）。
+
+        **優位が寄り付き直後の数分に集中しているなら、これは急速に落ちる。**
+        落ちる速さは戦略の成否を直接決める——ギャップは始値が付いて初めて
+        分かるので寄成注文（板寄せ）は使えず、最速でも「始値を見てから
+        成行を出す」形になる（意思決定ログ84）。
+        """
+        gap = self.gap_pct
+        if gap is None or gap == 0:
+            return None
+        entry = dict(self.entry_prices).get(delay_min)
+        if entry is None or entry <= 0:
+            return None
+        move = (self.cutoff_close - entry) / entry * 10_000.0
+        return -move if gap > 0 else move
+
+
+def _entry_prices(
+    daily_open: float, session: list[Bar]
+) -> tuple[tuple[int, float], ...]:
+    """遅延ごとに「実際に建てられる価格」を拾う。
+
+    遅延0は日足の始値をそのまま使う——**板寄せの約定値であり、
+    5分足に9:00のバーが無くても実在する価格**（意思決定ログ82で
+    9:00のバーがある日は0.00bps一致と確認済み）。
+
+    遅延Nは 9:00 + N分 **以降に始まる**最初のバーの始値。
+    「以降」にするのは、その時点でまだ始まっていないバーの価格を
+    使わないため（規約7・ルックアヘッドを構造的に防ぐ）。
+    """
+    out: list[tuple[int, float]] = []
+    open_minutes = SESSION_OPEN.hour * 60 + SESSION_OPEN.minute
+    for delay in ENTRY_DELAYS_MIN:
+        if delay == 0:
+            out.append((0, daily_open))
+            continue
+        target = open_minutes + delay
+        for bar in session:
+            at = bar.timestamp.time()
+            if at.hour * 60 + at.minute >= target and bar.open > 0:
+                out.append((delay, bar.open))
+                break
+    return tuple(out)
+
 
 def intraday_paths(
     daily_bars: dict[str, tuple[Bar, ...]],
@@ -228,6 +280,7 @@ def intraday_paths(
                             first_bar_at=session[0].timestamp.time(),
                             last_bar_at=session[-1].timestamp.time(),
                             bar_count=len(session),
+                            entry_prices=_entry_prices(bar.open, session),
                             prev_close=prev_close,
                             topix100=symbol in topix100_codes,
                         )
@@ -391,6 +444,21 @@ def _report_open_mismatch_cause(paths: tuple[IntradayPath, ...]) -> None:
     print("  **寄り付きのバーが無い日だけずれるなら、5分足側の欠損**で、")
     print("  日足の始値そのものは信用してよい。")
 
+
+SESSION_OPEN = time(9, 0)
+"""東証の寄り付き。"""
+
+ENTRY_DELAYS_MIN: tuple[int, ...] = (0, 5, 15, 30, 60)
+"""エントリー遅延（分）。**優位がどれだけ速く減衰するかを測る。**
+
+0分は日足の始値（＝板寄せの約定値）。**実測では5分遅れるだけで
+19〜26bps 失った**（意思決定ログ84）ので、減衰の速さそのものが
+戦略の成否を決める。
+
+**「数分の遅れに耐えるか」は次の手法探しの設計制約になる。**
+秒単位の執行速度に成否がかかる手法は、意思決定ログ13
+（レイテンシ勝負になる手法ほど個人が不利）の方針から外れる。
+"""
 
 MIN_BARS_FOR_ANALYSIS = 50
 """成績の集計に使う最低のバー本数。
@@ -568,6 +636,60 @@ def _report_gap_fade(paths: tuple[IntradayPath, ...]) -> None:
     print("    そもそも取りに行けない。**ほぼ同じなら**、14:50 の制約は無害")
 
 
+def _report_decay(paths: tuple[IntradayPath, ...]) -> None:
+    """エントリーを遅らせると優位がどう減衰するか。
+
+    **これが次の手法探しに持ち越す資産。** ギャップ・フェードは
+    5分遅れるだけで19〜26bps 失って棄却された（意思決定ログ84）。
+    問題はギャップ固有ではなく**優位が寄り付き直後に集中していること**で、
+    同じ形の手法はすべて同じ理由で死ぬ。
+
+    **秒単位の執行速度に成否がかかる手法は、意思決定ログ13の方針
+    （レイテンシ勝負になる手法ほど個人が不利）から外れる。**
+    今後の候補は「数分の遅れに耐えるか」を先に確かめる。
+    """
+    hr("4. エントリーを遅らせるとどう減衰するか")
+    print("  **ギャップは始値が付いて初めて分かる。** つまり寄成注文")
+    print("  （板寄せに参加する注文）は使えず、最速でも「始値を見てから")
+    print("  成行を出す」形になる。遅延0は理論上の上限。")
+    print()
+
+    matched = [
+        p
+        for p in paths
+        if (g := p.gap_pct) is not None
+        and abs(g) >= GAP_THRESHOLD_PCT
+        and p.bar_count >= MIN_BARS_FOR_ANALYSIS
+    ]
+    groups = (
+        ("全銘柄", tuple(matched)),
+        ("TOPIX100", tuple(p for p in matched if p.topix100)),
+        ("Layer 1", tuple(p for p in matched if not p.topix100)),
+    )
+    header = "  ".join(f"{d:>3}分" for d in ENTRY_DELAYS_MIN)
+    print(f"  {'銘柄群':<10} {header}")
+    print("  " + "-" * (12 + 8 * len(ENTRY_DELAYS_MIN)))
+    for label, group in groups:
+        if len(group) < 2:
+            continue
+        cells: list[str] = []
+        for delay in ENTRY_DELAYS_MIN:
+            samples = tuple(
+                (p.day, v)
+                for p in group
+                if (v := p.fade_with_delay_bps(delay)) is not None
+            )
+            stats = clustered_mean(samples)
+            cells.append(f"{stats.mean_bps:>+6.1f}b" if stats else f"{'—':>7}")
+        print(f"  {label:<10} " + "  ".join(cells))
+
+    print()
+    print("  **落ち方が速いほど、秒単位の執行速度に成否がかかる。**")
+    print("  それは意思決定ログ13（レイテンシ勝負になる手法ほど個人が不利）")
+    print("  の方針から外れる。**今後の候補は「数分の遅れに耐えるか」を")
+    print("  先に確かめる**——耐えないなら、優位があっても採らない。")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args()
@@ -597,6 +719,7 @@ def main() -> int:
     _report_completeness(paths)
     _report_tail(paths)
     _report_gap_fade(paths)
+    _report_decay(paths)
 
     print()
     print("**80営業日を待つ必要があるのは戦略の検証であって、仮定のズレの測定ではない。**")

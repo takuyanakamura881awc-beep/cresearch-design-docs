@@ -305,6 +305,76 @@ class TestFadeFromFirstBar:
         assert path.fade_bps(to_cutoff=True, entry_at_first_bar=True) > 0
 
 
+class TestEntryDelay:
+    """エントリー遅延ごとの価格。**優位の減衰の速さを測る土台。**"""
+
+    def _path(self, mif: ModuleType) -> Any:
+        daily = {
+            "A": (
+                _daily("A", DAY1, open_=1000, close=1000),
+                _daily("A", DAY2, open_=950, close=990),
+            )
+        }
+        # 9:00 のバーは欠損。9:05→960 / 9:15→970 / 9:30→975 / 10:00→985
+        intraday = {
+            "A": (
+                _five_min("A", DAY2, time(9, 5), open_=960, close=962),
+                _five_min("A", DAY2, time(9, 15), open_=970, close=972),
+                _five_min("A", DAY2, time(9, 30), open_=975, close=977),
+                _five_min("A", DAY2, time(10, 0), open_=985, close=987),
+                _five_min("A", DAY2, time(14, 45), open_=988, close=990),
+            )
+        }
+        return mif.intraday_paths(daily, intraday)[0]
+
+    def test_遅延ゼロは日足の始値(self, mif: ModuleType) -> None:
+        """**板寄せの約定値。** 5分足に9:00のバーが無くても実在する価格。"""
+        assert dict(self._path(mif).entry_prices)[0] == pytest.approx(950.0)
+
+    def test_遅延Nはその時刻以降に始まる最初のバー(self, mif: ModuleType) -> None:
+        """**「以降」にするのは、まだ始まっていないバーを使わないため**（規約7）。"""
+        prices = dict(self._path(mif).entry_prices)
+        assert prices[5] == pytest.approx(960.0)
+        assert prices[15] == pytest.approx(970.0)
+        assert prices[30] == pytest.approx(975.0)
+        assert prices[60] == pytest.approx(985.0)
+
+    def test_該当するバーが無い遅延は含まない(self, mif: ModuleType) -> None:
+        daily = {
+            "A": (
+                _daily("A", DAY1, open_=1000, close=1000),
+                _daily("A", DAY2, open_=950, close=990),
+            )
+        }
+        intraday = {"A": (_five_min("A", DAY2, time(9, 5), open_=960, close=990),)}
+        prices = dict(mif.intraday_paths(daily, intraday)[0].entry_prices)
+        assert set(prices) == {0, 5}
+
+    def test_遅らせるほど優位が減る(self, mif: ModuleType) -> None:
+        """**ギャップダウンが戻っていく過程では、遅れるほど取り分が減る。**"""
+        path = self._path(mif)
+        values = [path.fade_with_delay_bps(d) for d in (0, 5, 15, 30, 60)]
+        assert all(v is not None for v in values)
+        assert values == sorted(values, reverse=True)
+
+    def test_該当しない遅延はNone(self, mif: ModuleType) -> None:
+        daily = {
+            "A": (
+                _daily("A", DAY1, open_=1000, close=1000),
+                _daily("A", DAY2, open_=950, close=990),
+            )
+        }
+        intraday = {"A": (_five_min("A", DAY2, time(9, 5), open_=960, close=990),)}
+        path = mif.intraday_paths(daily, intraday)[0]
+        assert path.fade_with_delay_bps(60) is None
+
+    def test_ギャップが無ければNone(self, mif: ModuleType) -> None:
+        daily = {"A": (_daily("A", DAY1, open_=1000, close=1050),)}
+        intraday = {"A": (_five_min("A", DAY1, time(9, 0), open_=1000, close=1020),)}
+        path = mif.intraday_paths(daily, intraday)[0]
+        assert path.fade_with_delay_bps(0) is None
+
+
 class TestClusteredMean:
     def test_日ごとに等ウェイトにする(self, mif: ModuleType) -> None:
         """**該当銘柄が多い日を過大に扱わない**（意思決定ログ72）。"""
