@@ -736,6 +736,13 @@ def _report_capacity(pairs: tuple[GapFadePair, ...]) -> None:
           f"同時{MAX_CONCURRENT}銘柄・1銘柄{MAX_POSITION_PCT:.0%}上限・レバ1倍")
     print()
     print(
+        f"  **この {CAPACITY_THRESHOLD_PCT:.1%} という閾値は net bps が最大だったから"
+        "選んだもので、"
+    )
+    print("  結果を見てから選んだ基準**（意思決定ログ75）。日クラスタの t値では")
+    print("  最も弱いバケットでもある。**下の頑健性の格子と併せて読むこと。**")
+    print()
+    print(
         f"  {'資金':>10} {'銘柄':>7} {'枠/日':>6} {'建玉率':>7} "
         f"{'月利':>8} {'年利':>8} {'Sharpe':>7} {'最悪日':>7} {'BRK':>5} {'最大DD':>8}"
     )
@@ -788,6 +795,69 @@ def _report_capacity(pairs: tuple[GapFadePair, ...]) -> None:
     print("  損切り・ブレーカー三層・5分足の約定モデル・売建の在庫確認を")
     print("  どれも含んでおらず、すべて成績を良い側に倒す単純化になっている。")
     print("  **ここで目標に届かないなら、実装すれば必ず下回る。**")
+
+    _report_threshold_robustness(pairs)
+
+
+def _capacity_grid(
+    pairs: tuple[GapFadePair, ...],
+    label: str,
+    universe_days: frozenset[date] | None = None,
+) -> None:
+    """閾値 × 資金 の格子で、年利とシャープを並べる。
+
+    **閾値を1つに固定しない理由。** 建玉シミュレーションは当初
+    2.0%固定で測っていたが、それは「net bps が最大のバケット」という
+    **結果を見てから選んだ基準**だった。日クラスタの t値を出したところ
+    2.0%は t=0.6（ゼロと区別できない）で、最も強いのは 1.0%（t=3.3）だった
+    （意思決定ログ75）。**閾値の選び方で結論が変わるなら、その結論は
+    採用できない**ので、全バケットを並べて頑健性を見る。
+    """
+    print()
+    print(f"  【{label}】年利 / シャープレシオ")
+    print()
+    header = "  ".join(f"{t:>13.1%}" for t in GAP_BUCKETS_PCT)
+    print(f"  {'資金':>10}  {header}")
+    print("  " + "-" * (12 + 15 * len(GAP_BUCKETS_PCT)))
+    for capital in CAPITAL_CANDIDATES_YEN:
+        cells: list[str] = []
+        for threshold in GAP_BUCKETS_PCT:
+            stats = capacity_stats(
+                pairs, capital, threshold=threshold, universe_days=universe_days
+            )
+            cells.append(
+                f"{stats.annual_return_pct:>+7.1f}%/{stats.sharpe:>4.1f}"
+                if stats
+                else f"{'—':>13}"
+            )
+        print(f"  {capital:>9,}円  " + "  ".join(cells))
+
+
+def _report_threshold_robustness(pairs: tuple[GapFadePair, ...]) -> None:
+    """閾値の選び方と期間の切り方に、結論が耐えるかを見る。
+
+    **これは新しい探索ではなく、既に出した数字の頑健性チェック。**
+    新しい変種を足していないので多重比較の分母は増えない
+    （同じ1つの仮説を、選択の自由度を変えて測り直しているだけ）。
+    """
+    if not pairs:
+        return
+    all_days = frozenset(p.day for p in pairs)
+    _capacity_grid(pairs, "全期間", universe_days=all_days)
+
+    first, second = split_by_period(pairs)
+    if first and second:
+        _capacity_grid(first, "前半", universe_days=frozenset(p.day for p in first))
+        _capacity_grid(second, "後半", universe_days=frozenset(p.day for p in second))
+
+    print()
+    print("  **見るのは「後半」の行。** 前半は事実上 in-sample——閾値も資金も")
+    print("  全期間の数字を見てから決めている。後半で目標（年利25〜35%）に")
+    print("  届かないなら、届いていたのは過去の一区間だけだったということ。")
+    print()
+    print("  **閾値によって結論が変わるなら、その結論は採用しない。**")
+    print("  2.0%固定で測っていたのは net bps が最大だったからで、")
+    print("  それは結果を見てから選んだ基準だった（意思決定ログ75）。")
 
 
 def _report_spread_sensitivity(pairs: tuple[GapFadePair, ...]) -> None:

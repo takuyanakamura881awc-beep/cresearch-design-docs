@@ -722,3 +722,37 @@ class TestCapacityRiskMetrics:
         stats = gf.capacity_stats(pairs, 500_000, threshold=0.02)
         # 1日あたり 20%建玉 × -5%（＋コスト）≒ -1% が2日続く
         assert stats.max_drawdown_pct < stats.worst_day_pct
+
+
+class TestCapacityThresholdDimension:
+    """閾値を1つに固定しない——**2.0%は結果を見てから選んだ基準**（意思決定ログ75）。"""
+
+    def _pair(self, gf: ModuleType, symbol: str, day: date, *, gap: float) -> Any:
+        return gf.GapFadePair(
+            symbol=symbol,
+            day=day,
+            gap_pct=gap,
+            intraday_return_pct=0.01,
+            open_price=1_000.0,
+        )
+
+    def test_閾値を緩めると該当が増える(self, gf: ModuleType) -> None:
+        pairs = (
+            self._pair(gf, "A", DAY1, gap=-0.006),
+            self._pair(gf, "B", DAY1, gap=-0.012),
+            self._pair(gf, "C", DAY1, gap=-0.025),
+        )
+        assert gf.capacity_stats(pairs, 500_000, threshold=0.020).mean_slots_filled == 1.0
+        assert gf.capacity_stats(pairs, 500_000, threshold=0.010).mean_slots_filled == 2.0
+        assert gf.capacity_stats(pairs, 500_000, threshold=0.005).mean_slots_filled == 3.0
+
+    def test_期間で切っても分母はその期間の営業日(self, gf: ModuleType) -> None:
+        """**前半・後半それぞれで年利を出すとき、分母を全期間にしてはいけない。**"""
+        pairs = tuple(
+            self._pair(gf, "A", d, gap=-0.03) for d in (DAY1, DAY2, DAY3, DAY4)
+        )
+        first, second = gf.split_by_period(pairs)
+        stats = gf.capacity_stats(
+            second, 500_000, threshold=0.02, universe_days=frozenset(p.day for p in second)
+        )
+        assert stats.days == 2
