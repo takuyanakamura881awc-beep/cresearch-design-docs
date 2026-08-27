@@ -36,6 +36,7 @@ from datetime import date
 __all__ = [
     "ClusteredStats",
     "clustered_stats",
+    "non_overlapping_days",
     "required_gross_bps",
     "split_days",
 ]
@@ -162,3 +163,35 @@ def required_gross_bps(
     daily = float((1.0 + annual_target) ** (1.0 / days)) - 1.0
     net_bps = daily * horizon_days / deployment * 10_000.0
     return net_bps + cost_bps
+
+
+def non_overlapping_days(days: Iterable[date], horizon: int) -> frozenset[date]:
+    """``horizon`` 営業日保有するときに、**窓が重ならない**エントリー日だけを返す。
+
+    **なぜ要るのか。** 3日保有を毎日エントリーして測ると、D日に建てた玉と
+    D+1・D+2 に建てた玉は**同じ日を共有する**。日クラスタは*エントリー日*で
+    まとめているので、この重なりは打ち消せない——**独立な観測は日数ではなく
+    日数/N ぶんしかない**。
+
+    重なったまま t値を出すと、およそ **√N 倍** 過大に出る。実測では
+    3日保有で t=2.7 と出たが、独立な窓で数えると 1.6 相当だった
+    （`docs/00-overview.md` 意思決定ログ90）。
+
+    **これは意思決定ログ72で直したのと同じ構造の欠陥が、横断方向ではなく
+    時間方向で起きたもの。** 同じ日の銘柄が独立でないのと同様に、
+    重なる保有期間も独立ではない。
+
+    Args:
+        days: 観測のある営業日（重複可）。
+        horizon: 保有営業日数。1 なら全日を返す（重なりが無い）。
+
+    Returns:
+        重ならないエントリー日の集合。先頭から ``horizon`` 日おきに採る。
+
+    Raises:
+        ValueError: ``horizon`` が1未満のとき。
+    """
+    if horizon < 1:
+        raise ValueError("horizon は1以上")
+    ordered = sorted(set(days))
+    return frozenset(ordered[::horizon])

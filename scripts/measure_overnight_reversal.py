@@ -68,6 +68,7 @@ from autotrader.data.store import BarStore
 from autotrader.diagnostics import (
     ClusteredStats,
     clustered_stats,
+    non_overlapping_days,
     required_gross_bps,
     split_days,
 )
@@ -311,30 +312,40 @@ def _report_horizons(pairs: tuple[ReversalPair, ...]) -> None:
         return
     print(f"  対象: |前日リターン| >= {threshold:.1%} の {len(bucket)}件")
     print()
+    print("  **窓が重ならないエントリー日だけを使う。** 3日保有を毎日建てると")
+    print("  D日とD+1日の玉が同じ日を共有し、独立な観測が日数/N しかなくなる")
+    print("  ——重なったまま t値を出すと約√N倍 過大に出る（意思決定ログ90）。")
+    print()
     print(
-        f"  {'保有':>5} {'件数':>8} {'gross':>9} {'コスト':>9} {'net':>9} "
-        f"{'t値(日)':>8} {'必要gross':>10} {'判定':>5}"
+        f"  {'保有':>5} {'独立日':>7} {'gross':>9} {'コスト':>9} {'net':>9} "
+        f"{'net/日':>8} {'年利':>8} {'t値':>6} {'必要':>8} {'判定':>4}"
     )
-    print("  " + "-" * 68)
+    print("  " + "-" * 80)
     for horizon in HORIZONS:
+        entry_days = non_overlapping_days((p.day for p in bucket), horizon)
         samples = tuple(
             (p.day, v * 10_000.0)
             for p in bucket
-            if (v := reversal_score_at(p, horizon)) is not None
+            if p.day in entry_days and (v := reversal_score_at(p, horizon)) is not None
         )
         stats = clustered_stats(samples)
         if stats is None:
             continue
-        cost = statistics.fmean(holding_cost_bps(p, horizon) for p in bucket)
-        need = required_gross_bps(
-            ANNUAL_TARGET, cost_bps=cost, horizon_days=horizon
+        cost = statistics.fmean(
+            holding_cost_bps(p, horizon) for p in bucket if p.day in entry_days
         )
+        need = required_gross_bps(ANNUAL_TARGET, cost_bps=cost, horizon_days=horizon)
+        net = stats.mean_bps - cost
+        per_day = net / horizon
+        annual = (float((1.0 + per_day / 10_000.0) ** 240) - 1.0) * 100.0
         print(
-            f"  {horizon:>4}日 {len(samples):>8} {stats.mean_bps:>+8.2f}b "
-            f"{cost:>8.2f}b {stats.mean_bps - cost:>+8.2f}b {stats.t_stat:>7.1f} "
-            f"{need:>9.1f}b {'○' if stats.mean_bps >= need else '×':>5}"
+            f"  {horizon:>4}日 {stats.days:>7} {stats.mean_bps:>+8.2f}b "
+            f"{cost:>8.2f}b {net:>+8.2f}b {per_day:>+7.2f}b {annual:>+7.1f}% "
+            f"{stats.t_stat:>5.1f} {need:>7.1f}b {'○' if stats.mean_bps >= need else '×':>4}"
         )
     print()
+    print("  **保有期間をまたいで比べられるのは net/日 と年利だけ。**")
+    print(f"  目標は年利{ANNUAL_TARGET:.0%}〜35%（意思決定ログ73）。")
     print("  **必要gross は保有期間にほぼ比例して上がる**（回転が 1/N になるため）。")
     print("  gross がそれより速く伸びなければ、延ばしても目標には近づかない。")
 
@@ -358,18 +369,20 @@ def _report_rate_sensitivity(pairs: tuple[ReversalPair, ...]) -> None:
     print(f"  {'保有':>5} {'gross':>9}   net: {header}")
     print("  " + "-" * 56)
     for horizon in HORIZONS:
+        entry_days = non_overlapping_days((p.day for p in bucket), horizon)
+        window = tuple(p for p in bucket if p.day in entry_days)
         samples = tuple(
             (p.day, v * 10_000.0)
-            for p in bucket
+            for p in window
             if (v := reversal_score_at(p, horizon)) is not None
         )
         stats = clustered_stats(samples)
-        if stats is None:
+        if stats is None or not window:
             continue
         cells: list[str] = []
         for rate in rates:
             cost = statistics.fmean(
-                holding_cost_bps(p, horizon, annual_rate=rate) for p in bucket
+                holding_cost_bps(p, horizon, annual_rate=rate) for p in window
             )
             cells.append(f"{stats.mean_bps - cost:>+6.1f}b")
         nets = "  ".join(cells)

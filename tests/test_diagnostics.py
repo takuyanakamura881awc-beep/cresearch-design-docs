@@ -14,11 +14,16 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
-from autotrader.diagnostics import clustered_stats, required_gross_bps, split_days
+from autotrader.diagnostics import (
+    clustered_stats,
+    non_overlapping_days,
+    required_gross_bps,
+    split_days,
+)
 
 DAY1 = date(2026, 6, 1)
 DAY2 = date(2026, 6, 2)
@@ -159,3 +164,68 @@ class TestRequiredGrossBps:
     def test_建玉率が0以下ならエラー(self) -> None:
         with pytest.raises(ValueError, match="deployment"):
             required_gross_bps(0.25, cost_bps=4.8, deployment=0.0)
+
+
+class TestNonOverlappingDays:
+    """**重なる保有期間は独立ではない。**
+
+    3日保有を毎日建てると、D日とD+1日の玉が同じ日を共有する。
+    重なったまま t値を出すと約√N倍 過大に出る（意思決定ログ90）。
+    """
+
+    def _days(self, n: int) -> list[date]:
+        return [date(2026, 6, 1) + timedelta(days=i) for i in range(n)]
+
+    def test_保有1日なら全日を返す(self) -> None:
+        """**重なりが無いので間引かない。**"""
+        days = self._days(10)
+        assert non_overlapping_days(days, 1) == frozenset(days)
+
+    def test_保有3日なら3日おきに採る(self) -> None:
+        days = self._days(9)
+        assert non_overlapping_days(days, 3) == frozenset(
+            {days[0], days[3], days[6]}
+        )
+
+    def test_独立な観測は日数を保有期間で割った数になる(self) -> None:
+        """**これが t値を√N倍過大にしていた原因。**"""
+        days = self._days(100)
+        assert len(non_overlapping_days(days, 1)) == 100
+        assert len(non_overlapping_days(days, 5)) == 20
+        assert len(non_overlapping_days(days, 10)) == 10
+
+    def test_重複した日は一度だけ数える(self) -> None:
+        """同じ日に複数銘柄の観測があっても、日としては1つ。"""
+        days = self._days(6)
+        assert non_overlapping_days(days * 10, 2) == frozenset(
+            {days[0], days[2], days[4]}
+        )
+
+    def test_順序が乱れていても正しく間引く(self) -> None:
+        days = self._days(6)
+        assert non_overlapping_days(reversed(days), 2) == frozenset(
+            {days[0], days[2], days[4]}
+        )
+
+    def test_保有期間が日数を超えれば先頭だけ(self) -> None:
+        days = self._days(3)
+        assert non_overlapping_days(days, 10) == frozenset({days[0]})
+
+    def test_空なら空(self) -> None:
+        assert non_overlapping_days((), 5) == frozenset()
+
+    def test_保有期間が0以下ならエラー(self) -> None:
+        with pytest.raises(ValueError, match="horizon"):
+            non_overlapping_days(self._days(5), 0)
+
+    def test_重なりを外すとt値が下がる(self) -> None:
+        """**実測で 2.7 → 1.6 相当に落ちた**のと同じ構造を合成データで固定する。"""
+        days = self._days(60)
+        # 同じ値の繰り返しではばらつきが0になるので、日ごとに少しずつ変える
+        samples = [(d, 10.0 + (i % 7)) for i, d in enumerate(days)]
+        overlapping = clustered_stats(samples)
+        kept = non_overlapping_days(days, 5)
+        independent = clustered_stats([(d, v) for d, v in samples if d in kept])
+        assert overlapping is not None and independent is not None
+        assert independent.days < overlapping.days
+        assert abs(independent.t_stat) < abs(overlapping.t_stat)
