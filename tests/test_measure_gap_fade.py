@@ -593,3 +593,132 @@ class TestClusteredStats:
         pairs = (self._pair(gf, "A", DAY1, gap=-0.03, move=0.01),)
         assert gf.clustered_stats(pairs, 0.02) is None
         assert gf.clustered_stats((), 0.02) is None
+
+
+DAY3 = date(2026, 6, 3)
+DAY4 = date(2026, 6, 4)
+
+
+class TestSplitByPeriod:
+    """期間分割。**銘柄ではなく日で切る。**"""
+
+    def _pair(self, gf: ModuleType, symbol: str, day: date) -> Any:
+        return gf.GapFadePair(
+            symbol=symbol,
+            day=day,
+            gap_pct=-0.03,
+            intraday_return_pct=0.01,
+            open_price=1_000.0,
+        )
+
+    def test_営業日の中央で分ける(self, gf: ModuleType) -> None:
+        pairs = tuple(self._pair(gf, "A", d) for d in (DAY1, DAY2, DAY3, DAY4))
+        first, second = gf.split_by_period(pairs)
+        assert [p.day for p in first] == [DAY1, DAY2]
+        assert [p.day for p in second] == [DAY3, DAY4]
+
+    def test_前半と後半は重ならず合わせて全期間になる(self, gf: ModuleType) -> None:
+        pairs = tuple(
+            self._pair(gf, s, d) for d in (DAY1, DAY2, DAY3) for s in ("A", "B")
+        )
+        first, second = gf.split_by_period(pairs)
+        assert set(first).isdisjoint(second)
+        assert len(first) + len(second) == len(pairs)
+
+    def test_同じ日のペアは同じ側に入る(self, gf: ModuleType) -> None:
+        """**日で切るので、同じ日の銘柄がまたがってはいけない。**"""
+        pairs = tuple(
+            self._pair(gf, s, d) for d in (DAY1, DAY2) for s in ("A", "B", "C")
+        )
+        first, second = gf.split_by_period(pairs)
+        assert {p.day for p in first}.isdisjoint({p.day for p in second})
+
+    def test_営業日が1日しかなければ分けない(self, gf: ModuleType) -> None:
+        pairs = (self._pair(gf, "A", DAY1), self._pair(gf, "B", DAY1))
+        first, second = gf.split_by_period(pairs)
+        assert len(first) == 2
+        assert second == ()
+
+    def test_日数が奇数でも取りこぼさない(self, gf: ModuleType) -> None:
+        pairs = tuple(self._pair(gf, "A", d) for d in (DAY1, DAY2, DAY3))
+        first, second = gf.split_by_period(pairs)
+        assert len(first) + len(second) == 3
+        assert len(first) >= 1
+        assert len(second) >= 1
+
+
+class TestCapacityRiskMetrics:
+    """リターンだけでなく、**安全装置と衝突しないか**を測る。"""
+
+    def _pair(self, gf: ModuleType, symbol: str, day: date, *, move: float) -> Any:
+        return gf.GapFadePair(
+            symbol=symbol,
+            day=day,
+            gap_pct=-0.03,
+            intraday_return_pct=move,
+            open_price=1_000.0,
+        )
+
+    def test_日次ブレーカーに達した日を数える(self, gf: ModuleType) -> None:
+        """**シミュレーションはブレーカーを適用しない。** 数えるだけ。
+
+        資金50万・株価1,000円なら1単元＝資金の20%。-15% 動けば -3% の日になる。
+        """
+        pairs = (
+            self._pair(gf, "A", DAY1, move=-0.15),
+            self._pair(gf, "A", DAY2, move=+0.15),
+        )
+        stats = gf.capacity_stats(pairs, 500_000, threshold=0.02)
+        assert stats.days == 2
+        assert stats.breaker_days == 1
+        assert stats.worst_day_pct < -2.0
+
+    def test_ブレーカーに達しなければゼロ(self, gf: ModuleType) -> None:
+        pairs = (
+            self._pair(gf, "A", DAY1, move=0.01),
+            self._pair(gf, "A", DAY2, move=0.01),
+        )
+        assert gf.capacity_stats(pairs, 500_000, threshold=0.02).breaker_days == 0
+
+    def test_年利は月利の複利換算(self, gf: ModuleType) -> None:
+        """**12倍ではない。** 月利3%は年利36%ではなく42.6%。"""
+        pairs = (
+            self._pair(gf, "A", DAY1, move=0.01),
+            self._pair(gf, "A", DAY2, move=0.02),
+        )
+        stats = gf.capacity_stats(pairs, 500_000, threshold=0.02)
+        expected = ((1.0 + stats.monthly_return_pct / 100.0) ** 12 - 1.0) * 100.0
+        assert stats.annual_return_pct == pytest.approx(expected)
+
+    def test_変動がなければシャープはゼロにする(self, gf: ModuleType) -> None:
+        """ゼロ除算を外に漏らさない。"""
+        pairs = (
+            self._pair(gf, "A", DAY1, move=0.01),
+            self._pair(gf, "A", DAY2, move=0.01),
+        )
+        stats = gf.capacity_stats(pairs, 500_000, threshold=0.02)
+        assert stats.daily_stdev_pct == pytest.approx(0.0)
+        assert stats.sharpe == 0.0
+
+    def test_同じリターンでも変動が大きいほどシャープが低い(self, gf: ModuleType) -> None:
+        """**リターンだけを追うと高リスク手法を選んでしまう**（意思決定ログ9）。"""
+
+        def build(swing: float) -> tuple[object, ...]:
+            return (
+                self._pair(gf, "A", DAY1, move=0.02 + swing),
+                self._pair(gf, "A", DAY2, move=0.02 - swing),
+            )
+
+        calm = gf.capacity_stats(build(0.005), 500_000, threshold=0.02)
+        wild = gf.capacity_stats(build(0.05), 500_000, threshold=0.02)
+        assert calm.monthly_return_pct == pytest.approx(wild.monthly_return_pct)
+        assert calm.sharpe > wild.sharpe
+
+    def test_最大DDは連敗を積み上げた値(self, gf: ModuleType) -> None:
+        pairs = (
+            self._pair(gf, "A", DAY1, move=-0.05),
+            self._pair(gf, "A", DAY2, move=-0.05),
+        )
+        stats = gf.capacity_stats(pairs, 500_000, threshold=0.02)
+        # 1日あたり 20%建玉 × -5%（＋コスト）≒ -1% が2日続く
+        assert stats.max_drawdown_pct < stats.worst_day_pct

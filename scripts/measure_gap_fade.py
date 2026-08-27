@@ -74,6 +74,12 @@ LOT_SIZE = 100
 TRADING_DAYS_PER_MONTH = 20
 """月利への換算に使う営業日数。"""
 
+TRADING_DAYS_PER_YEAR = 245
+"""年利・シャープレシオへの換算に使う営業日数。"""
+
+DAILY_BREAKER_PCT = -0.02
+"""日次ブレーカー（安全装置#4）。この損失に達した日は当日の取引を止める。"""
+
 CAPACITY_THRESHOLD_PCT = 0.020
 """建玉シミュレーションで使うギャップ下限。**最も net の良いバケット**を使う。"""
 
@@ -296,6 +302,37 @@ class CapacityStats:
     """1日あたり、資金のうち建玉になった割合。レバ1倍なので100%が上限。"""
     monthly_return_pct: float
     """net の月利（%）。**ストップもブレーカーも含まない上限見積り。**"""
+    daily_stdev_pct: float
+    """日次リターンの標準偏差（%）。**リターンだけ見ても運か実力か分からない。**"""
+    worst_day_pct: float
+    """最悪の1日（%）。"""
+    breaker_days: int
+    """日次ブレーカー（-2%・安全装置#4）に達した日数。
+
+    **シミュレーションはブレーカーを適用していない。** ここで数えているのは
+    「もし動かしていたら何日で強制停止していたか」であり、多いほど
+    **戦略が安全装置の設計前提と衝突している**ことを意味する。
+    """
+    max_drawdown_pct: float
+    """日次リターンを積み上げたときの最大下落幅（%）。累積DD(-15%・安全装置#6)と比べる。"""
+
+    @property
+    def annual_return_pct(self) -> float:
+        """年利（%）。**目標は年利25〜35%**（意思決定ログ73）。"""
+        monthly = self.monthly_return_pct / 100.0
+        return (float((1.0 + monthly) ** 12.0) - 1.0) * 100.0
+
+    @property
+    def sharpe(self) -> float:
+        """年率シャープレシオ。**このプロジェクトの評価軸**（意思決定ログ9）。
+
+        無リスク金利は0とみなす（`report/metrics.py` と同じ扱い）。
+        リターンだけを追うと、たまたま勝った高リスク手法を選んでしまう。
+        """
+        if self.daily_stdev_pct <= 0:
+            return 0.0
+        daily_mean = self.monthly_return_pct / TRADING_DAYS_PER_MONTH
+        return daily_mean / self.daily_stdev_pct * math.sqrt(TRADING_DAYS_PER_YEAR)
 
 
 def capacity_stats(
@@ -379,6 +416,14 @@ def capacity_stats(
         slots.append(filled)
         deployed.append(exposure / capital_yen)
 
+    equity = 1.0
+    peak = 1.0
+    drawdown = 0.0
+    for daily in daily_returns:
+        equity *= 1.0 + daily
+        peak = max(peak, equity)
+        drawdown = min(drawdown, equity / peak - 1.0)
+
     return CapacityStats(
         capital_yen=capital_yen,
         symbols_used=len(used_symbols),
@@ -386,6 +431,12 @@ def capacity_stats(
         mean_slots_filled=statistics.fmean(slots),
         mean_deployed_pct=statistics.fmean(deployed) * 100.0,
         monthly_return_pct=statistics.fmean(daily_returns) * TRADING_DAYS_PER_MONTH * 100.0,
+        daily_stdev_pct=(
+            statistics.stdev(daily_returns) * 100.0 if len(daily_returns) > 1 else 0.0
+        ),
+        worst_day_pct=min(daily_returns) * 100.0,
+        breaker_days=sum(1 for d in daily_returns if d <= DAILY_BREAKER_PCT),
+        max_drawdown_pct=drawdown * 100.0,
     )
 
 
@@ -522,6 +573,7 @@ def report(pairs: tuple[GapFadePair, ...]) -> None:
     print("  スプレッドはこれより広い。**net が僅差で正でも安心できない。**")
 
     _report_by_side(pairs)
+    _report_period_split(pairs)
     _report_drift_adjusted(pairs)
     _report_spread_sensitivity(pairs)
 
@@ -554,6 +606,76 @@ def _report_by_side(pairs: tuple[GapFadePair, ...]) -> None:
     print()
     print("  **片方だけが良くても、それだけで方向を絞らない。** 方向で分けた")
     print("  分だけ比較の数が増えており、偶然に片寄る余地が生まれている。")
+
+
+def split_by_period(
+    pairs: tuple[GapFadePair, ...],
+) -> tuple[tuple[GapFadePair, ...], tuple[GapFadePair, ...]]:
+    """営業日の中央で前半・後半に二分する。
+
+    **`--stress-test` で竹にかけた規律を、ギャップにも適用する**
+    （意思決定ログ46）。片方の期間だけで勝っていれば偶然を疑う。
+
+    **銘柄ではなく日で切る。** 日数の中央値で分けるので、
+    片方に日が偏らない（該当件数は偏りうる——それ自体が情報になる）。
+    """
+    days = sorted({p.day for p in pairs})
+    if len(days) < 2:
+        return (pairs, ())
+    boundary = days[len(days) // 2]
+    first = tuple(p for p in pairs if p.day < boundary)
+    second = tuple(p for p in pairs if p.day >= boundary)
+    return (first, second)
+
+
+def _report_period_split(pairs: tuple[GapFadePair, ...]) -> None:
+    """前半・後半で効果が安定しているかを見る。
+
+    **判定基準（結果を見る前に固定した）**:
+
+    - **両期間とも net が正で、かつ閾値との単調性が両方で保たれる**
+      → 期間に依存しない効果。次の検証に進む価値がある
+    - **片方の期間だけが正、または符号が入れ替わる**
+      → 特定の局面を切り取っただけ。棄却
+
+    竹の `--stress-test` では前半66%・後半87%と両方が正だったが、
+    それでも全期間の閾値（99%）に届かず棄却した（意思決定ログ46）。
+    **期間分割は「通れば合格」ではなく「落とすための試験」。**
+    """
+    if not pairs:
+        return
+    first, second = split_by_period(pairs)
+    if not first or not second:
+        print()
+        print("  【期間分割】営業日が足りず判定不能")
+        return
+
+    first_days = sorted({p.day for p in first})
+    second_days = sorted({p.day for p in second})
+    print()
+    print("  【期間分割】前半・後半で効果が安定しているか")
+    print(f"  前半 {first_days[0]}〜{first_days[-1]}（{len(first_days)}営業日）")
+    print(f"  後半 {second_days[0]}〜{second_days[-1]}（{len(second_days)}営業日）")
+    print()
+    print(
+        f"  {'|ギャップ|下限':<12} {'前半 件数':>9} {'net':>9} {'t値(日)':>8}   "
+        f"{'後半 件数':>9} {'net':>9} {'t値(日)':>8}"
+    )
+    print("  " + "-" * 76)
+    for threshold in GAP_BUCKETS_PCT:
+        cells: list[str] = []
+        for subset in (first, second):
+            stats = bucket_stats(subset, threshold)
+            clustered = clustered_stats(subset, threshold)
+            if stats is None:
+                cells.append(f"{'—':>9} {'—':>9} {'—':>8}")
+                continue
+            t_txt = f"{clustered.t_stat:>7.1f}" if clustered else f"{'—':>8}"
+            cells.append(f"{stats.n:>9} {stats.net_bps:>+8.2f}b {t_txt}")
+        print(f"  {threshold:>10.1%}  {cells[0]}   {cells[1]}")
+    print()
+    print("  **片方の期間だけが正、または符号が入れ替わるなら棄却。**")
+    print("  期間分割は「通れば合格」ではなく**落とすための試験**（意思決定ログ46）。")
 
 
 def _report_drift_adjusted(pairs: tuple[GapFadePair, ...]) -> None:
@@ -614,19 +736,20 @@ def _report_capacity(pairs: tuple[GapFadePair, ...]) -> None:
           f"同時{MAX_CONCURRENT}銘柄・1銘柄{MAX_POSITION_PCT:.0%}上限・レバ1倍")
     print()
     print(
-        f"  {'資金':>10} {'使えた銘柄':>10} {'枠/日':>7} "
-        f"{'建玉率':>8} {'月利(net)':>10}"
+        f"  {'資金':>10} {'銘柄':>7} {'枠/日':>6} {'建玉率':>7} "
+        f"{'月利':>8} {'年利':>8} {'Sharpe':>7} {'最悪日':>7} {'BRK':>5} {'最大DD':>8}"
     )
-    print("  " + "-" * 52)
+    print("  " + "-" * 86)
     for capital in CAPITAL_CANDIDATES_YEN:
         stats = capacity_stats(pairs, capital)
         if stats is None:
             continue
         print(
-            f"  {capital:>9,}円 {stats.symbols_used:>9}銘柄 "
-            f"{stats.mean_slots_filled:>6.2f} "
-            f"{stats.mean_deployed_pct:>7.1f}% "
-            f"{stats.monthly_return_pct:>+9.2f}%"
+            f"  {capital:>9,}円 {stats.symbols_used:>6} "
+            f"{stats.mean_slots_filled:>6.2f} {stats.mean_deployed_pct:>6.1f}% "
+            f"{stats.monthly_return_pct:>+7.2f}% {stats.annual_return_pct:>+7.1f}% "
+            f"{stats.sharpe:>7.2f} {stats.worst_day_pct:>+6.2f}% "
+            f"{stats.breaker_days:>5} {stats.max_drawdown_pct:>+7.1f}%"
         )
 
     longs = tuple(p for p in pairs if p.gap_pct < 0)
@@ -636,23 +759,35 @@ def _report_capacity(pairs: tuple[GapFadePair, ...]) -> None:
     print("  **安全装置#3（ショートのストップ必須）と売建可能銘柄リストを回避できる。**")
     print("  そのぶんシグナルが半減するので、枠が埋まらず建玉率が落ちる。")
     print()
-    print(f"  {'資金':>10} {'使えた銘柄':>10} {'枠/日':>7} {'建玉率':>8} {'月利(net)':>10}")
-    print("  " + "-" * 52)
+    print(
+        f"  {'資金':>10} {'銘柄':>7} {'枠/日':>6} {'建玉率':>7} "
+        f"{'月利':>8} {'年利':>8} {'Sharpe':>7} {'最悪日':>7} {'BRK':>5} {'最大DD':>8}"
+    )
+    print("  " + "-" * 86)
     for capital in CAPITAL_CANDIDATES_YEN:
         stats = capacity_stats(longs, capital, universe_days=all_days)
         if stats is None:
             continue
         print(
-            f"  {capital:>9,}円 {stats.symbols_used:>9}銘柄 "
-            f"{stats.mean_slots_filled:>6.2f} "
-            f"{stats.mean_deployed_pct:>7.1f}% "
-            f"{stats.monthly_return_pct:>+9.2f}%"
+            f"  {capital:>9,}円 {stats.symbols_used:>6} "
+            f"{stats.mean_slots_filled:>6.2f} {stats.mean_deployed_pct:>6.1f}% "
+            f"{stats.monthly_return_pct:>+7.2f}% {stats.annual_return_pct:>+7.1f}% "
+            f"{stats.sharpe:>7.2f} {stats.worst_day_pct:>+6.2f}% "
+            f"{stats.breaker_days:>5} {stats.max_drawdown_pct:>+7.1f}%"
         )
+    print()
+    print("  BRK = 日次ブレーカー(-2%・安全装置#4)に達した日数。**シミュレーションは")
+    print("  ブレーカーを適用していない**ので、これは「動かしていたら何日で強制停止")
+    print("  していたか」。多いほど**戦略が安全装置の設計前提と衝突している**。")
+    print()
+    print("  **目標は年利25〜35%**（意思決定ログ73）。ただし合格の門はリターンではなく")
+    print("  **シャープレシオ**（`docs/07` §2・意思決定ログ9）——リターンだけを追うと、")
+    print("  たまたま勝った高リスク手法を選んでしまう。")
     print()
     print("  **これは上限見積りであって、バックテストではない。**")
     print("  損切り・ブレーカー三層・5分足の約定モデル・売建の在庫確認を")
     print("  どれも含んでおらず、すべて成績を良い側に倒す単純化になっている。")
-    print("  **ここで月利が目標に届かないなら、実装すれば必ず下回る。**")
+    print("  **ここで目標に届かないなら、実装すれば必ず下回る。**")
 
 
 def _report_spread_sensitivity(pairs: tuple[GapFadePair, ...]) -> None:

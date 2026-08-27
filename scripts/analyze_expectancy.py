@@ -37,6 +37,17 @@ MEDIAN_ATR_PCT = 0.0333  # 実測（scripts/measure_universe.py §7 の中央値
 MAX_WEIGHT_PER_SYMBOL = 0.25  # 安全装置 #7
 TRADES_PER_DAY = 13.0  # 実測 12.7〜13
 BUSINESS_DAYS_PER_MONTH = 20
+MONTHS_PER_YEAR = 12
+
+ANNUAL_TARGET = 0.25
+"""目標リターン（年利）。**人間が決める**（`CLAUDE.md`「人間が判断すること」）。
+
+2026-08-27 に月利5%（年利79.6%）から年利25〜35%へ変更した（意思決定ログ73）。
+月利3%でも年利42.6%になり、月利ベースの目標は年利で見ると過大だった。
+"""
+
+ANNUAL_STRETCH = 0.35
+"""ストレッチ目標（年利）。"""
 
 # --- 実測（scripts/backtest_take.py の出力を転記） ---
 MEASURED = {
@@ -73,6 +84,15 @@ def required_win_rate(edge_per_trade_atr: float) -> float:
     """
     numerator = STOP_ATR_MULT + cost_in_atr() + edge_per_trade_atr
     return numerator / (TAKE_PROFIT_ATR_MULT + STOP_ATR_MULT)
+
+
+def monthly_from_annual(annual_return: float) -> float:
+    """年利から月利へ。**複利で割り戻す**（12で割らない）。
+
+    年利25% は月利 2.08% ではなく **1.88%**。この差は小さく見えるが、
+    1トレードあたりに要る優位に落とすと効いてくる。
+    """
+    return float((1.0 + annual_return) ** (1.0 / MONTHS_PER_YEAR)) - 1.0
 
 
 def edge_for_monthly_target(monthly_return: float) -> float:
@@ -131,22 +151,30 @@ def main() -> None:
 
     print()
     print(
-        f"■ 月利目標に要る勝率"
+        f"■ 目標に要る勝率"
         f"（1日{TRADES_PER_DAY:.0f}トレード × {BUSINESS_DAYS_PER_MONTH}営業日）"
     )
-    for target in (0.0, 0.05, 0.10):
-        edge = edge_for_monthly_target(target)
+    print(f"  目標は**年利** {ANNUAL_TARGET:.0%}〜{ANNUAL_STRETCH:.0%}（意思決定ログ73）")
+    for annual in (0.0, ANNUAL_TARGET, ANNUAL_STRETCH):
+        monthly = monthly_from_annual(annual)
+        edge = edge_for_monthly_target(monthly)
         need = required_win_rate(edge)
-        print(f"  月利 {target:+.0%} → 1トレード {edge:+.4f} ATR → 勝率 **{need:.1%}**")
+        print(
+            f"  年利 {annual:+.0%}（月利 {monthly:+.2%}） → "
+            f"1トレード {edge:+.4f} ATR → 勝率 **{need:.1%}**"
+        )
 
     gap_be = breakeven - measured["win_rate"]
-    gap_5 = required_win_rate(edge_for_monthly_target(0.05)) - breakeven
+    target_monthly = monthly_from_annual(ANNUAL_TARGET)
+    gap_target = required_win_rate(edge_for_monthly_target(target_monthly)) - breakeven
     print()
     print(
         f"  実測 {measured['win_rate']:.1%} → 損益分岐 {breakeven:.1%} まで "
         f"{gap_be * 100:.1f}ポイント"
     )
-    print(f"  損益分岐 → 月利+5% は わずか {gap_5 * 100:.1f}ポイント")
+    print(
+        f"  損益分岐 → 年利+{ANNUAL_TARGET:.0%} は わずか {gap_target * 100:.1f}ポイント"
+    )
     print("  **薄い優位を1ヶ月260回で増幅する設計。勝率にもコスト見積りにも敏感。**")
 
     print()
@@ -174,13 +202,16 @@ def main() -> None:
     print()
     print("■ 呼値モデルでの損益分岐（株価帯ごと）")
     print("  同じ ATR% なら株価が高いほどコストが軽く、分岐点が下がる")
-    print(f"  {'株価':>7} {'スプレッド':>10} {'往復(ATR)':>10} {'損益分岐':>9} {'月利+5%':>9}")
+    print(
+        f"  {'株価':>7} {'スプレッド':>10} {'往復(ATR)':>10} "
+        f"{'損益分岐':>9} {f'年利+{ANNUAL_TARGET:.0%}':>9}"
+    )
     print("  " + "-" * 52)
     for price in (400.0, 600.0, 1000.0, 1250.0, 1600.0, 2200.0):
         cost = round_trip_cost_atr(price, price * MEDIAN_ATR_PCT)
         be = (STOP_ATR_MULT + cost) / (TAKE_PROFIT_ATR_MULT + STOP_ATR_MULT)
         target = (
-            STOP_ATR_MULT + cost + edge_for_monthly_target(0.05)
+            STOP_ATR_MULT + cost + edge_for_monthly_target(monthly_from_annual(ANNUAL_TARGET))
         ) / (TAKE_PROFIT_ATR_MULT + STOP_ATR_MULT)
         print(
             f"  {price:>6,.0f}円 {float(spread_yen(price)):>8.1f}円 "
