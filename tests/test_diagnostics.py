@@ -18,7 +18,7 @@ from datetime import date
 
 import pytest
 
-from autotrader.diagnostics import clustered_stats, split_days
+from autotrader.diagnostics import clustered_stats, required_gross_bps, split_days
 
 DAY1 = date(2026, 6, 1)
 DAY2 = date(2026, 6, 2)
@@ -118,3 +118,44 @@ class TestSplitDays:
 
     def test_空なら空を返す(self) -> None:
         assert split_days(()) == (frozenset(), frozenset())
+
+
+class TestRequiredGrossBps:
+    """**基準ではなく算術。** 目標とコストと建玉率から一意に決まる。"""
+
+    def test_コストを足した値になる(self) -> None:
+        without = required_gross_bps(0.25, cost_bps=0.0)
+        with_cost = required_gross_bps(0.25, cost_bps=4.8)
+        assert with_cost == pytest.approx(without + 4.8)
+
+    def test_建玉率が低いほど多くの優位が要る(self) -> None:
+        """**資金の半分しか建玉になっていなければ、2倍の優位が要る。**"""
+        full = required_gross_bps(0.25, cost_bps=0.0, deployment=1.0)
+        half = required_gross_bps(0.25, cost_bps=0.0, deployment=0.5)
+        assert half == pytest.approx(full * 2)
+
+    def test_目標が高いほど多くの優位が要る(self) -> None:
+        assert required_gross_bps(0.35, cost_bps=4.8) > required_gross_bps(
+            0.25, cost_bps=4.8
+        )
+
+    def test_年利ゼロならコストぶんだけ要る(self) -> None:
+        """損益分岐＝コストを取り返すだけ。"""
+        assert required_gross_bps(0.0, cost_bps=4.8) == pytest.approx(4.8)
+
+    def test_複利で割り戻す(self) -> None:
+        """**単利で240営業日で割らない。** 年利25%は日次0.0093%であって0.104%ではない。"""
+        daily_bps = required_gross_bps(0.25, cost_bps=0.0)
+        assert daily_bps == pytest.approx(9.3, abs=0.1)
+        assert daily_bps < 0.25 / 240 * 10_000
+
+    def test_TOPIX100と通常銘柄で桁が変わる(self) -> None:
+        """**呼値の差がそのまま合格ラインの差になる**（意思決定ログ67）。"""
+        topix100 = required_gross_bps(0.25, cost_bps=4.8)
+        regular = required_gross_bps(0.25, cost_bps=21.0)
+        assert topix100 == pytest.approx(14.1, abs=0.1)
+        assert regular == pytest.approx(30.3, abs=0.1)
+
+    def test_建玉率が0以下ならエラー(self) -> None:
+        with pytest.raises(ValueError, match="deployment"):
+            required_gross_bps(0.25, cost_bps=4.8, deployment=0.0)

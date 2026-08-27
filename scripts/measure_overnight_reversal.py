@@ -65,12 +65,20 @@ from datetime import date
 from pathlib import Path
 
 from autotrader.data.store import BarStore
-from autotrader.diagnostics import ClusteredStats, clustered_stats, split_days
+from autotrader.diagnostics import (
+    ClusteredStats,
+    clustered_stats,
+    required_gross_bps,
+    split_days,
+)
 from autotrader.provenance import banner
 from autotrader.tick import DEFAULT_SPREAD_TICKS, spread_yen
 from autotrader.types import Bar, Symbol
 
 DATA_ROOT = Path("data")
+
+ANNUAL_TARGET = 0.25
+"""目標年利（意思決定ログ73）。**必要な gross を逆算するのに使う。**"""
 
 PRIOR_MOVE_BUCKETS_PCT: tuple[float, ...] = (0.01, 0.02, 0.03, 0.04)
 """``|前日リターン|`` の下限バケット。
@@ -280,6 +288,19 @@ def _report_buckets(pairs: tuple[ReversalPair, ...]) -> None:
     print()
     print("  **判定に使うのは t値(日) と net(日)。** 同じ日の銘柄は市場要因で")
     print("  強く相関するので、件数ベースの t値は過大に出る（意思決定ログ72）。")
+
+    if baseline is not None:
+        print()
+        print(
+            f"  【合格ライン】年利{ANNUAL_TARGET:.0%}に要る gross"
+            f"（コスト{baseline.cost_bps:.1f}bps 前提）"
+        )
+        for deployment, note in ((1.0, "常に満玉"), (0.62, "実測の建玉率")):
+            need = required_gross_bps(
+                ANNUAL_TARGET, cost_bps=baseline.cost_bps, deployment=deployment
+            )
+            print(f"    建玉率 {deployment:>4.0%}（{note}）: **{need:>5.1f}bps**")
+        print("  **これは基準ではなく算術。** 目標とコストと建玉率から一意に決まる。")
 
 
 def _report_period_split(pairs: tuple[ReversalPair, ...]) -> None:

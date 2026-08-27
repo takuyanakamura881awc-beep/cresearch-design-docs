@@ -33,7 +33,15 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
 
-__all__ = ["ClusteredStats", "clustered_stats", "split_days"]
+__all__ = [
+    "ClusteredStats",
+    "clustered_stats",
+    "required_gross_bps",
+    "split_days",
+]
+
+TRADING_DAYS_PER_MONTH = 20
+MONTHS_PER_YEAR = 12
 
 
 @dataclass(frozen=True)
@@ -94,3 +102,49 @@ def split_days(days: Iterable[date]) -> tuple[frozenset[date], frozenset[date]]:
         frozenset(d for d in ordered if d < boundary),
         frozenset(d for d in ordered if d >= boundary),
     )
+
+
+def required_gross_bps(
+    annual_target: float,
+    *,
+    cost_bps: float,
+    deployment: float = 1.0,
+) -> float:
+    """目標を達成するのに1トレードあたり要る gross（bps）。
+
+    **これは基準ではなく算術。** 目標（年利）とコストと建玉率が決まれば
+    一意に決まるので、実験のたびに逆算しなくて済むようにここへ置く。
+
+    導出::
+
+        日次リターン = 建玉率 × 1トレードあたりの net
+        年利 = (1 + 日次リターン) ** (12 × 20) - 1
+
+    を net について解き、コストを足す。**建玉率が効く**——資金の半分しか
+    建玉になっていなければ、1トレードあたり2倍の優位が要る
+    （`scripts/measure_gap_fade.py` の `capacity_stats` が実測する値）。
+
+    Args:
+        annual_target: 目標年利（0.25 = 25%）。
+        cost_bps: 往復コスト（bps）。TOPIX100 は約4.8、通常銘柄は約21〜30
+            （`docs/00-overview.md` 意思決定ログ67）。
+        deployment: 資金のうち建玉になる割合。1.0 なら常に満玉。
+
+    Returns:
+        1トレードあたりに要る gross（bps）。
+
+    Raises:
+        ValueError: ``deployment`` が0以下のとき。
+
+    実測との比較（意思決定ログ88）::
+
+        必要（TOPIX100・建玉率100%）  約14bps
+        必要（TOPIX100・建玉率62%）   約20bps
+        実測で見つかった gross        0〜5bps（市場要因を除いた後）
+    """
+    if deployment <= 0:
+        raise ValueError("deployment は0より大きい")
+    days = TRADING_DAYS_PER_MONTH * MONTHS_PER_YEAR
+    daily = float((1.0 + annual_target) ** (1.0 / days)) - 1.0
+    net_bps = daily / deployment * 10_000.0
+    return net_bps + cost_bps
