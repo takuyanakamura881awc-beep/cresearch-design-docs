@@ -94,9 +94,50 @@ def load_universe() -> tuple[Symbol, ...] | None:
             market=row.get("market"),
             margin_type=row.get("margin_type"),
             sector=row.get("sector"),
+            # `save_universe` は書いているのに読み落としていた。
+            # **呼値の判定に効く**（`Symbol.is_topix100`）
+            scale_category=row.get("scale_category"),
         )
         for row in payload["symbols"]
     )
+
+
+
+def load_topix100() -> tuple[Symbol, ...]:
+    """TOPIX100 構成銘柄。`scripts/measure_topix100.py` が作るキャッシュを読む。
+
+    **なぜここで要るのか。** `universe.json` は Layer 1（プライム・貸借・
+    株価上限1,250円）を通った小型〜中型株で、**この銘柄群では竹・VWAP乖離・
+    ギャップ・フェードの3つがすべて棄却された**。一方、唯一 net 正が出た
+    TOPIX100（呼値0.1〜0.5円）の5分足は**1本も貯まっていなかった**——
+    このスクリプトが `universe.json` の銘柄しか取りに行かないため。
+
+    **yfinance の5分足は58日ぶんしか遡れない**（`MAX_LOOKBACK_DAYS`）。
+    取らなかった週のデータは**二度と手に入らない**ので、
+    仮説がまだ生きているうちに貯め始める（意思決定ログ76）。
+
+    **無ければ空を返す。** 銘柄一覧そのものの取得は J-Quants の
+    レート制限で8〜12分かかるので、`measure_topix100.py --refresh` の
+    責務にしてある（このスクリプトは取りに行かない）。
+    """
+    for name in ("master_scale_historical.json", "master_scale.json"):
+        path = DATA_ROOT / name
+        if not path.is_file():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        symbols = tuple(
+            Symbol(
+                code=row["code"],
+                name=row["name"],
+                market=row.get("market"),
+                margin_type=row.get("margin_type"),
+                sector=row.get("sector"),
+                scale_category=row.get("scale_category"),
+            )
+            for row in payload["symbols"]
+        )
+        return tuple(s for s in symbols if s.is_topix100)
+    return ()
 
 
 def save_universe(as_of: date, symbols: tuple[Symbol, ...]) -> None:
@@ -313,6 +354,20 @@ def main() -> int:
     else:
         print(f"  キャッシュを使う: {UNIVERSE_PATH}（{len(symbols)}銘柄）")
         print("  取り直すには --refresh")
+
+    # **TOPIX100 を足す。** universe.json は Layer 1（小型〜中型）だけで、
+    # そこでは3手法とも棄却された。唯一 net 正が出た TOPIX100 の5分足が
+    # 貯まっていないと、日足の上限見積りを実際の約定モデルで検証できない。
+    topix100 = load_topix100()
+    if topix100:
+        known = {s.code for s in symbols}
+        extra = tuple(s for s in topix100 if s.code not in known)
+        symbols = symbols + extra
+        print(f"  TOPIX100 を追加: {len(topix100)}銘柄（うち新規 {len(extra)}）")
+        print("  → 唯一 net 正が出た銘柄群。**5分足を貯めないと検証できない**")
+    else:
+        print("  TOPIX100 の一覧が無い（python scripts/measure_topix100.py --refresh）")
+        print("  → **5分足は58日しか遡れないので、取らなかった週は永久に失われる**")
 
     store = BarStore(DATA_ROOT)
     yahoo = YahooDataSource()
