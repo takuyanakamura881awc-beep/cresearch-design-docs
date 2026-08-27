@@ -110,6 +110,12 @@ class IntradayPath:
     """その日の最初の5分足の時刻。**始値がずれる原因の切り分けに要る。**"""
     last_bar_at: time
     """その日の最後の5分足の時刻（カットオフを問わない）。"""
+    bar_count: int
+    """その日の5分足の本数。**欠損の量を測る一番直接的な指標。**
+
+    東証は 9:00〜11:30 と 12:30〜15:30（2024年11月から15:30引け）なので、
+    完全なら 30 + 36 = 66本になるはず。
+    """
     prev_close: float | None
     """前日の日足終値。ギャップの計算に要る。銘柄の初日は ``None``。"""
     topix100: bool = False
@@ -206,6 +212,7 @@ def intraday_paths(
                             cutoff_close=closable[-1].close,
                             first_bar_at=session[0].timestamp.time(),
                             last_bar_at=session[-1].timestamp.time(),
+                            bar_count=len(session),
                             prev_close=prev_close,
                             topix100=symbol in topix100_codes,
                         )
@@ -370,6 +377,76 @@ def _report_open_mismatch_cause(paths: tuple[IntradayPath, ...]) -> None:
     print("  日足の始値そのものは信用してよい。")
 
 
+SESSION_BARS = 66
+"""完全な1日の5分足の本数。
+
+東証は 9:00〜11:30（30本）と 12:30〜15:30（36本）。
+**2024年11月から15:30引け**になっている。
+"""
+
+
+def _report_completeness(paths: tuple[IntradayPath, ...]) -> None:
+    """5分足がどれだけ欠けているかを、日付と銘柄に分けて診断する。
+
+    **寄り付きのバーが64%の日で欠けている**（意思決定ログ82）。
+    日足の実験には影響しないが、**寄り付きで建てる戦略の5分足検証を直撃する**
+    ——9:00 のバーが無ければ 9:05 で建てるしかなく、その時点で価格は
+    中央値39bps動いている。追いかけている優位（0〜24bps）より大きい。
+
+    **欠損の原因で対処が変わる:**
+
+    - **日付で決まる**（古い日ほど欠ける）→ Yahoo が古い日中データを
+      間引いている。週1回の取得では**取りこぼしを埋められない**ので、
+      取得頻度を上げるか別のデータ源が要る
+    - **銘柄で決まる**→ 流動性。その銘柄を検証から外せばよい
+    """
+    hr("1.5 5分足はどれだけ欠けているか")
+    print(f"  完全な1日は {SESSION_BARS}本（9:00〜11:30 の30本 + 12:30〜15:30 の36本）。")
+    print("  **東証は2024年11月から15:30引け。**")
+    print()
+
+    counts = sorted(p.bar_count for p in paths)
+    print(f"  1日あたりの本数: 中央値 {counts[len(counts) // 2]}本 / "
+          f"最小 {counts[0]}本 / 最大 {counts[-1]}本")
+    full = sum(1 for c in counts if c >= SESSION_BARS)
+    print(f"  {SESSION_BARS}本以上そろった日: {full}件（{full / len(counts):.1%}）")
+
+    session_open = min(p.first_bar_at for p in paths)
+    days = sorted({p.day for p in paths})
+    boundary = days[len(days) // 2]
+
+    print()
+    print(f"  【日付で決まるか】{session_open.strftime('%H:%M')} のバーがある割合")
+    for label, subset in (
+        (f"前半（〜{boundary}）", [p for p in paths if p.day < boundary]),
+        (f"後半（{boundary}〜）", [p for p in paths if p.day >= boundary]),
+    ):
+        if not subset:
+            continue
+        has_open = sum(1 for p in subset if p.first_bar_at == session_open)
+        median_bars = sorted(p.bar_count for p in subset)[len(subset) // 2]
+        print(
+            f"    {label:<22} {has_open / len(subset):>6.1%} "
+            f"（{len(subset)}件 / 本数の中央値 {median_bars}）"
+        )
+    print("    → **後半のほうが明らかに高いなら、Yahoo が古い日を間引いている。**")
+    print("      週1回の取得では取りこぼしを埋められないので、頻度を上げる必要がある")
+
+    print()
+    print(f"  【銘柄で決まるか】{session_open.strftime('%H:%M')} のバーがある割合")
+    by_symbol: dict[str, list[bool]] = defaultdict(list)
+    for path in paths:
+        by_symbol[path.symbol].append(path.first_bar_at == session_open)
+    rates = sorted(sum(v) / len(v) for v in by_symbol.values())
+    buckets = [0, 0, 0, 0]
+    for rate in rates:
+        buckets[min(int(rate * 4), 3)] += 1
+    for i, n in enumerate(buckets):
+        print(f"    {i * 25:>3}〜{(i + 1) * 25:>3}%: {n:>4}銘柄")
+    print("    → **銘柄がきれいに二分されるなら流動性の問題**で、")
+    print("      欠ける銘柄を検証から外せばよい。**一様に散らばるなら日付側の問題**")
+
+
 def _report_tail(paths: tuple[IntradayPath, ...]) -> None:
     """14:50 で切ることで失う（または得する）ぶん。"""
     hr(f"2. {CUTOFF.strftime('%H:%M')} で切ると何が変わるか")
@@ -475,6 +552,7 @@ def main() -> int:
     print(f"  期間      : {min(days)} 〜 {max(days)}")
 
     _report_open_integrity(paths)
+    _report_completeness(paths)
     _report_tail(paths)
     _report_gap_fade(paths)
 

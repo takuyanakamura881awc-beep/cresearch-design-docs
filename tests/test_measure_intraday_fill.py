@@ -139,6 +139,18 @@ class TestIntradayPaths:
         # 最後のバーはカットオフを問わない（欠損の診断に使うため）
         assert paths[0].last_bar_at == time(14, 55)
 
+    def test_その日のバー本数を持つ(self, mif: ModuleType) -> None:
+        """**欠損の量を測る一番直接的な指標。** 完全な1日は66本。"""
+        daily = {"A": (_daily("A", DAY1, open_=1000, close=1050),)}
+        intraday = {
+            "A": (
+                _five_min("A", DAY1, time(9, 0), open_=1000, close=1005),
+                _five_min("A", DAY1, time(9, 5), open_=1005, close=1010),
+                _five_min("A", DAY1, time(14, 45), open_=1010, close=1020),
+            )
+        }
+        assert mif.intraday_paths(daily, intraday)[0].bar_count == 3
+
     def test_TOPIX100かどうかを持つ(self, mif: ModuleType) -> None:
         """**net 正が出たのは TOPIX100 だけ。** 混ぜると比較にならない。"""
         daily = {
