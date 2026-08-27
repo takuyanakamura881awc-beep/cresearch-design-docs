@@ -109,6 +109,7 @@ def required_gross_bps(
     *,
     cost_bps: float,
     deployment: float = 1.0,
+    horizon_days: int = 1,
 ) -> float:
     """目標を達成するのに1トレードあたり要る gross（bps）。
 
@@ -124,17 +125,28 @@ def required_gross_bps(
     建玉になっていなければ、1トレードあたり2倍の優位が要る
     （`scripts/measure_gap_fade.py` の `capacity_stats` が実測する値）。
 
+    **保有期間を延ばすと要求は比例して上がる。** ``horizon_days`` 日持つなら
+    回転は 1/N になるので、同じ日次リターンを出すには1トレードあたり N倍の
+    net が要る。一方コストは往復1回ぶん（＋金利×日数）しか増えない。
+
+    **つまり「保有期間を延ばせばコストの重みが下がる」は、"損を薄める"
+    という意味では正しいが、"目標に届く"という意味では逆**——
+    目標に届くには **gross が N倍より速く伸びる**必要がある。
+    多くのシグナルは √N 程度でしか伸びないので、この差は効く。
+
     Args:
         annual_target: 目標年利（0.25 = 25%）。
-        cost_bps: 往復コスト（bps）。TOPIX100 は約4.8、通常銘柄は約21〜30
-            （`docs/00-overview.md` 意思決定ログ67）。
+        cost_bps: 1往復ぶんの総コスト（bps）。スプレッドに加え、
+            持ち越すなら金利・貸株料も含める。TOPIX100 のスプレッドは
+            約4.8、通常銘柄は約21〜30（`docs/00-overview.md` 意思決定ログ67）。
         deployment: 資金のうち建玉になる割合。1.0 なら常に満玉。
+        horizon_days: 保有営業日数。1 なら当日決済（安全装置#2）。
 
     Returns:
         1トレードあたりに要る gross（bps）。
 
     Raises:
-        ValueError: ``deployment`` が0以下のとき。
+        ValueError: ``deployment`` が0以下、または ``horizon_days`` が1未満のとき。
 
     実測との比較（意思決定ログ88）::
 
@@ -144,7 +156,9 @@ def required_gross_bps(
     """
     if deployment <= 0:
         raise ValueError("deployment は0より大きい")
+    if horizon_days < 1:
+        raise ValueError("horizon_days は1以上")
     days = TRADING_DAYS_PER_MONTH * MONTHS_PER_YEAR
     daily = float((1.0 + annual_target) ** (1.0 / days)) - 1.0
-    net_bps = daily / deployment * 10_000.0
+    net_bps = daily * horizon_days / deployment * 10_000.0
     return net_bps + cost_bps

@@ -80,6 +80,32 @@ DATA_ROOT = Path("data")
 ANNUAL_TARGET = 0.25
 """目標年利（意思決定ログ73）。**必要な gross を逆算するのに使う。**"""
 
+HORIZONS: tuple[int, ...] = (1, 2, 3, 5, 10)
+"""保有営業日数。**1日以外は安全装置#2（当日中に閉じる）を破る。**
+
+**これは「延ばせ」という提案ではなく、人間が判断するための材料**
+（`CLAUDE.md`「人間が判断すること」）。5家族すべてが「優位 < コスト」で
+死んでいるので、コスト側の前提を動かしたらどうなるかを測っておく。
+
+**持ち越すと失うもの**: デイトレ信用の手数料0・金利0・貸株料0
+（`docs/02-margin-rules.md`）、当日決済による翌日ギャップリスクの回避、
+日次ブレーカー（安全装置#4）が前提にしている「1日で損益が確定する」構造。
+"""
+
+OVERNIGHT_RATE_ANNUAL = 0.03
+"""持ち越し1日あたりの金利（年率）。**未実測の仮定。**
+
+`docs/02-margin-rules.md` にはデイトレ信用の0%しか記載がなく、
+**制度信用・一般信用（長期）の実際のレートは確認していない**。
+`tick.DEFAULT_SPREAD_TICKS` と同じ扱いで、**保守的な側**に置き、
+感度も出す（`_report_rate_sensitivity`）。
+
+**実際に保有期間を延ばすなら、証券会社の公表レートで置き換えること。**
+"""
+
+TRADING_DAYS_PER_YEAR = 245
+"""年率を日率に直すのに使う営業日数。"""
+
 PRIOR_MOVE_BUCKETS_PCT: tuple[float, ...] = (0.01, 0.02, 0.03, 0.04)
 """``|前日リターン|`` の下限バケット。
 
@@ -107,6 +133,13 @@ class ReversalPair:
     """当日始値。**コストは株価で決まる**（`autotrader.tick`）。"""
     topix100: bool = False
     """TOPIX100 構成銘柄か。**呼値が1桁違うのでコストに直接効く**（意思決定ログ61）。"""
+    forward_returns: tuple[tuple[int, float], ...] = ()
+    """``(保有営業日数, 当日始値からその日の終値までのリターン)``。
+
+    1日は ``intraday_return_pct`` と同じ。**将来の終値を使うが、これは
+    シグナルではなく成績**——建てた後に確定する情報なので先読みではない。
+    足りない日数（銘柄の終端付近）は含まない。
+    """
 
 
 def reversal_pairs(
@@ -125,9 +158,19 @@ def reversal_pairs(
     pairs: list[ReversalPair] = []
     for symbol, series in daily_bars.items():
         ordered = sorted(series, key=lambda b: b.timestamp)
-        for two_ago, prev, today in zip(ordered, ordered[1:], ordered[2:], strict=False):
+        for i in range(2, len(ordered)):
+            two_ago, prev, today = ordered[i - 2], ordered[i - 1], ordered[i]
             if two_ago.close <= 0 or prev.close <= 0 or today.open <= 0:
                 continue
+            forward: list[tuple[int, float]] = []
+            for horizon in HORIZONS:
+                exit_index = i + horizon - 1
+                if exit_index >= len(ordered):
+                    continue
+                exit_close = ordered[exit_index].close
+                if exit_close <= 0:
+                    continue
+                forward.append((horizon, (exit_close - today.open) / today.open))
             pairs.append(
                 ReversalPair(
                     symbol=symbol,
@@ -136,6 +179,7 @@ def reversal_pairs(
                     intraday_return_pct=(today.close - today.open) / today.open,
                     open_price=today.open,
                     topix100=symbol in topix100_codes,
+                    forward_returns=tuple(forward),
                 )
             )
     return tuple(pairs)
@@ -207,6 +251,131 @@ def bucket_stats(
         cost_bps=statistics.fmean(round_trip_cost_bps(p, n_ticks) for p in bucket),
         clustered=clustered_stats((p.day, reversal_score(p) * 10_000.0) for p in bucket),
     )
+
+
+def reversal_score_at(pair: ReversalPair, horizon: int) -> float | None:
+    """``horizon`` 営業日持ったときの反転スコア。該当が無ければ ``None``。"""
+    if pair.prior_move_pct == 0:
+        return None
+    forward = dict(pair.forward_returns).get(horizon)
+    if forward is None:
+        return None
+    return -forward if pair.prior_move_pct > 0 else forward
+
+
+def holding_cost_bps(
+    pair: ReversalPair,
+    horizon: int,
+    *,
+    n_ticks: float = DEFAULT_SPREAD_TICKS,
+    annual_rate: float = OVERNIGHT_RATE_ANNUAL,
+) -> float:
+    """``horizon`` 営業日持ったときの総コスト（bps）。
+
+    往復スプレッド（1回ぶん・保有期間によらない）に、**持ち越した日数ぶんの
+    金利**を足す。当日決済（``horizon == 1``）なら金利は0——
+    デイトレ信用は手数料0・金利0・貸株料0（`docs/02-margin-rules.md`）。
+
+    **``annual_rate`` は未実測の仮定**（`OVERNIGHT_RATE_ANNUAL`）。
+    """
+    spread = round_trip_cost_bps(pair, n_ticks)
+    nights = max(0, horizon - 1)
+    return spread + annual_rate / TRADING_DAYS_PER_YEAR * nights * 10_000.0
+
+
+def _report_horizons(pairs: tuple[ReversalPair, ...]) -> None:
+    """保有期間を延ばすと優位とコストの比がどう変わるか。
+
+    **これは「延ばせ」という提案ではない。** 5家族すべてが「優位 < コスト」で
+    死んだので、**コスト側の前提を動かしたらどうなるか**を人間が判断できる
+    材料として測る（`CLAUDE.md`「人間が判断すること」）。
+
+    **重要な算術**: ``horizon`` 日持つと回転は 1/N になるので、同じ日次
+    リターンを出すには1トレードあたり **N倍の net** が要る。一方コストは
+    往復1回ぶん（＋金利×日数）しか増えない。つまり
+    **「延ばせばコストの重みが下がる」は"損を薄める"意味では正しいが、
+    "目標に届く"意味では逆**——目標に届くには gross が N倍より速く伸びる
+    必要がある（`diagnostics.required_gross_bps` の docstring 参照）。
+    """
+    hr("4. 保有期間を延ばすとどうなるか")
+    print("  **1日以外は安全装置#2（当日中に閉じる）を破る。**")
+    print("  デイトレ信用の手数料0・金利0・貸株料0、翌日ギャップリスクの回避、")
+    print("  日次ブレーカーが前提にする「1日で損益が確定する」構造をすべて失う。")
+    print(f"  金利は年{OVERNIGHT_RATE_ANNUAL:.1%}と仮定（**未実測**）。")
+    print()
+
+    threshold = PRIOR_MOVE_BUCKETS_PCT[1]
+    bucket = tuple(p for p in pairs if abs(p.prior_move_pct) >= threshold)
+    if len(bucket) < 2:
+        print("  該当が足りない")
+        return
+    print(f"  対象: |前日リターン| >= {threshold:.1%} の {len(bucket)}件")
+    print()
+    print(
+        f"  {'保有':>5} {'件数':>8} {'gross':>9} {'コスト':>9} {'net':>9} "
+        f"{'t値(日)':>8} {'必要gross':>10} {'判定':>5}"
+    )
+    print("  " + "-" * 68)
+    for horizon in HORIZONS:
+        samples = tuple(
+            (p.day, v * 10_000.0)
+            for p in bucket
+            if (v := reversal_score_at(p, horizon)) is not None
+        )
+        stats = clustered_stats(samples)
+        if stats is None:
+            continue
+        cost = statistics.fmean(holding_cost_bps(p, horizon) for p in bucket)
+        need = required_gross_bps(
+            ANNUAL_TARGET, cost_bps=cost, horizon_days=horizon
+        )
+        print(
+            f"  {horizon:>4}日 {len(samples):>8} {stats.mean_bps:>+8.2f}b "
+            f"{cost:>8.2f}b {stats.mean_bps - cost:>+8.2f}b {stats.t_stat:>7.1f} "
+            f"{need:>9.1f}b {'○' if stats.mean_bps >= need else '×':>5}"
+        )
+    print()
+    print("  **必要gross は保有期間にほぼ比例して上がる**（回転が 1/N になるため）。")
+    print("  gross がそれより速く伸びなければ、延ばしても目標には近づかない。")
+
+
+def _report_rate_sensitivity(pairs: tuple[ReversalPair, ...]) -> None:
+    """金利の想定を変えたときに結論が変わるか。
+
+    **金利は未実測**（`OVERNIGHT_RATE_ANNUAL`）なので、
+    `DEFAULT_SPREAD_TICKS` と同じ扱いで感度を出す（意思決定ログ60）。
+    **変わらないなら、レートを調べに行く必要はない。**
+    """
+    threshold = PRIOR_MOVE_BUCKETS_PCT[1]
+    bucket = tuple(p for p in pairs if abs(p.prior_move_pct) >= threshold)
+    if len(bucket) < 2:
+        return
+    rates = (0.0, 0.02, 0.03, 0.05)
+    print()
+    print("  【金利の想定に対する感度】**gross は金利に依存しない**ので確実")
+    print()
+    header = "  ".join(f"年{r:.0%}" for r in rates)
+    print(f"  {'保有':>5} {'gross':>9}   net: {header}")
+    print("  " + "-" * 56)
+    for horizon in HORIZONS:
+        samples = tuple(
+            (p.day, v * 10_000.0)
+            for p in bucket
+            if (v := reversal_score_at(p, horizon)) is not None
+        )
+        stats = clustered_stats(samples)
+        if stats is None:
+            continue
+        cells: list[str] = []
+        for rate in rates:
+            cost = statistics.fmean(
+                holding_cost_bps(p, horizon, annual_rate=rate) for p in bucket
+            )
+            cells.append(f"{stats.mean_bps - cost:>+6.1f}b")
+        nets = "  ".join(cells)
+        print(f"  {horizon:>4}日 {stats.mean_bps:>+8.2f}b        {nets}")
+    print()
+    print("  **どの想定でも判定が変わらないなら、金利を調べに行く必要はない。**")
 
 
 def load_symbols(*, topix100_only: bool) -> tuple[Symbol, ...]:
@@ -415,6 +584,8 @@ def main() -> int:
     _report_buckets(pairs)
     _report_period_split(pairs)
     _report_verdict(pairs)
+    _report_horizons(pairs)
+    _report_rate_sensitivity(pairs)
 
     print()
     print("**シグナルは前日大引けで確定するので、寄成注文で板寄せの価格を取れる。**")

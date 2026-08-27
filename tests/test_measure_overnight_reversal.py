@@ -235,3 +235,99 @@ class TestBucketStats:
         assert stats.n == 20
         assert stats.clustered is None
         assert stats.clustered_net_bps is None
+
+
+class TestForwardReturns:
+    """保有期間の軸。**将来の終値を使うが、これはシグナルではなく成績。**
+
+    建てた後に確定する情報なので先読みではない（規約7）。
+    """
+
+    def _daily(self, mor: ModuleType, closes: list[float]) -> Any:
+        """始値はすべて1000円、終値だけ動く日足。"""
+        days = tuple(date(2026, 6, 1) + __import__("datetime").timedelta(days=i)
+                     for i in range(len(closes)))
+        return {
+            "A": tuple(
+                _bar("A", d, open_=1000.0, close=c)
+                for d, c in zip(days, closes, strict=True)
+            )
+        }
+
+    def test_保有期間ごとの将来リターンを持つ(self, mor: ModuleType) -> None:
+        # index 2 が最初のペア。始値1000 に対し index 2/3/4 の終値
+        daily = self._daily(mor, [1000, 1050, 1010, 1020, 1030, 1040, 1050])
+        pair = mor.reversal_pairs(daily)[0]
+        forward = dict(pair.forward_returns)
+        assert forward[1] == pytest.approx(0.010)  # 1010
+        assert forward[2] == pytest.approx(0.020)  # 1020
+        assert forward[3] == pytest.approx(0.030)  # 1030
+        assert forward[5] == pytest.approx(0.050)  # 1050
+
+    def test_1日は当日のリターンと一致する(self, mor: ModuleType) -> None:
+        daily = self._daily(mor, [1000, 1050, 1010, 1020])
+        pair = mor.reversal_pairs(daily)[0]
+        assert dict(pair.forward_returns)[1] == pytest.approx(
+            pair.intraday_return_pct
+        )
+
+    def test_足りない日数は含まない(self, mor: ModuleType) -> None:
+        """**銘柄の終端付近で無理に埋めない。**"""
+        daily = self._daily(mor, [1000, 1050, 1010, 1020])
+        pair = mor.reversal_pairs(daily)[0]
+        assert set(dict(pair.forward_returns)) == {1, 2}
+
+    def test_反転スコアは前日と逆方向で正(self, mor: ModuleType) -> None:
+        # 前日 +5%（1000→1050）、その後じり下げ
+        daily = self._daily(mor, [1000, 1050, 990, 980, 970, 960, 950])
+        pair = mor.reversal_pairs(daily)[0]
+        assert mor.reversal_score_at(pair, 1) == pytest.approx(0.010)
+        assert mor.reversal_score_at(pair, 5) == pytest.approx(0.050)
+
+    def test_該当しない保有期間はNone(self, mor: ModuleType) -> None:
+        daily = self._daily(mor, [1000, 1050, 1010, 1020])
+        pair = mor.reversal_pairs(daily)[0]
+        assert mor.reversal_score_at(pair, 10) is None
+
+    def test_前日動いていなければNone(self, mor: ModuleType) -> None:
+        daily = self._daily(mor, [1000, 1000, 1010, 1020, 1030, 1040, 1050])
+        pair = mor.reversal_pairs(daily)[0]
+        assert mor.reversal_score_at(pair, 1) is None
+
+
+class TestHoldingCost:
+    def _pair(self, mor: ModuleType) -> Any:
+        return mor.ReversalPair(
+            symbol="A",
+            day=DAYS[2],
+            prior_move_pct=0.03,
+            intraday_return_pct=-0.01,
+            open_price=1000.0,
+        )
+
+    def test_当日決済なら金利ゼロ(self, mor: ModuleType) -> None:
+        """**デイトレ信用は手数料0・金利0・貸株料0**（docs/02）。"""
+        pair = self._pair(mor)
+        assert mor.holding_cost_bps(pair, 1) == pytest.approx(
+            mor.round_trip_cost_bps(pair)
+        )
+
+    def test_持ち越した夜数ぶんだけ金利が乗る(self, mor: ModuleType) -> None:
+        pair = self._pair(mor)
+        one = mor.holding_cost_bps(pair, 1, annual_rate=0.03)
+        three = mor.holding_cost_bps(pair, 3, annual_rate=0.03)
+        per_night = 0.03 / mor.TRADING_DAYS_PER_YEAR * 10_000.0
+        assert three - one == pytest.approx(per_night * 2)
+
+    def test_スプレッドは保有期間で増えない(self, mor: ModuleType) -> None:
+        """**往復1回ぶん。** ここが「延ばせば損を薄められる」の中身。"""
+        pair = self._pair(mor)
+        zero_rate_1 = mor.holding_cost_bps(pair, 1, annual_rate=0.0)
+        zero_rate_10 = mor.holding_cost_bps(pair, 10, annual_rate=0.0)
+        assert zero_rate_1 == pytest.approx(zero_rate_10)
+
+    def test_金利ゼロならスプレッドだけ(self, mor: ModuleType) -> None:
+        pair = self._pair(mor)
+        assert mor.holding_cost_bps(pair, 5, annual_rate=0.0) == pytest.approx(
+            mor.round_trip_cost_bps(pair)
+        )
