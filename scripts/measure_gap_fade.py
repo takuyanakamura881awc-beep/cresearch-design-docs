@@ -389,6 +389,58 @@ def capacity_stats(
     )
 
 
+@dataclass(frozen=True)
+class ClusteredStats:
+    """日ごとにまとめてから出した統計。**同じ日の銘柄は独立ではない。**"""
+
+    days: int
+    """実質的な標本数。**件数ではなくこちらが効く。**"""
+    mean_bps: float
+    """日ごとの平均 fade_score を、さらに日をまたいで平均したもの。"""
+    t_stat: float
+
+
+def clustered_stats(
+    pairs: tuple[GapFadePair, ...], threshold: float
+) -> ClusteredStats | None:
+    """t値を日クラスタで出し直す。
+
+    **なぜ要るのか。** バケットの t値を件数（5,786件など）から計算すると、
+    **同じ日の銘柄同士が市場要因で強く相関している**ことを無視することになる。
+    ある日に市場全体が上げれば、その日のギャップダウン銘柄はまとめて
+    フェード側に振れる——独立な観測が5,786個あるのではなく、
+    **せいぜい日数ぶんしかない**。
+
+    実際、市場ドリフトを控除すると買建の優位は +35.95 → +4.94bps に落ちた
+    （意思決定ログ71）。**消えたぶんは日単位で共通の動き**であり、
+    そこに件数ぶんの信頼を置いてはいけない。
+
+    日ごとに平均してから日をまたいで t値を出せば、実質的な標本数が
+    日数になる。**点推定もわずかに変わる**（日ごとに等ウェイトになるため）が、
+    それは意図した挙動——銘柄が多く該当した日を過大に扱わない。
+
+    Returns:
+        該当日が2日未満なら ``None``。
+    """
+    by_day: dict[date, list[GapFadePair]] = defaultdict(list)
+    for pair in pairs:
+        if abs(pair.gap_pct) >= threshold:
+            by_day[pair.day].append(pair)
+    if len(by_day) < 2:
+        return None
+
+    daily = [
+        statistics.fmean(fade_score(p) * 10_000.0 for p in group) for group in by_day.values()
+    ]
+    mean = statistics.fmean(daily)
+    stderr = statistics.stdev(daily) / math.sqrt(len(daily))
+    return ClusteredStats(
+        days=len(daily),
+        mean_bps=mean,
+        t_stat=mean / stderr if stderr > 0 else 0.0,
+    )
+
+
 def load_symbols() -> tuple[Symbol, ...]:
     """`scripts/backtest_take.py` の同名関数と同じ読み込み。
 
@@ -436,24 +488,34 @@ def report(pairs: tuple[GapFadePair, ...]) -> None:
     print()
     print(
         f"  {'|ギャップ|下限':<12} {'件数':>7} {'gross':>9} {'コスト':>9} "
-        f"{'net':>9} {'t値':>7}"
+        f"{'net':>9} {'t値(件)':>8} {'日数':>6} {'t値(日)':>8}"
     )
-    print("  " + "-" * 60)
+    print("  " + "-" * 74)
     for threshold in GAP_BUCKETS_PCT:
         stats = bucket_stats(pairs, threshold)
         if stats is None:
             print(f"  {threshold:>10.1%}  {0:>7}  —（該当なし）")
             continue
+        clustered = clustered_stats(pairs, threshold)
+        cluster_txt = (
+            f"{clustered.days:>6} {clustered.t_stat:>7.1f}"
+            if clustered
+            else f"{'—':>6} {'—':>8}"
+        )
         print(
             f"  {threshold:>10.1%}  {stats.n:>7} "
             f"{stats.gross_bps:>+8.2f}b {stats.cost_bps:>8.2f}b "
-            f"{stats.net_bps:>+8.2f}b {stats.t_stat:>6.1f}"
+            f"{stats.net_bps:>+8.2f}b {stats.t_stat:>7.1f} {cluster_txt}"
         )
 
     print()
     print("  **gross はコスト前、net はコストを引いた後。** t値は gross が")
     print("  ゼロと区別できるかで、**コスト後に残るかとは別の話**。")
     print("  net が負なら、傾向が統計的に本物でも取引する意味はない。")
+    print()
+    print("  **見るべきは t値(日) のほう。** 同じ日の銘柄は市場要因で強く")
+    print("  相関しているので、件数ぶんの独立した観測があるわけではない。")
+    print("  実質的な標本数は日数であり、t値(件) はそのぶん過大に出る。")
     print()
     print("  往復コストは呼値2tick想定（`autotrader.tick`）。始値で建てて")
     print("  引けで手仕舞う前提の、最も楽観的な見積り——実際は寄り付き直後の")

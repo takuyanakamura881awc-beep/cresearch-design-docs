@@ -512,3 +512,84 @@ class TestCapacityUniverseDays:
         assert with_denominator.monthly_return_pct == pytest.approx(
             without.monthly_return_pct / 2
         )
+
+
+class TestClusteredStats:
+    """日クラスタの t 値。**件数ベースの t 値は過大に出る。**
+
+    同じ日の銘柄は市場要因で強く相関している。5,786件を独立として
+    扱うと、実質的には数百日ぶんしかない情報に件数ぶんの信頼を
+    置くことになる（意思決定ログ71）。
+    """
+
+    def _pair(
+        self, gf: ModuleType, symbol: str, day: date, *, gap: float, move: float
+    ) -> Any:
+        return gf.GapFadePair(
+            symbol=symbol,
+            day=day,
+            gap_pct=gap,
+            intraday_return_pct=move,
+            open_price=1_000.0,
+        )
+
+    def test_実質的な標本数は日数(self, gf: ModuleType) -> None:
+        pairs = tuple(
+            self._pair(gf, f"S{i}", day, gap=-0.03, move=0.01)
+            for day in (DAY1, DAY2)
+            for i in range(50)
+        )
+        assert gf.bucket_stats(pairs, 0.02).n == 100
+        assert gf.clustered_stats(pairs, 0.02).days == 2
+
+    def test_日ごとに等ウェイトにする(self, gf: ModuleType) -> None:
+        """該当銘柄が多い日を過大に扱わない。
+
+        DAY1 は9銘柄すべて +1%、DAY2 は1銘柄だけ -1%。件数平均なら
+        +0.8% 寄りだが、日ごとに等ウェイトなら 0% になる。
+        """
+        pairs = (
+            *(self._pair(gf, f"S{i}", DAY1, gap=-0.03, move=0.01) for i in range(9)),
+            self._pair(gf, "X", DAY2, gap=-0.03, move=-0.01),
+        )
+        assert gf.bucket_stats(pairs, 0.02).gross_bps == pytest.approx(80.0)
+        assert gf.clustered_stats(pairs, 0.02).mean_bps == pytest.approx(0.0)
+
+    def test_日をまたいでばらつきがなければt値は出ない(self, gf: ModuleType) -> None:
+        """**件数ベースとの差が最も出る形。**
+
+        全銘柄・全日が同じ動き＝完全に市場要因。件数ベースの標準誤差も
+        0 になるが、日クラスタでも 0 で、どちらも t値を出さない。
+        重要なのは**日をまたいだばらつきだけが t値を作る**という構造。
+        """
+        pairs = tuple(
+            self._pair(gf, f"S{i}", day, gap=-0.03, move=0.01)
+            for day in (DAY1, DAY2)
+            for i in range(50)
+        )
+        assert gf.clustered_stats(pairs, 0.02).t_stat == 0.0
+
+    def test_件数を増やしても日数が同じならt値は変わらない(self, gf: ModuleType) -> None:
+        """**これが日クラスタを入れた理由そのもの。**
+
+        同じ2日を、1日9銘柄で見ても18銘柄で見ても、市場の動きが同じなら
+        得られた情報は増えていない。t値も増えてはいけない。
+        """
+
+        def build(per_day: int) -> tuple[object, ...]:
+            return tuple(
+                self._pair(gf, f"S{i}", day, gap=-0.03, move=move)
+                for day, move in ((DAY1, 0.02), (DAY2, 0.01))
+                for i in range(per_day)
+            )
+
+        small = gf.clustered_stats(build(9), 0.02)
+        large = gf.clustered_stats(build(18), 0.02)
+        assert small.t_stat == pytest.approx(large.t_stat)
+        # 件数ベースは件数が増えるだけで t値が跳ね上がる（これが過大の正体）
+        assert gf.bucket_stats(build(18), 0.02).t_stat > gf.bucket_stats(build(9), 0.02).t_stat
+
+    def test_該当日が2日未満ならNone(self, gf: ModuleType) -> None:
+        pairs = (self._pair(gf, "A", DAY1, gap=-0.03, move=0.01),)
+        assert gf.clustered_stats(pairs, 0.02) is None
+        assert gf.clustered_stats((), 0.02) is None
