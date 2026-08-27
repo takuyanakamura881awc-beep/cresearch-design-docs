@@ -63,6 +63,25 @@ DATA_ROOT = Path("data")
 CUTOFF = MarketScheduler.CLOSE_ALL_TIME
 """クローズ時刻。**`scheduler` の値をそのまま使う**——診断ごとに定義し直さない。"""
 
+BAR_MINUTES = 5
+"""5分足の1本の長さ。"""
+
+LAST_BAR_START = time(
+    (CUTOFF.hour * 60 + CUTOFF.minute - BAR_MINUTES) // 60,
+    (CUTOFF.hour * 60 + CUTOFF.minute - BAR_MINUTES) % 60,
+)
+"""手仕舞いに使える最後のバーの**開始**時刻。
+
+**yfinance の5分足は区間の開始時刻でラベルされる。** つまり `14:50` の
+バーは 14:50〜14:55 を表し、その終値は **14:55 の価格**。
+`timestamp <= 14:50` で拾うと、**14:55 まで持ち越した価格で手仕舞ったこと**
+になり、5分ぶん先読みする。
+
+区間が 14:50 までに終わるバー（開始 ≤ 14:45）だけを使う。
+規約「検証できないものは保守的な側に倒す」——ラベルが区間終了だった場合、
+この選び方は1本ぶん損をするだけで、優位を水増しはしない。
+"""
+
 GAP_THRESHOLD_PCT = 0.010
 """ギャップ該当日を絞る下限。
 
@@ -82,9 +101,22 @@ class IntradayPath:
     first_bar_open: float
     """その日の最初の5分足の始値。**日足の始値と一致するはず。**"""
     cutoff_close: float
-    """``CUTOFF`` 以前の最後の5分足の終値。**実際に手仕舞える価格。**"""
+    """区間が ``CUTOFF`` までに終わる最後の5分足の終値。**実際に手仕舞える価格。**
+
+    バーのラベルは区間の**開始**時刻なので、14:50 で手仕舞うなら
+    使えるのは 14:45 開始のバー（`LAST_BAR_START`）まで。
+    """
+    first_bar_at: time
+    """その日の最初の5分足の時刻。**始値がずれる原因の切り分けに要る。**"""
+    last_bar_at: time
+    """その日の最後の5分足の時刻（カットオフを問わない）。"""
     prev_close: float | None
     """前日の日足終値。ギャップの計算に要る。銘柄の初日は ``None``。"""
+    topix100: bool = False
+    """TOPIX100 構成銘柄か。**net 正が出たのはこの銘柄群だけ**（意思決定ログ67）。
+
+    Layer 1（小型〜中型）と混ぜて測ると比較にならない。
+    """
 
     @property
     def open_mismatch_bps(self) -> float:
@@ -130,7 +162,8 @@ class IntradayPath:
 def intraday_paths(
     daily_bars: dict[str, tuple[Bar, ...]],
     intraday_bars: dict[str, tuple[Bar, ...]],
-    cutoff: time = CUTOFF,
+    last_bar_start: time = LAST_BAR_START,
+    topix100_codes: frozenset[str] = frozenset(),
 ) -> tuple[IntradayPath, ...]:
     """日足と5分足を、銘柄 × 営業日で突き合わせる。
 
@@ -138,8 +171,11 @@ def intraday_paths(
     日足（2年）の大半は対象外になる——それが正しい挙動で、
     片方しか無い日を無理に埋めない。
 
-    ``cutoff`` 以前の5分足が1本も無い日は除く（手仕舞えないので測れない）。
-    価格が0以下の日も除く（0除算対策）。
+    ``last_bar_start`` 以前に始まる5分足が1本も無い日は除く
+    （手仕舞えないので測れない）。価格が0以下の日も除く（0除算対策）。
+
+    **``last_bar_start`` は「開始時刻」であって手仕舞い時刻ではない**
+    （`LAST_BAR_START` の docstring 参照）。
     """
     paths: list[IntradayPath] = []
     for symbol, daily in daily_bars.items():
@@ -158,7 +194,7 @@ def intraday_paths(
             session = by_day.get(day)
             if session and bar.open > 0 and bar.close > 0:
                 session.sort(key=lambda b: b.timestamp)
-                closable = [b for b in session if b.timestamp.time() <= cutoff]
+                closable = [b for b in session if b.timestamp.time() <= last_bar_start]
                 if closable and session[0].open > 0:
                     paths.append(
                         IntradayPath(
@@ -168,7 +204,10 @@ def intraday_paths(
                             daily_close=bar.close,
                             first_bar_open=session[0].open,
                             cutoff_close=closable[-1].close,
+                            first_bar_at=session[0].timestamp.time(),
+                            last_bar_at=session[-1].timestamp.time(),
                             prev_close=prev_close,
+                            topix100=symbol in topix100_codes,
                         )
                     )
             # **前日終値は5分足の有無と無関係に進める。**
@@ -260,18 +299,75 @@ def _report_open_integrity(paths: tuple[IntradayPath, ...]) -> None:
     hr("1. 日足の始値 == 最初の5分足の始値 か")
     print("  **ずれていれば、これまでの gap_pct の計算そのものが疑わしい。**")
     print()
-    diffs = [abs(p.open_mismatch_bps) for p in paths]
+    diffs = sorted(abs(p.open_mismatch_bps) for p in paths)
     exact = sum(1 for d in diffs if d < 0.5)
-    print(f"  対象      : {len(diffs)}件")
+    print(f"  対象            : {len(diffs)}件")
     print(f"  一致(0.5bps未満): {exact}件（{exact / len(diffs):.1%}）")
-    diffs.sort()
     print(f"  ずれの中央値    : {diffs[len(diffs) // 2]:.2f}bps")
     print(f"  ずれの最大      : {diffs[-1]:.2f}bps")
+
+    _report_open_mismatch_cause(paths)
+
     print()
     if exact / len(diffs) > 0.95:
         print("  → **整合している。** 日足の始値を使ってよい")
     else:
-        print("  → **整合していない。** 日足の始値を前提にした実験を見直す必要がある")
+        print("  → **整合していない。** 原因の切り分けを上の内訳で見ること")
+
+
+def _histogram(label: str, times: list[time], limit: int = 5) -> None:
+    counts: dict[time, int] = defaultdict(int)
+    for t in times:
+        counts[t] += 1
+    total = len(times)
+    top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    print(f"  {label}（上位{limit}件 / 全{len(counts)}種）")
+    for at, n in top:
+        print(f"    {at.strftime('%H:%M')}  {n:>6}件（{n / total:>5.1%}）")
+
+
+def _report_open_mismatch_cause(paths: tuple[IntradayPath, ...]) -> None:
+    """始値がずれる原因を切り分ける。
+
+    **考えられる原因は2つあり、対処がまったく違う。**
+
+    1. **最初の5分足が寄り付きのバーではない**（9:00 のバーが欠けている）
+       → 日足の始値は正しく、5分足側の欠損。寄り付きで建てる前提は保てる
+    2. **9:00 のバーはあるのに値がずれる**
+       → 日足と5分足で価格の基準が違う（調整の差など）。
+       **この場合は日足ベースの実験すべてが疑わしくなる**
+
+    最初のバーの時刻で分けて中央値を見れば、どちらかが分かる。
+    """
+    print()
+    print("  【原因の切り分け】")
+    _histogram("最初のバーの時刻", [p.first_bar_at for p in paths])
+    print()
+    _histogram("最後のバーの時刻", [p.last_bar_at for p in paths])
+
+    session_open = min(p.first_bar_at for p in paths)
+    on_open = sorted(abs(p.open_mismatch_bps) for p in paths if p.first_bar_at == session_open)
+    late = sorted(abs(p.open_mismatch_bps) for p in paths if p.first_bar_at != session_open)
+    print()
+    print(f"  最初のバーが {session_open.strftime('%H:%M')}（＝寄り付き）かどうかで分ける:")
+    groups = (
+        (f"{session_open.strftime('%H:%M')} から", on_open),
+        ("それ以降から", late),
+    )
+    for label, values in groups:
+        if not values:
+            print(f"    {label:<12} 該当なし")
+            continue
+        matched = sum(1 for v in values if v < 0.5)
+        print(
+            f"    {label:<12} {len(values):>6}件 / 一致 {matched / len(values):>5.1%} / "
+            f"ずれの中央値 {values[len(values) // 2]:>7.2f}bps"
+        )
+    print()
+    print("  **寄り付きのバーがある日でもずれるなら、日足と5分足で価格の基準が違う**")
+    print("  ——その場合は日足ベースの実験すべてが疑わしくなる。")
+    print("  **寄り付きのバーが無い日だけずれるなら、5分足側の欠損**で、")
+    print("  日足の始値そのものは信用してよい。")
 
 
 def _report_tail(paths: tuple[IntradayPath, ...]) -> None:
@@ -312,21 +408,40 @@ def _report_gap_fade(paths: tuple[IntradayPath, ...]) -> None:
         print("  該当が足りない。5分足がもっと貯まってから")
         return
 
-    print(f"  該当: {len(candidates)}件")
-    print()
-    for label, to_cutoff in (("14:50 で手仕舞い", True), ("大引けで手仕舞い", False)):
-        samples = tuple(
-            (p.day, v) for p in candidates if (v := p.fade_bps(to_cutoff=to_cutoff)) is not None
-        )
-        stats = clustered_mean(samples)
-        if stats is None:
+    # **銘柄群を分ける。** net 正が出たのは TOPIX100 だけ（意思決定ログ67）で、
+    # Layer 1（小型〜中型）では3手法とも棄却された。混ぜると比較にならない。
+    groups = (
+        ("全銘柄", tuple(candidates)),
+        ("TOPIX100", tuple(p for p in candidates if p.topix100)),
+        ("Layer 1", tuple(p for p in candidates if not p.topix100)),
+    )
+    for group_label, group in groups:
+        if len(group) < 2:
+            print(f"  【{group_label}】該当が足りない（{len(group)}件）")
             continue
-        print(
-            f"  {label:<20} gross {stats.mean_bps:>+8.2f}bps "
-            f"（{stats.days}日 / t={stats.t_stat:>5.1f}）"
-        )
+        print(f"  【{group_label}】{len(group)}件")
+        for label, to_cutoff in (
+            (f"{CUTOFF.strftime('%H:%M')} で手仕舞い", True),
+            ("大引けで手仕舞い", False),
+        ):
+            samples = tuple(
+                (p.day, v)
+                for p in group
+                if (v := p.fade_bps(to_cutoff=to_cutoff)) is not None
+            )
+            stats = clustered_mean(samples)
+            if stats is None:
+                continue
+            print(
+                f"    {label:<20} gross {stats.mean_bps:>+8.2f}bps "
+                f"（{stats.days}日 / t={stats.t_stat:>5.1f}）"
+            )
+        print()
 
-    print()
+    print("  **42営業日では判定できない。** 日足の486営業日に対して1割に満たず、")
+    print("  t値もほぼゼロになる。ここで見るのは**優位の有無ではなく、")
+    print("  14:50 と大引けの差**——それは平均の差なので少ない日数でも測れる。")
+
     print("  **gross はコスト前。** TOPIX100 の往復コストは約4.8bps、")
     print("  通常銘柄なら約21bps（意思決定ログ67）。")
     print()
@@ -349,7 +464,9 @@ def main() -> int:
     intraday = {c: b for c, b in intraday.items() if b}
     print(f"  銘柄: {len(symbols)} / 日足あり {len(daily)} / 5分足あり {len(intraday)}")
 
-    paths = intraday_paths(daily, intraday)
+    topix100_codes = frozenset(s.code for s in symbols if s.is_topix100)
+    print(f"  うち TOPIX100: {len(topix100_codes)}銘柄")
+    paths = intraday_paths(daily, intraday, topix100_codes=topix100_codes)
     if not paths:
         print("  日足と5分足が両方そろう日が無い。先に python scripts/fetch_bars.py")
         return 1

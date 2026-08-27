@@ -90,8 +90,13 @@ class TestIntradayPaths:
         assert paths[0].prev_close == pytest.approx(1000.0)
         assert paths[0].gap_pct == pytest.approx(-0.05)
 
-    def test_カットオフ以前の最後のバーで手仕舞う(self, mif: ModuleType) -> None:
-        """**14:50 より後のバーを使うと、取りに行けない値動きが入る。**"""
+    def test_区間が14時50分までに終わるバーで手仕舞う(self, mif: ModuleType) -> None:
+        """**yfinance の5分足は区間の開始時刻でラベルされる。**
+
+        14:50 のバーは 14:50〜14:55 を表すので、その終値は 14:55 の価格。
+        `timestamp <= 14:50` で拾うと**5分ぶん先読みする**ので、
+        使えるのは 14:45 開始のバーまで。
+        """
         daily = {"A": (_daily("A", DAY1, open_=1000, close=1050),)}
         intraday = {
             "A": (
@@ -102,17 +107,51 @@ class TestIntradayPaths:
             )
         }
         paths = mif.intraday_paths(daily, intraday)
-        # 14:50 のバーは含む（<=）が、14:55 は含まない
-        assert paths[0].cutoff_close == pytest.approx(1030.0)
-        assert paths[0].return_to_cutoff_bps == pytest.approx(300.0)
+        assert paths[0].cutoff_close == pytest.approx(1020.0)
+        assert paths[0].return_to_cutoff_bps == pytest.approx(200.0)
         assert paths[0].return_to_close_bps == pytest.approx(500.0)
-        assert paths[0].tail_bps == pytest.approx(200.0)
+        assert paths[0].tail_bps == pytest.approx(300.0)
 
-    def test_カットオフ以前のバーが無い日は除く(self, mif: ModuleType) -> None:
+    def test_14時50分開始のバーは使わない(self, mif: ModuleType) -> None:
+        """**そのバーの終値は 14:55 の価格。** 使えば5分ぶん先読みになる。"""
+        daily = {"A": (_daily("A", DAY1, open_=1000, close=1050),)}
+        intraday = {"A": (_five_min("A", DAY1, time(14, 50), open_=1020, close=1030),)}
+        assert mif.intraday_paths(daily, intraday) == ()
+
+    def test_手仕舞えるバーが無い日は除く(self, mif: ModuleType) -> None:
         """手仕舞えないので測れない。**無理に埋めない。**"""
         daily = {"A": (_daily("A", DAY1, open_=1000, close=1050),)}
         intraday = {"A": (_five_min("A", DAY1, time(14, 55), open_=1030, close=1050),)}
         assert mif.intraday_paths(daily, intraday) == ()
+
+    def test_最初と最後のバーの時刻を持つ(self, mif: ModuleType) -> None:
+        """**始値がずれる原因の切り分けに要る。**"""
+        daily = {"A": (_daily("A", DAY1, open_=1000, close=1050),)}
+        intraday = {
+            "A": (
+                _five_min("A", DAY1, time(9, 5), open_=1002, close=1005),
+                _five_min("A", DAY1, time(14, 45), open_=1005, close=1020),
+                _five_min("A", DAY1, time(14, 55), open_=1030, close=1050),
+            )
+        }
+        paths = mif.intraday_paths(daily, intraday)
+        assert paths[0].first_bar_at == time(9, 5)
+        # 最後のバーはカットオフを問わない（欠損の診断に使うため）
+        assert paths[0].last_bar_at == time(14, 55)
+
+    def test_TOPIX100かどうかを持つ(self, mif: ModuleType) -> None:
+        """**net 正が出たのは TOPIX100 だけ。** 混ぜると比較にならない。"""
+        daily = {
+            "A": (_daily("A", DAY1, open_=1000, close=1050),),
+            "B": (_daily("B", DAY1, open_=1000, close=1050),),
+        }
+        intraday = {
+            "A": (_five_min("A", DAY1, time(9, 0), open_=1000, close=1005),),
+            "B": (_five_min("B", DAY1, time(9, 0), open_=1000, close=1005),),
+        }
+        paths = mif.intraday_paths(daily, intraday, topix100_codes=frozenset({"A"}))
+        flags = {p.symbol: p.topix100 for p in paths}
+        assert flags == {"A": True, "B": False}
 
     def test_バーの順序が乱れていても正しく拾う(self, mif: ModuleType) -> None:
         """保存順に依存しない。"""
@@ -160,7 +199,7 @@ class TestFadeBps:
         intraday = {
             "A": (
                 _five_min("A", DAY2, time(9, 0), open_=opened, close=opened),
-                _five_min("A", DAY2, time(14, 50), open_=opened, close=opened * 1.005),
+                _five_min("A", DAY2, time(14, 45), open_=opened, close=opened * 1.005),
             )
         }
         return mif.intraday_paths(daily, intraday)[0]
