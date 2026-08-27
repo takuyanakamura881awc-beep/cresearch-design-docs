@@ -227,6 +227,84 @@ class TestFadeBps:
         assert path.fade_bps(to_cutoff=False) == pytest.approx(-100.0)
 
 
+class TestFadeFromFirstBar:
+    """**Yahoo の日本株5分足は寄り付きの1本を構造的に落とす**（意思決定ログ83）。
+
+    日足の始値で建てるという仮定は64%の日で実現できないので、
+    実際に建てられる最初のバーで建てた場合も測れなければならない。
+    """
+
+    def _path(self, mif: ModuleType) -> Any:
+        # 前日1000 → 当日は950で寄る（-5%のギャップダウン）。
+        # 最初に建てられるのは 9:05 の 960、14:45 のバーの終値が 980
+        daily = {
+            "A": (
+                _daily("A", DAY1, open_=1000, close=1000),
+                _daily("A", DAY2, open_=950, close=990),
+            )
+        }
+        intraday = {
+            "A": (
+                _five_min("A", DAY2, time(9, 5), open_=960, close=965),
+                _five_min("A", DAY2, time(14, 45), open_=975, close=980),
+            )
+        }
+        return mif.intraday_paths(daily, intraday)[0]
+
+    def test_日足の始値で建てた場合(self, mif: ModuleType) -> None:
+        path = self._path(mif)
+        # 950 → 980 = +3.158% = +315.8bps（ギャップダウンなので符号そのまま）
+        assert path.fade_bps(to_cutoff=True) == pytest.approx(315.789, abs=0.01)
+
+    def test_最初のバーで建てた場合(self, mif: ModuleType) -> None:
+        """**寄り付きに間に合わないぶん、優位が削られる。**"""
+        path = self._path(mif)
+        # 960 → 980 = +2.083% = +208.3bps
+        assert path.fade_bps(
+            to_cutoff=True, entry_at_first_bar=True
+        ) == pytest.approx(208.333, abs=0.01)
+
+    def test_ギャップの判定は日足の始値のまま(self, mif: ModuleType) -> None:
+        """**シグナルの定義は変えない。** 変えるのは建てられる価格だけ。"""
+        path = self._path(mif)
+        assert path.gap_pct == pytest.approx(-0.05)
+
+    def test_寄り付きのバーがあれば両者は一致する(self, mif: ModuleType) -> None:
+        daily = {
+            "A": (
+                _daily("A", DAY1, open_=1000, close=1000),
+                _daily("A", DAY2, open_=950, close=990),
+            )
+        }
+        intraday = {
+            "A": (
+                _five_min("A", DAY2, time(9, 0), open_=950, close=960),
+                _five_min("A", DAY2, time(14, 45), open_=975, close=980),
+            )
+        }
+        path = mif.intraday_paths(daily, intraday)[0]
+        assert path.fade_bps(to_cutoff=True) == pytest.approx(
+            path.fade_bps(to_cutoff=True, entry_at_first_bar=True)
+        )
+
+    def test_ギャップアップなら符号が反転する(self, mif: ModuleType) -> None:
+        daily = {
+            "A": (
+                _daily("A", DAY1, open_=1000, close=1000),
+                _daily("A", DAY2, open_=1050, close=1010),
+            )
+        }
+        intraday = {
+            "A": (
+                _five_min("A", DAY2, time(9, 5), open_=1040, close=1035),
+                _five_min("A", DAY2, time(14, 45), open_=1025, close=1020),
+            )
+        }
+        path = mif.intraday_paths(daily, intraday)[0]
+        # 1040 → 1020 は下落。ギャップアップのフェードなので正
+        assert path.fade_bps(to_cutoff=True, entry_at_first_bar=True) > 0
+
+
 class TestClusteredMean:
     def test_日ごとに等ウェイトにする(self, mif: ModuleType) -> None:
         """**該当銘柄が多い日を過大に扱わない**（意思決定ログ72）。"""

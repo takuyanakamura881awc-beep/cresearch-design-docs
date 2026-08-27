@@ -151,17 +151,32 @@ class IntradayPath:
             return None
         return (self.daily_open - self.prev_close) / self.prev_close
 
-    def fade_bps(self, *, to_cutoff: bool) -> float | None:
-        """ギャップと逆に動いたら正。``to_cutoff`` で 14:50 と大引けを切り替える。
+    def fade_bps(
+        self, *, to_cutoff: bool, entry_at_first_bar: bool = False
+    ) -> float | None:
+        """ギャップと逆に動いたら正。エントリーと手仕舞いの取り方を切り替える。
 
         `scripts/measure_gap_fade.py` の `fade_score` と同じ符号の規約。
         **式を写しているのではなく、同じ規約を別の測定単位（bps・14:50 まで）で
         使っている**——あちらは日足だけ、こちらは5分足を突き合わせる。
+
+        Args:
+            to_cutoff: ``True`` なら 14:50 まで、``False`` なら大引けまで。
+            entry_at_first_bar: ``True`` なら**実際に建てられる最初のバー**の
+                始値で建てる。**Yahoo の日本株5分足は寄り付きの1本を
+                構造的に落とす**（意思決定ログ83）ので、日足の始値で建てる
+                という仮定は64%の日で実現できない。
+
+        **``gap_pct`` は常に日足の始値で計算する。** シグナルの定義は
+        「前日終値 vs 当日始値」であり、そちらは実測で正しいと確認済み
+        （意思決定ログ82）。変えるのは**建てられる価格**だけ。
         """
         gap = self.gap_pct
         if gap is None or gap == 0:
             return None
-        move = self.return_to_cutoff_bps if to_cutoff else self.return_to_close_bps
+        entry = self.first_bar_open if entry_at_first_bar else self.daily_open
+        exit_price = self.cutoff_close if to_cutoff else self.daily_close
+        move = (exit_price - entry) / entry * 10_000.0
         return -move if gap > 0 else move
 
 
@@ -377,6 +392,14 @@ def _report_open_mismatch_cause(paths: tuple[IntradayPath, ...]) -> None:
     print("  日足の始値そのものは信用してよい。")
 
 
+MIN_BARS_FOR_ANALYSIS = 50
+"""成績の集計に使う最低のバー本数。
+
+**実測で1本しか無い日があった。** そういう日の「最初のバー」は
+寄り付きとは無関係な時刻なので、混ぜると `entry_at_first_bar` の
+測定が壊れる。完全な1日が66本なので、その3/4を下限にする。
+"""
+
 SESSION_BARS = 66
 """完全な1日の5分足の本数。
 
@@ -478,9 +501,16 @@ def _report_gap_fade(paths: tuple[IntradayPath, ...]) -> None:
     print("  （意思決定ログ75）。net bps が最大の 2.0% は t=0.6 だった。")
     print()
 
-    candidates = [
+    matched = [
         p for p in paths if (g := p.gap_pct) is not None and abs(g) >= GAP_THRESHOLD_PCT
     ]
+    # **バーがほとんど無い日を混ぜない。** 実測で1本しか無い日があり、
+    # そういう日の「最初のバー」は寄り付きとは無関係な時刻になる。
+    candidates = [p for p in matched if p.bar_count >= MIN_BARS_FOR_ANALYSIS]
+    dropped = len(matched) - len(candidates)
+    if dropped:
+        print(f"  バー本数が {MIN_BARS_FOR_ANALYSIS}本未満で除外: {dropped}件")
+        print()
     if len(candidates) < 2:
         print("  該当が足りない。5分足がもっと貯まってから")
         return
@@ -497,24 +527,36 @@ def _report_gap_fade(paths: tuple[IntradayPath, ...]) -> None:
             print(f"  【{group_label}】該当が足りない（{len(group)}件）")
             continue
         print(f"  【{group_label}】{len(group)}件")
-        for label, to_cutoff in (
-            (f"{CUTOFF.strftime('%H:%M')} で手仕舞い", True),
-            ("大引けで手仕舞い", False),
-        ):
+        variants = (
+            ("日足の始値→大引け（従来の仮定）", False, False),
+            (f"日足の始値→{CUTOFF.strftime('%H:%M')}", False, True),
+            (f"最初のバー→{CUTOFF.strftime('%H:%M')}（実現可能）", True, True),
+        )
+        for label, at_first_bar, to_cutoff in variants:
             samples = tuple(
                 (p.day, v)
                 for p in group
-                if (v := p.fade_bps(to_cutoff=to_cutoff)) is not None
+                if (
+                    v := p.fade_bps(
+                        to_cutoff=to_cutoff, entry_at_first_bar=at_first_bar
+                    )
+                )
+                is not None
             )
             stats = clustered_mean(samples)
             if stats is None:
                 continue
             print(
-                f"    {label:<20} gross {stats.mean_bps:>+8.2f}bps "
+                f"    {label:<34} gross {stats.mean_bps:>+8.2f}bps "
                 f"（{stats.days}日 / t={stats.t_stat:>5.1f}）"
             )
         print()
 
+    print("  **「実現可能」の行が本題。** Yahoo の日本株5分足は寄り付きの1本を")
+    print("  構造的に落とすので（意思決定ログ83）、日足の始値で建てる仮定は")
+    print("  64%の日で実現できない。**この行が従来の仮定と大きく違うなら、")
+    print("  優位はあっても取りに行けない。**")
+    print()
     print("  **42営業日では判定できない。** 日足の486営業日に対して1割に満たず、")
     print("  t値もほぼゼロになる。ここで見るのは**優位の有無ではなく、")
     print("  14:50 と大引けの差**——それは平均の差なので少ない日数でも測れる。")
