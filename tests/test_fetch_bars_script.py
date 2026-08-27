@@ -146,3 +146,96 @@ class TestLoadTopix100:
     def test_一覧が無ければ空(self, fb: ModuleType, data_root: Path) -> None:
         """**空でも落ちない。** 収集自体は Layer 1 だけで続行できる。"""
         assert fb.load_topix100() == ()
+
+
+class TestAccumulationReport:
+    """蓄積状況は**銘柄ごとに数える**。
+
+    和集合で数えると、1銘柄でも80日あれば「80日（227銘柄）」と出てしまい、
+    **ほとんど空の銘柄を「揃った」と誤読する**。途中から収集対象に加わった
+    銘柄（TOPIX100・意思決定ログ77）があるので、この区別は実際に効く。
+    """
+
+    def _store(self, tmp_path: Path, coverage: dict[str, int]) -> object:
+        from datetime import datetime
+
+        from autotrader.data.store import BarStore
+        from autotrader.types import Bar
+
+        store = BarStore(tmp_path)
+        for code, n_days in coverage.items():
+            if n_days == 0:
+                continue
+            bars = tuple(
+                Bar(
+                    symbol=code,
+                    timestamp=datetime(2026, 6, 1 + i, 9, 0),
+                    open=1000.0,
+                    high=1010.0,
+                    low=990.0,
+                    close=1005.0,
+                    volume=10_000,
+                )
+                for i in range(n_days)
+            )
+            store.write(code, "5m", bars)
+        return store
+
+    def test_1銘柄だけ揃っていても揃ったと言わない(
+        self, fb: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """**これが和集合で数えたときに起きる誤読。**"""
+        coverage = {"A": 25, **{f"S{i}": 1 for i in range(60)}}
+        store = self._store(tmp_path, coverage)
+        symbols = tuple(Symbol(code=c, name=c) for c in coverage)
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(fb, "WALKFORWARD_DAYS", 25)
+        try:
+            fb._print_accumulation(store, symbols)
+        finally:
+            monkey.undo()
+        out = capsys.readouterr().out
+        assert "Phase 4 を回せる" not in out
+        assert "25日以上ある銘柄: 1/61" in out
+        assert "最小: 1日" in out
+
+    def test_全銘柄が揃えば回せると言う(
+        self, fb: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        coverage = {f"S{i}": 26 for i in range(55)}
+        store = self._store(tmp_path, coverage)
+        symbols = tuple(Symbol(code=c, name=c) for c in coverage)
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(fb, "WALKFORWARD_DAYS", 25)
+        try:
+            fb._print_accumulation(store, symbols)
+        finally:
+            monkey.undo()
+        out = capsys.readouterr().out
+        assert "Phase 4 を回せる" in out
+
+    def test_日数は足りても銘柄数が監視枠に届かなければ回せない(
+        self, fb: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """**日次の監視枠50を埋められないなら、日数だけあっても意味がない。**"""
+        coverage = {f"S{i}": 26 for i in range(10)}
+        store = self._store(tmp_path, coverage)
+        symbols = tuple(Symbol(code=c, name=c) for c in coverage)
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(fb, "WALKFORWARD_DAYS", 25)
+        try:
+            fb._print_accumulation(store, symbols)
+        finally:
+            monkey.undo()
+        out = capsys.readouterr().out
+        assert "Phase 4 を回せる" not in out
+        assert "監視枠" in out
+
+    def test_5分足が1本も無ければその旨を出す(
+        self, fb: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from autotrader.data.store import BarStore
+
+        store = BarStore(tmp_path)
+        fb._print_accumulation(store, (Symbol(code="A", name="A"),))
+        assert "5分足がまだ無い" in capsys.readouterr().out

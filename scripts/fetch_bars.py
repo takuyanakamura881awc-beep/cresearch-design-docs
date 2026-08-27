@@ -48,6 +48,7 @@ from autotrader.data.yahoo import MAX_LOOKBACK_DAYS, YahooDataSource
 from autotrader.types import Bar, Symbol
 from autotrader.universe.builder import build
 from autotrader.universe.filters import FilterConfig
+from autotrader.universe.selector import DEFAULT_MAX_WATCHLIST
 
 DATA_ROOT = Path("data")
 UNIVERSE_PATH = DATA_ROOT / "universe.json"
@@ -297,30 +298,51 @@ def _print_accumulation(store: BarStore, symbols: tuple[Symbol, ...]) -> None:
     """
     hr("5. 5分足の蓄積状況")
 
-    days: set[date] = set()
-    covered = 0
+    # **銘柄ごとに数える。** 和集合で数えると、1銘柄でも80日あれば
+    # 「80日（227銘柄）」と出てしまい、**ほとんど空の銘柄を「揃った」と
+    # 誤読する**（意思決定ログ54・63で二度踏んだのと同じ種類の欠陥）。
+    # 途中から収集対象に加わった銘柄（TOPIX100・意思決定ログ77）があるので、
+    # この区別は実際に効く。
+    all_days: set[date] = set()
+    per_symbol: list[int] = []
     for symbol in symbols:
-        span = store.coverage(symbol.code, "5m")
-        if span is None:
+        symbol_days = {bar.timestamp.date() for bar in store.read(symbol.code, "5m")}
+        if not symbol_days:
             continue
-        covered += 1
-        for bar in store.read(symbol.code, "5m"):
-            days.add(bar.timestamp.date())
+        per_symbol.append(len(symbol_days))
+        all_days |= symbol_days
 
-    if not days:
+    if not per_symbol:
         print("  5分足がまだ無い")
         return
 
-    business_days = len(days)
-    print(f"  期間      : {min(days)} 〜 {max(days)}")
-    print(f"  営業日数  : {business_days}日（{covered}銘柄）")
-    print(f"  必要日数  : {WALKFORWARD_DAYS}日（ウォークフォワード 学習60 + 検証20）")
+    per_symbol.sort()
+    median_days = per_symbol[len(per_symbol) // 2]
+    ready = sum(1 for d in per_symbol if d >= WALKFORWARD_DAYS)
 
-    if business_days >= WALKFORWARD_DAYS:
-        print("  **Phase 4（ウォークフォワードでのパラメータ確定）を回せる**")
+    print(f"  期間          : {min(all_days)} 〜 {max(all_days)}")
+    print(f"  5分足がある銘柄: {len(per_symbol)}/{len(symbols)}")
+    print(f"  必要日数      : {WALKFORWARD_DAYS}日（ウォークフォワード 学習60 + 検証20）")
+    print()
+    print("  **銘柄ごとの営業日数**（和集合ではない——途中から加えた銘柄があるため）")
+    print(f"    中央値: {median_days}日 / 最小: {per_symbol[0]}日 / 最大: {per_symbol[-1]}日")
+    print(f"    {WALKFORWARD_DAYS}日以上ある銘柄: {ready}/{len(per_symbol)}")
+
+    print()
+    if ready >= DEFAULT_MAX_WATCHLIST:
+        print(
+            f"  **Phase 4 を回せる**（{WALKFORWARD_DAYS}日以上ある銘柄が "
+            f"日次の監視枠 {DEFAULT_MAX_WATCHLIST} を満たす）"
+        )
     else:
-        remaining = WALKFORWARD_DAYS - business_days
-        print(f"  あと {remaining}営業日ぶん足りない（約{remaining / 5:.0f}週）")
+        remaining = WALKFORWARD_DAYS - median_days
+        if remaining > 0:
+            print(f"  あと {remaining}営業日ぶん足りない（約{remaining / 5:.0f}週）")
+        else:
+            print(
+                f"  日数は足りているが、{WALKFORWARD_DAYS}日以上ある銘柄が "
+                f"{ready}件で監視枠 {DEFAULT_MAX_WATCHLIST} に届かない"
+            )
         print()
         print("  **yfinance の5分足は常に58日ぶんしか返さない。**")
         print("  BarStore は既存データとマージするので、週1回この取得を回せば")
