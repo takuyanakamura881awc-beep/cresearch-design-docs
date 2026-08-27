@@ -45,8 +45,6 @@
 from __future__ import annotations
 
 import argparse
-import math
-import statistics
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -54,6 +52,7 @@ from datetime import date, time
 from pathlib import Path
 
 from autotrader.data.store import BarStore
+from autotrader.diagnostics import clustered_stats
 from autotrader.engine.scheduler import MarketScheduler
 from autotrader.provenance import banner
 from autotrader.types import Bar, Symbol
@@ -291,37 +290,12 @@ def intraday_paths(
     return tuple(paths)
 
 
-@dataclass(frozen=True)
-class ClusteredMean:
-    """日ごとにまとめてから出した平均と t値（意思決定ログ72）。"""
+clustered_mean = clustered_stats
+"""日クラスタ集計。**`autotrader.diagnostics` の実装をそのまま使う。**
 
-    days: int
-    mean_bps: float
-    t_stat: float
-
-
-def clustered_mean(samples: tuple[tuple[date, float], ...]) -> ClusteredMean | None:
-    """``(営業日, 値)`` の列を、日ごとに平均してから日をまたいで集計する。
-
-    **件数ではなく日数が実質的な標本数。** 同じ日の銘柄は市場要因で
-    強く相関するので、件数ベースの t値は過大に出る。
-
-    Returns:
-        該当日が2日未満なら ``None``。
-    """
-    by_day: dict[date, list[float]] = defaultdict(list)
-    for day, value in samples:
-        by_day[day].append(value)
-    if len(by_day) < 2:
-        return None
-    daily = [statistics.fmean(values) for values in by_day.values()]
-    mean = statistics.fmean(daily)
-    stderr = statistics.stdev(daily) / math.sqrt(len(daily))
-    return ClusteredMean(
-        days=len(daily),
-        mean_bps=mean,
-        t_stat=mean / stderr if stderr > 0 else 0.0,
-    )
+以前はこのスクリプトと `measure_gap_fade.py` が同じものを別々に持っていた。
+規約「同じことをする関数を二つ作らない」に従ってモジュールへ出した。
+"""
 
 
 def load_symbols() -> tuple[Symbol, ...]:

@@ -44,6 +44,8 @@ from datetime import date
 from pathlib import Path
 
 from autotrader.data.store import BarStore
+from autotrader.diagnostics import ClusteredStats, split_days
+from autotrader.diagnostics import clustered_stats as clustered_from_samples
 from autotrader.provenance import banner
 from autotrader.tick import DEFAULT_SPREAD_TICKS, spread_yen
 from autotrader.types import Bar, Symbol
@@ -440,17 +442,6 @@ def capacity_stats(
     )
 
 
-@dataclass(frozen=True)
-class ClusteredStats:
-    """日ごとにまとめてから出した統計。**同じ日の銘柄は独立ではない。**"""
-
-    days: int
-    """実質的な標本数。**件数ではなくこちらが効く。**"""
-    mean_bps: float
-    """日ごとの平均 fade_score を、さらに日をまたいで平均したもの。"""
-    t_stat: float
-
-
 def clustered_stats(
     pairs: tuple[GapFadePair, ...], threshold: float
 ) -> ClusteredStats | None:
@@ -473,22 +464,10 @@ def clustered_stats(
     Returns:
         該当日が2日未満なら ``None``。
     """
-    by_day: dict[date, list[GapFadePair]] = defaultdict(list)
-    for pair in pairs:
-        if abs(pair.gap_pct) >= threshold:
-            by_day[pair.day].append(pair)
-    if len(by_day) < 2:
-        return None
-
-    daily = [
-        statistics.fmean(fade_score(p) * 10_000.0 for p in group) for group in by_day.values()
-    ]
-    mean = statistics.fmean(daily)
-    stderr = statistics.stdev(daily) / math.sqrt(len(daily))
-    return ClusteredStats(
-        days=len(daily),
-        mean_bps=mean,
-        t_stat=mean / stderr if stderr > 0 else 0.0,
+    return clustered_from_samples(
+        (p.day, fade_score(p) * 10_000.0)
+        for p in pairs
+        if abs(p.gap_pct) >= threshold
     )
 
 
@@ -619,13 +598,13 @@ def split_by_period(
     **銘柄ではなく日で切る。** 日数の中央値で分けるので、
     片方に日が偏らない（該当件数は偏りうる——それ自体が情報になる）。
     """
-    days = sorted({p.day for p in pairs})
-    if len(days) < 2:
+    first_days, second_days = split_days(p.day for p in pairs)
+    if not second_days:
         return (pairs, ())
-    boundary = days[len(days) // 2]
-    first = tuple(p for p in pairs if p.day < boundary)
-    second = tuple(p for p in pairs if p.day >= boundary)
-    return (first, second)
+    return (
+        tuple(p for p in pairs if p.day in first_days),
+        tuple(p for p in pairs if p.day in second_days),
+    )
 
 
 def _report_period_split(pairs: tuple[GapFadePair, ...]) -> None:
