@@ -165,7 +165,9 @@ def required_gross_bps(
     return net_bps + cost_bps
 
 
-def non_overlapping_days(days: Iterable[date], horizon: int) -> frozenset[date]:
+def non_overlapping_days(
+    days: Iterable[date], horizon: int, phase: int = 0
+) -> frozenset[date]:
     """``horizon`` 営業日保有するときに、**窓が重ならない**エントリー日だけを返す。
 
     **なぜ要るのか。** 3日保有を毎日エントリーして測ると、D日に建てた玉と
@@ -181,17 +183,26 @@ def non_overlapping_days(days: Iterable[date], horizon: int) -> frozenset[date]:
     時間方向で起きたもの。** 同じ日の銘柄が独立でないのと同様に、
     重なる保有期間も独立ではない。
 
+    **点推定にはこれを使わないこと。** 間引くとデータの (N-1)/N を捨てるうえ、
+    ``phase`` の選び方に結果が依存する——実測では5日保有の gross が
+    位相を変えるだけで +31.5 → +10.0bps と3倍動いた（意思決定ログ91）。
+    **gross と net は全観測から求め、重なりの補正は t値にだけ効かせる。**
+
     Args:
         days: 観測のある営業日（重複可）。
         horizon: 保有営業日数。1 なら全日を返す（重なりが無い）。
+        phase: 何日目から数え始めるか（``0 <= phase < horizon``）。
+            **位相を振ると推定がどれだけ動くかが、そのまま推定の不安定さ。**
 
     Returns:
-        重ならないエントリー日の集合。先頭から ``horizon`` 日おきに採る。
+        重ならないエントリー日の集合。``phase`` 日目から ``horizon`` 日おきに採る。
 
     Raises:
-        ValueError: ``horizon`` が1未満のとき。
+        ValueError: ``horizon`` が1未満、または ``phase`` が範囲外のとき。
     """
     if horizon < 1:
         raise ValueError("horizon は1以上")
+    if not 0 <= phase < horizon:
+        raise ValueError("phase は 0 以上 horizon 未満")
     ordered = sorted(set(days))
-    return frozenset(ordered[::horizon])
+    return frozenset(ordered[phase::horizon])

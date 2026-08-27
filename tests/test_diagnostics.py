@@ -218,6 +218,34 @@ class TestNonOverlappingDays:
         with pytest.raises(ValueError, match="horizon"):
             non_overlapping_days(self._days(5), 0)
 
+    def test_位相をずらすと別の日が選ばれる(self) -> None:
+        """**点推定に使ってはいけない理由。** どの日から数え始めたかに依存する。"""
+        days = self._days(6)
+        assert non_overlapping_days(days, 3, phase=0) == frozenset(
+            {days[0], days[3]}
+        )
+        assert non_overlapping_days(days, 3, phase=1) == frozenset(
+            {days[1], days[4]}
+        )
+        assert non_overlapping_days(days, 3, phase=2) == frozenset(
+            {days[2], days[5]}
+        )
+
+    def test_全位相を合わせると全日になる(self) -> None:
+        """**位相ごとの平均を集めれば、全体の平均と同じ標本を覆う。**"""
+        days = self._days(9)
+        covered: set[date] = set()
+        for phase in range(3):
+            covered |= non_overlapping_days(days, 3, phase)
+        assert covered == set(days)
+
+    def test_位相が範囲外ならエラー(self) -> None:
+        days = self._days(6)
+        with pytest.raises(ValueError, match="phase"):
+            non_overlapping_days(days, 3, phase=3)
+        with pytest.raises(ValueError, match="phase"):
+            non_overlapping_days(days, 3, phase=-1)
+
     def test_重なりを外すとt値が下がる(self) -> None:
         """**実測で 2.7 → 1.6 相当に落ちた**のと同じ構造を合成データで固定する。"""
         days = self._days(60)

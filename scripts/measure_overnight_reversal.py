@@ -312,42 +312,102 @@ def _report_horizons(pairs: tuple[ReversalPair, ...]) -> None:
         return
     print(f"  対象: |前日リターン| >= {threshold:.1%} の {len(bucket)}件")
     print()
-    print("  **窓が重ならないエントリー日だけを使う。** 3日保有を毎日建てると")
-    print("  D日とD+1日の玉が同じ日を共有し、独立な観測が日数/N しかなくなる")
-    print("  ——重なったまま t値を出すと約√N倍 過大に出る（意思決定ログ90）。")
+    print("  **点推定は全観測から。t値だけ重なりを補正する。**")
+    print("  3日保有を毎日建てるとD日とD+1日の玉が同じ日を共有し、独立な観測が")
+    print("  日数/N しかなくなる（重なったまま t値を出すと約√N倍 過大・意思決定ログ90）。")
+    print("  **間引くのは t値のためだけ**——点推定まで間引くと(N-1)/N を捨てる")
+    print("  うえ、どの日から数え始めたかに依存する（意思決定ログ91）。")
     print()
     print(
-        f"  {'保有':>5} {'独立日':>7} {'gross':>9} {'コスト':>9} {'net':>9} "
+        f"  {'保有':>5} {'gross':>9} {'コスト':>9} {'net':>9} "
         f"{'net/日':>8} {'年利':>8} {'t値':>6} {'必要':>8} {'判定':>4}"
     )
-    print("  " + "-" * 80)
+    print("  " + "-" * 72)
+    rows: list[tuple[int, float, float]] = []
     for horizon in HORIZONS:
-        entry_days = non_overlapping_days((p.day for p in bucket), horizon)
+        # **点推定は全観測。** 間引かない
         samples = tuple(
             (p.day, v * 10_000.0)
             for p in bucket
-            if p.day in entry_days and (v := reversal_score_at(p, horizon)) is not None
+            if (v := reversal_score_at(p, horizon)) is not None
         )
         stats = clustered_stats(samples)
         if stats is None:
             continue
-        cost = statistics.fmean(
-            holding_cost_bps(p, horizon) for p in bucket if p.day in entry_days
-        )
+        cost = statistics.fmean(holding_cost_bps(p, horizon) for p in bucket)
         need = required_gross_bps(ANNUAL_TARGET, cost_bps=cost, horizon_days=horizon)
         net = stats.mean_bps - cost
         per_day = net / horizon
         annual = (float((1.0 + per_day / 10_000.0) ** 240) - 1.0) * 100.0
+
+        # **t値だけ重なりを補正する。** 位相ごとに出して平均する
+        # （1つの位相だけ見ると、その位相の当たり外れが t値に混ざる）
+        t_values = [
+            phase_stats.t_stat
+            for phase in range(horizon)
+            if (days := non_overlapping_days((p.day for p in bucket), horizon, phase))
+            and (
+                phase_stats := clustered_stats(
+                    (d, v) for d, v in samples if d in days
+                )
+            )
+            is not None
+        ]
+        t_stat = statistics.fmean(t_values) if t_values else 0.0
+        rows.append((horizon, net, per_day))
         print(
-            f"  {horizon:>4}日 {stats.days:>7} {stats.mean_bps:>+8.2f}b "
+            f"  {horizon:>4}日 {stats.mean_bps:>+8.2f}b "
             f"{cost:>8.2f}b {net:>+8.2f}b {per_day:>+7.2f}b {annual:>+7.1f}% "
-            f"{stats.t_stat:>5.1f} {need:>7.1f}b {'○' if stats.mean_bps >= need else '×':>4}"
+            f"{t_stat:>5.1f} {need:>7.1f}b {'○' if stats.mean_bps >= need else '×':>4}"
         )
     print()
     print("  **保有期間をまたいで比べられるのは net/日 と年利だけ。**")
     print(f"  目標は年利{ANNUAL_TARGET:.0%}〜35%（意思決定ログ73）。")
     print("  **必要gross は保有期間にほぼ比例して上がる**（回転が 1/N になるため）。")
     print("  gross がそれより速く伸びなければ、延ばしても目標には近づかない。")
+
+    _report_phase_stability(bucket)
+
+
+def _report_phase_stability(bucket: tuple[ReversalPair, ...]) -> None:
+    """位相を変えると推定がどれだけ動くか。**動くならその推定は信用できない。**
+
+    実測では5日保有の gross が、先頭から数え始めるか1日ずらすかだけで
+    +31.5 → +10.0bps と3倍動いた（意思決定ログ91）。
+    **この振れ幅そのものが不確かさ**であり、統計量を足すより直接的に効く。
+    """
+    print()
+    print("  【位相を変えるとどれだけ動くか】**動くなら推定を信用しない**")
+    print("  N日おきに間引くとき、何日目から数え始めるかを振る。")
+    print()
+    print(f"  {'保有':>5} {'gross(全体)':>12} {'位相の最小':>11} {'位相の最大':>11} {'振れ幅':>9}")
+    print("  " + "-" * 54)
+    for horizon in HORIZONS:
+        samples = tuple(
+            (p.day, v * 10_000.0)
+            for p in bucket
+            if (v := reversal_score_at(p, horizon)) is not None
+        )
+        overall = clustered_stats(samples)
+        if overall is None:
+            continue
+        if horizon == 1:
+            print(f"  {horizon:>4}日 {overall.mean_bps:>+11.2f}b {'—（重なりなし）':>28}")
+            continue
+        means: list[float] = []
+        for phase in range(horizon):
+            days = non_overlapping_days((p.day for p in bucket), horizon, phase)
+            phase_stats = clustered_stats((d, v) for d, v in samples if d in days)
+            if phase_stats is not None:
+                means.append(phase_stats.mean_bps)
+        if not means:
+            continue
+        print(
+            f"  {horizon:>4}日 {overall.mean_bps:>+11.2f}b {min(means):>+10.2f}b "
+            f"{max(means):>+10.2f}b {max(means) - min(means):>+8.2f}b"
+        )
+    print()
+    print("  **振れ幅が gross そのものと同じ桁なら、その保有期間の推定は無意味。**")
 
 
 def _report_rate_sensitivity(pairs: tuple[ReversalPair, ...]) -> None:
@@ -369,20 +429,18 @@ def _report_rate_sensitivity(pairs: tuple[ReversalPair, ...]) -> None:
     print(f"  {'保有':>5} {'gross':>9}   net: {header}")
     print("  " + "-" * 56)
     for horizon in HORIZONS:
-        entry_days = non_overlapping_days((p.day for p in bucket), horizon)
-        window = tuple(p for p in bucket if p.day in entry_days)
         samples = tuple(
             (p.day, v * 10_000.0)
-            for p in window
+            for p in bucket
             if (v := reversal_score_at(p, horizon)) is not None
         )
         stats = clustered_stats(samples)
-        if stats is None or not window:
+        if stats is None:
             continue
         cells: list[str] = []
         for rate in rates:
             cost = statistics.fmean(
-                holding_cost_bps(p, horizon, annual_rate=rate) for p in window
+                holding_cost_bps(p, horizon, annual_rate=rate) for p in bucket
             )
             cells.append(f"{stats.mean_bps - cost:>+6.1f}b")
         nets = "  ".join(cells)
