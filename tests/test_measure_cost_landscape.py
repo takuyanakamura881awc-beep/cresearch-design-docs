@@ -161,3 +161,56 @@ class TestTradable:
         row = self._row(mcl, "A", price=1_250.0, turnover=1e9)
         assert row.affordable(500_000)
         assert not self._row(mcl, "B", price=1_251.0, turnover=1e9).affordable(500_000)
+
+
+class TestSelectUniverse:
+    """**構造的な基準だけで切り出す。** 成績は一切見ない（意思決定ログ94・95）。"""
+
+    def _row(
+        self, mcl: ModuleType, code: str, *, price: float, turnover: float
+    ) -> Any:
+        return mcl.MarketRow(
+            code=code,
+            name=code,
+            price=price,
+            avg_turnover_yen=turnover,
+            topix100=False,
+            scale_category="TOPIX Mid400",
+        )
+
+    def test_コストの安い順に並ぶ(self, mcl: ModuleType) -> None:
+        rows = (
+            self._row(mcl, "MID", price=2_500.0, turnover=1e9),   # 8bps
+            self._row(mcl, "CHEAP", price=3_000.0, turnover=1e9),  # 6.7bps
+            self._row(mcl, "PRICY", price=2_000.0, turnover=1e9),  # 10bps
+        )
+        assert [r.code for r in mcl.select_universe(rows)] == ["CHEAP", "MID", "PRICY"]
+
+    def test_同じコストなら売買代金の大きい順(self, mcl: ModuleType) -> None:
+        """**どちらも成績とは無関係な構造的な量。**"""
+        rows = (
+            self._row(mcl, "THIN", price=3_000.0, turnover=5e8),
+            self._row(mcl, "DEEP", price=3_000.0, turnover=9e9),
+        )
+        assert [r.code for r in mcl.select_universe(rows)] == ["DEEP", "THIN"]
+
+    def test_コスト上限を超える銘柄は入らない(self, mcl: ModuleType) -> None:
+        rows = (
+            self._row(mcl, "OK", price=2_000.0, turnover=1e9),     # 10bps
+            self._row(mcl, "EXPENSIVE", price=1_000.0, turnover=1e9),  # 20bps
+        )
+        assert [r.code for r in mcl.select_universe(rows)] == ["OK"]
+
+    def test_株価上限を超える銘柄は入らない(self, mcl: ModuleType) -> None:
+        """資金120万円なら株価上限3,000円（安全装置#7）。"""
+        rows = (self._row(mcl, "TOO_HIGH", price=3_500.0, turnover=1e9),)
+        assert mcl.select_universe(rows) == ()
+
+    def test_流動性が足りない銘柄は入らない(self, mcl: ModuleType) -> None:
+        rows = (self._row(mcl, "THIN", price=3_000.0, turnover=1e6),)
+        assert mcl.select_universe(rows) == ()
+
+    def test_資金とコスト上限を上書きできる(self, mcl: ModuleType) -> None:
+        rows = (self._row(mcl, "A", price=1_000.0, turnover=1e9),)  # 20bps
+        assert mcl.select_universe(rows) == ()
+        assert len(mcl.select_universe(rows, max_cost_bps=20.0)) == 1

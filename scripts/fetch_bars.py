@@ -141,6 +141,30 @@ def load_topix100() -> tuple[Symbol, ...]:
     return ()
 
 
+def load_cheap_universe() -> tuple[Symbol, ...]:
+    """コストで切り出したユニバース。`scripts/measure_cost_landscape.py` が作る。
+
+    **なぜここで要るのか。** `universe.json`（Layer 1・株価≤1,250円）でも
+    TOPIX100 でも3〜5手法が棄却された。地図を作ったところ、
+    **安く取引できる銘柄の大半は中型・小型株の高株価帯（2,000〜3,000円）**
+    で、その432銘柄を丸ごと飛ばしていたことが分かった（意思決定ログ95）。
+
+    **成績で選んだ銘柄群ではない**——コスト・流動性・銘柄数という
+    構造的な基準だけで切り出してある（`select_universe`）。
+
+    **無ければ空を返す。** 一覧の作成は `measure_cost_landscape.py --refresh`
+    の責務にしてある（J-Quants の全銘柄取得に十数分かかるため）。
+    """
+    path = DATA_ROOT / "universe_cheap.json"
+    if not path.is_file():
+        return ()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return tuple(
+        Symbol(code=row["code"], name=row["name"], scale_category=row.get("scale_category"))
+        for row in payload["symbols"]
+    )
+
+
 def save_universe(as_of: date, symbols: tuple[Symbol, ...]) -> None:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     UNIVERSE_PATH.write_text(
@@ -380,6 +404,17 @@ def main() -> int:
     # **TOPIX100 を足す。** universe.json は Layer 1（小型〜中型）だけで、
     # そこでは3手法とも棄却された。唯一 net 正が出た TOPIX100 の5分足が
     # 貯まっていないと、日足の上限見積りを実際の約定モデルで検証できない。
+    cheap = load_cheap_universe()
+    if cheap:
+        known = {s.code for s in symbols}
+        extra = tuple(s for s in cheap if s.code not in known)
+        symbols = symbols + extra
+        print(f"  コストで切り出したユニバース: {len(cheap)}銘柄（うち新規 {len(extra)}）")
+        print("  → 中型・小型の高株価帯。**両端だけ試して真ん中を飛ばしていた**")
+    else:
+        print("  コストで切り出したユニバースが無い")
+        print("  （python scripts/measure_cost_landscape.py --refresh で作る）")
+
     topix100 = load_topix100()
     if topix100:
         known = {s.code for s in symbols}

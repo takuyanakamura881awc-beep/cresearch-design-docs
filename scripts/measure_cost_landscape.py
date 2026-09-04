@@ -175,6 +175,107 @@ def tradable(
     )
 
 
+SELECT_CAPITAL_YEN = 1_200_000
+"""ユニバースを切り出すときの資金。
+
+**成績ではなく地図から決めた**——50万円では10bps以下が6銘柄しかなく
+監視枠50を埋められないが、120万円で287銘柄になる（意思決定ログ95）。
+`5,000,000円` まで振っても338銘柄で頭打ちなので、**120万円が
+「使える銘柄数が跳ねる最初の点」**であって曲線の最大値ではない。
+"""
+
+SELECT_MAX_COST_BPS = 10.0
+"""切り出すコストの上限（bps）。
+
+年利25%に要る gross は `9.3 + コスト` なので（`diagnostics.required_gross_bps`）、
+**10bps なら必要19.3bps**。TOPIX100 の14.1bps より高いが、
+銘柄数が 99 → 287 と桁違いになる。
+"""
+
+UNIVERSE_PATH = DATA_ROOT / "universe_cheap.json"
+"""切り出したユニバースの保存先。`scripts/fetch_bars.py` が読む。"""
+
+
+def select_universe(
+    rows: tuple[MarketRow, ...],
+    *,
+    capital_yen: int = SELECT_CAPITAL_YEN,
+    max_cost_bps: float = SELECT_MAX_COST_BPS,
+) -> tuple[MarketRow, ...]:
+    """構造的な基準だけでユニバースを切り出す。
+
+    **成績を一切見ない**——`MarketRow` は成績の欄を持たないので、
+    見ようと思っても見られない（意思決定ログ94）。
+
+    並び順は**コストの安い順**。同じコストなら売買代金の大きい順にする
+    ——どちらも成績とは無関係な構造的な量。
+    """
+    pool = tradable(rows, capital_yen, max_cost_bps=max_cost_bps)
+    return tuple(sorted(pool, key=lambda r: (r.cost_bps, -r.avg_turnover_yen)))
+
+
+def _save_universe(rows: tuple[MarketRow, ...], as_of: str) -> None:
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    UNIVERSE_PATH.write_text(
+        json.dumps(
+            {
+                "as_of": as_of,
+                "note": (
+                    "コスト・流動性・銘柄数という構造的な基準だけで選んだユニバース。"
+                    "成績は一切見ていない（意思決定ログ94・95）"
+                ),
+                "capital_yen": SELECT_CAPITAL_YEN,
+                "max_cost_bps": SELECT_MAX_COST_BPS,
+                "symbols": [
+                    {
+                        "code": r.code,
+                        "name": r.name,
+                        "scale_category": r.scale_category,
+                        "price": r.price,
+                        "cost_bps": r.cost_bps,
+                    }
+                    for r in rows
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"  保存: {UNIVERSE_PATH}（{len(rows)}銘柄）")
+
+
+def _report_selection(rows: tuple[MarketRow, ...], as_of: str) -> None:
+    """切り出したユニバースの中身。**保存して `fetch_bars.py` に渡す。**"""
+    hr("4. 構造的な基準で切り出したユニバース")
+    print(
+        f"  資金 {SELECT_CAPITAL_YEN:,}円 / コスト {SELECT_MAX_COST_BPS:.0f}bps以下 / "
+        f"売買代金 {DEFAULT_MIN_AVG_TURNOVER_YEN:,}円以上"
+    )
+    print("  **成績は一切見ていない。** 順序はコストの安い順（同点なら売買代金順）。")
+    print()
+    selected = select_universe(rows)
+    if not selected:
+        print("  該当なし")
+        return
+    costs = sorted(r.cost_bps for r in selected)
+    print(f"  銘柄数  : {len(selected)}（日次の監視枠50に対して{len(selected) / 50:.1f}倍）")
+    median = costs[len(costs) // 2]
+    print(f"  コスト  : 中央値 {median:.1f}bps / 最小 {costs[0]:.1f} / 最大 {costs[-1]:.1f}")
+    print(f"  必要gross: 年利25%・建玉率100%で {9.3 + median:.1f}bps")
+    print()
+    by_scale: dict[str, int] = {}
+    for r in selected:
+        key = r.scale_category or "（区分なし）"
+        by_scale[key] = by_scale.get(key, 0) + 1
+    for scale, n in sorted(by_scale.items(), key=lambda kv: -kv[1]):
+        print(f"    {scale:<20} {n:>4}")
+    print()
+    _save_universe(selected, as_of)
+    print()
+    print("  次: python scripts/fetch_bars.py でこの銘柄群の日足を貯める")
+
+
 def hr(title: str) -> None:
     print()
     print("=" * 70)
@@ -262,7 +363,17 @@ def main() -> int:
         return 0
 
     _report_inventory(rows)
+    _report_selection(rows, _snapshot_as_of())
     return 0
+
+
+def _snapshot_as_of() -> str:
+    if SNAPSHOT_PATH.is_file():
+        payload = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        as_of = payload.get("as_of")
+        if isinstance(as_of, str):
+            return as_of
+    return date.today().isoformat()
 
 
 def _report_inventory(rows: tuple[MarketRow, ...]) -> None:

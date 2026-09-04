@@ -239,3 +239,34 @@ class TestAccumulationReport:
         store = BarStore(tmp_path)
         fb._print_accumulation(store, (Symbol(code="A", name="A"),))
         assert "5分足がまだ無い" in capsys.readouterr().out
+
+
+class TestLoadCheapUniverse:
+    """コストで切り出したユニバース。**中型・小型の高株価帯**（意思決定ログ95）。
+
+    `universe.json`（≤1,250円）でも TOPIX100（大型）でも手法が棄却された。
+    地図を作ったところ、**安く取引できる銘柄の大半は真ん中の帯**にあり、
+    そこを丸ごと飛ばしていた。
+    """
+
+    def test_保存された銘柄を読む(self, fb: ModuleType, data_root: Path) -> None:
+        (data_root / "universe_cheap.json").write_text(
+            json.dumps(
+                {
+                    "as_of": "2026-06-12",
+                    "symbols": [
+                        {"code": "7203", "name": "トヨタ", "scale_category": "TOPIX Core30"},
+                        {"code": "1234", "name": "中型", "scale_category": "TOPIX Mid400"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        loaded = fb.load_cheap_universe()
+        assert [s.code for s in loaded] == ["7203", "1234"]
+        assert loaded[1].scale_category == "TOPIX Mid400"
+
+    def test_一覧が無ければ空(self, fb: ModuleType, data_root: Path) -> None:
+        """**空でも落ちない。** 収集自体は既存の銘柄群で続行できる。"""
+        assert fb.load_cheap_universe() == ()
