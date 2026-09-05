@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -331,3 +332,64 @@ class TestHoldingCost:
         assert mor.holding_cost_bps(pair, 5, annual_rate=0.0) == pytest.approx(
             mor.round_trip_cost_bps(pair)
         )
+
+
+class TestLoadCheapUniverse:
+    """コストで切り出したユニバースの読み込み（意思決定ログ95）。
+
+    **判定基準は変えない。** ユニバースを差し替えるだけで、
+    `_report_verdict` の3条件はそのまま使う（意思決定ログ46・75）。
+    """
+
+    def test_universe_cheapを読む(
+        self, mor: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mor, "DATA_ROOT", tmp_path)
+        (tmp_path / "universe_cheap.json").write_text(
+            json.dumps(
+                {
+                    "as_of": "2026-06-12",
+                    "symbols": [
+                        {"code": "1234", "name": "中型", "scale_category": "TOPIX Mid400"},
+                        {"code": "5678", "name": "小型", "scale_category": "TOPIX Small 1"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        loaded = mor.load_symbols(topix100_only=False, cheap=True)
+        assert [s.code for s in loaded] == ["1234", "5678"]
+        # **TOPIX100 ではないので通常銘柄の呼値になる**
+        assert not any(s.is_topix100 for s in loaded)
+
+    def test_一覧が無ければ作り方を案内して終了(
+        self, mor: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mor, "DATA_ROOT", tmp_path)
+        with pytest.raises(SystemExit, match="measure_cost_landscape"):
+            mor.load_symbols(topix100_only=False, cheap=True)
+
+    def test_TOPIX100の一覧とは別物(
+        self, mor: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """**混ぜない。** 呼値が違うのでコストが1桁変わる。"""
+        monkeypatch.setattr(mor, "DATA_ROOT", tmp_path)
+        (tmp_path / "universe_cheap.json").write_text(
+            json.dumps(
+                {"symbols": [{"code": "1234", "name": "中型", "scale_category": "TOPIX Mid400"}]},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (tmp_path / "master_scale_historical.json").write_text(
+            json.dumps(
+                {"symbols": [{"code": "7203", "name": "トヨタ", "scale_category": "TOPIX Core30"}]},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        cheap = mor.load_symbols(topix100_only=False, cheap=True)
+        topix = mor.load_symbols(topix100_only=True)
+        assert [s.code for s in cheap] == ["1234"]
+        assert [s.code for s in topix] == ["7203"]

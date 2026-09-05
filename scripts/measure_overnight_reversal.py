@@ -449,12 +449,30 @@ def _report_rate_sensitivity(pairs: tuple[ReversalPair, ...]) -> None:
     print("  **どの想定でも判定が変わらないなら、金利を調べに行く必要はない。**")
 
 
-def load_symbols(*, topix100_only: bool) -> tuple[Symbol, ...]:
+def load_symbols(*, topix100_only: bool, cheap: bool = False) -> tuple[Symbol, ...]:
     """銘柄一覧。`scripts/measure_gap_fade.py` と同じ読み込み方をする。
 
     **スクリプト間で import せず、それぞれ自己完結させる**
     （スクリプトファイルは pythonpath に乗らないため）。
+
+    Args:
+        topix100_only: TOPIX100 構成銘柄だけに絞る。
+        cheap: `scripts/measure_cost_landscape.py` が**成績を一切見ずに**
+            切り出したユニバースを使う（意思決定ログ95）。
+            コスト10bps以下・流動性3億円以上・資金120万円で建てられる287銘柄で、
+            **中型・小型の高株価帯**が中心。Layer 1（≤1,250円）と TOPIX100（大型）
+            という両端だけを試して飛ばしていた領域。
     """
+    if cheap:
+        path = DATA_ROOT / "universe_cheap.json"
+        if not path.is_file():
+            raise SystemExit(
+                f"{path} がない。"
+                "先に python scripts/measure_cost_landscape.py --refresh を実行する"
+            )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return tuple(_to_symbol(r) for r in payload["symbols"])
+
     if topix100_only:
         # **検証期間の開始時点の一覧を使う。** 現在の一覧で過去を測るのは
         # サバイバーシップバイアス（`docs/03-universe.md` §4.2・意思決定ログ66）
@@ -629,15 +647,33 @@ def main() -> int:
         action="store_true",
         help="TOPIX100 構成銘柄だけで測る（呼値0.1〜0.5円でコストが1桁下がる）",
     )
+    parser.add_argument(
+        "--cheap",
+        action="store_true",
+        help=(
+            "コストで切り出したユニバースで測る（意思決定ログ95）。"
+            "**成績を一切見ずに**コスト10bps以下・流動性3億円以上で選んだ287銘柄。"
+            "中型・小型の高株価帯が中心で、これまで飛ばしていた領域"
+        ),
+    )
     args = parser.parse_args()
+    if args.topix100 and args.cheap:
+        raise SystemExit("--topix100 と --cheap は同時に指定できない")
 
     print("前日の値動きの反転を測る（寄成で建てられる初めての候補）")
     print(banner())
 
-    symbols = load_symbols(topix100_only=args.topix100)
+    symbols = load_symbols(topix100_only=args.topix100, cheap=args.cheap)
     if args.topix100:
         print(f"  **TOPIX100 のみ**（呼値0.1〜0.5円）: {len(symbols)}銘柄")
         print("  構成銘柄は検証期間の開始時点のもの（docs/03 §4.2）")
+    elif args.cheap:
+        print(f"  **コストで切り出したユニバース**: {len(symbols)}銘柄")
+        print("  **成績を一切見ずに**コスト10bps以下・流動性3億円以上で選んだ")
+        print("  （意思決定ログ95）。中型・小型の高株価帯が中心。")
+        print()
+        print("  **判定基準は TOPIX100 のときと同じものをそのまま使う。**")
+        print("  ユニバースを変えただけで基準を緩めない（意思決定ログ46・75）。")
     topix100_codes = frozenset(s.code for s in symbols if s.is_topix100)
 
     store = BarStore(DATA_ROOT)
