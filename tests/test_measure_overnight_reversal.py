@@ -19,7 +19,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -393,3 +393,94 @@ class TestLoadCheapUniverse:
         topix = mor.load_symbols(topix100_only=True)
         assert [s.code for s in cheap] == ["1234"]
         assert [s.code for s in topix] == ["7203"]
+
+
+class TestCalendarGuard:
+    """出口を **index ではなく暦日**で選ぶ（意思決定ログ97）。
+
+    以前は ``ordered[i + horizon - 1]`` をそのまま出口にしていたので、
+    日足が欠けている銘柄では**数か月先の終値が「N営業日保有」として
+    混ざりえた**。実測でセクション4だけが桁違いになった原因の候補。
+    """
+
+    def test_許す暦日数は保有期間とともに増える(self, mor: ModuleType) -> None:
+        assert mor.max_calendar_days(1) < mor.max_calendar_days(10)
+        # 10営業日は最短でも14暦日。連休を挟む余地を残す
+        assert mor.max_calendar_days(10) >= 14
+
+    def _gapped(self, mor: ModuleType, gap_days: int) -> dict[str, tuple[Bar, ...]]:
+        """3日連続したあと ``gap_days`` 空けて1本だけ続く日足。"""
+        base = date(2026, 6, 1)
+        days = [base, base + timedelta(days=1), base + timedelta(days=2)]
+        days.append(days[-1] + timedelta(days=gap_days))
+        closes = [1000.0, 1050.0, 1010.0, 5000.0]
+        return {
+            "A": tuple(
+                _bar("A", d, open_=1000.0, close=c)
+                for d, c in zip(days, closes, strict=True)
+            )
+        }
+
+    def test_離れすぎた出口は採用しない(self, mor: ModuleType) -> None:
+        pair = mor.reversal_pairs(self._gapped(mor, 90))[0]
+        # 1日（当日の終値）は残り、2日（90暦日先）は落ちる
+        assert set(dict(pair.forward_returns)) == {1}
+
+    def test_通常の間隔なら採用する(self, mor: ModuleType) -> None:
+        pair = mor.reversal_pairs(self._gapped(mor, 3))[0]
+        assert set(dict(pair.forward_returns)) == {1, 2}
+
+    def test_捨てた出口を数えて報告できる(self, mor: ModuleType) -> None:
+        """**黙って捨てない。** 件数と最悪ケースが取り出せること。"""
+        drops = mor.forward_exit_drops(self._gapped(mor, 90))
+        assert len(drops) == 1
+        assert drops[0].symbol == "A"
+        assert drops[0].horizon == 2
+        assert drops[0].elapsed_days == 90
+
+    def test_問題なければ捨てた出口はゼロ(self, mor: ModuleType) -> None:
+        assert mor.forward_exit_drops(self._gapped(mor, 3)) == ()
+
+
+class TestExtremeForwardReturns:
+    """異常値は**丸めず切らず、実物を名指しで出す**。
+
+    外れ値の刈り込みは、このプロジェクトが2度踏んだ切り捨てバイアス
+    （意思決定ログ59・71）そのもの。
+    """
+
+    def _daily(self, closes: list[float]) -> dict[str, tuple[Bar, ...]]:
+        base = date(2026, 6, 1)
+        return {
+            "A": tuple(
+                _bar("A", base + timedelta(days=i), open_=1000.0, close=c)
+                for i, c in enumerate(closes)
+            )
+        }
+
+    def test_絶対値の大きい順に並ぶ(self, mor: ModuleType) -> None:
+        pairs = mor.reversal_pairs(self._daily([1000, 1050, 1010, 500, 3000]))
+        rows = mor.extreme_forward_returns(pairs)
+        magnitudes = [abs(r.exit.return_pct) for r in rows]
+        assert magnitudes == sorted(magnitudes, reverse=True)
+        assert magnitudes[0] == pytest.approx(2.0)  # 1000 → 3000
+
+    def test_出口の日付と終値まで残る(self, mor: ModuleType) -> None:
+        """リターンだけ持つと、異常値が出ても原因を追えない。"""
+        pairs = mor.reversal_pairs(self._daily([1000, 1050, 1010, 500, 3000]))
+        top = mor.extreme_forward_returns(pairs)[0]
+        assert top.symbol == "A"
+        assert top.exit.exit_close == pytest.approx(3000.0)
+        assert top.exit.exit_day == date(2026, 6, 5)
+        assert top.open_price == pytest.approx(1000.0)
+
+    def test_件数を絞れる(self, mor: ModuleType) -> None:
+        pairs = mor.reversal_pairs(self._daily([1000, 1050, 1010, 500, 3000]))
+        assert len(mor.extreme_forward_returns(pairs, limit=1)) == 1
+
+    def test_forward_returnsはforward_exitsと一致する(self, mor: ModuleType) -> None:
+        """集計側は従来どおり ``forward_returns`` だけ見れば足りる。"""
+        pair = mor.reversal_pairs(self._daily([1000, 1050, 1010, 1020, 1030]))[0]
+        assert pair.forward_returns == tuple(
+            (e.horizon, e.return_pct) for e in pair.forward_exits
+        )

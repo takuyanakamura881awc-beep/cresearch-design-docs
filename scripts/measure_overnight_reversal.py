@@ -52,6 +52,13 @@
 3. **前半・後半とも net が正**で、単調性が両方で保たれる
 
 **3つとも通って初めて、5分足での検証に進む。** どれか1つでも外せば棄却。
+
+【セクション0（データの健全性）を先に見ること】
+
+日をまたぐ値（``prior_move_pct`` と保有期間の将来リターン）は、日足に
+**価格水準の継ぎ目**があるとそこだけ嘘になる。同じバーの中で完結する値は
+無傷なので、**平均を見てからでは気づけない**（意思決定ログ97）。
+継ぎ目が出たらその銘柄の日足を作り直してから読む。
 """
 
 from __future__ import annotations
@@ -60,6 +67,7 @@ import argparse
 import json
 import statistics
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -68,6 +76,7 @@ from autotrader.data.store import BarStore
 from autotrader.diagnostics import (
     ClusteredStats,
     clustered_stats,
+    drop_discontinuous_symbols,
     non_overlapping_days,
     required_gross_bps,
     split_days,
@@ -115,6 +124,60 @@ PRIOR_MOVE_BUCKETS_PCT: tuple[float, ...] = (0.01, 0.02, 0.03, 0.04)
 （`docs/00` 意思決定ログの確定値）なので、その前後を挟む刻みにした。
 """
 
+MAX_EXTREME_ROWS = 10
+"""異常値として名指しで出す件数。**握り潰さず実物を見せる**（規約「エラーを握り潰さない」）。"""
+
+
+def max_calendar_days(horizon: int) -> int:
+    """営業日 ``horizon`` 日ぶんの出口までに許す暦日数。
+
+    **index で N本先を取ると、日足が欠けている銘柄では数か月先の終値を
+    「N営業日保有」として扱ってしまう。** 保有期間は営業日で数えるものなので、
+    暦日で見て離れすぎた出口は採用しない（採用しなかった件数は報告する）。
+
+    土日で最大2日、年末年始・大型連休で最大10日ほど空くので
+    ``horizon * 2 + 12`` を上限にする（10営業日なら32暦日）。
+    """
+    return horizon * 2 + 12
+
+
+@dataclass(frozen=True)
+class ForwardExit:
+    """保有 ``horizon`` 営業日の出口。**どの日のいくらで閉じたかまで残す。**
+
+    リターンだけ持つと、異常値が出たときに原因を追えない。
+    """
+
+    horizon: int
+    exit_day: date
+    exit_close: float
+    return_pct: float
+    """当日始値からその日の終値までのリターン。"""
+
+
+@dataclass(frozen=True)
+class DroppedExit:
+    """暦日で離れすぎたため採用しなかった出口。**黙って捨てず数える。**"""
+
+    symbol: str
+    day: date
+    horizon: int
+    exit_day: date
+
+    @property
+    def elapsed_days(self) -> int:
+        return (self.exit_day - self.day).days
+
+
+@dataclass(frozen=True)
+class ExtremeReturn:
+    """将来リターンの絶対値が大きかった観測。**原因を推測で片付けないための実物。**"""
+
+    symbol: str
+    day: date
+    exit: ForwardExit
+    open_price: float
+
 
 @dataclass(frozen=True)
 class ReversalPair:
@@ -134,13 +197,81 @@ class ReversalPair:
     """当日始値。**コストは株価で決まる**（`autotrader.tick`）。"""
     topix100: bool = False
     """TOPIX100 構成銘柄か。**呼値が1桁違うのでコストに直接効く**（意思決定ログ61）。"""
-    forward_returns: tuple[tuple[int, float], ...] = ()
-    """``(保有営業日数, 当日始値からその日の終値までのリターン)``。
+    forward_exits: tuple[ForwardExit, ...] = ()
+    """保有営業日数ごとの出口。
 
     1日は ``intraday_return_pct`` と同じ。**将来の終値を使うが、これは
     シグナルではなく成績**——建てた後に確定する情報なので先読みではない。
-    足りない日数（銘柄の終端付近）は含まない。
+
+    含まないもの: 足りない日数（銘柄の終端付近）と、
+    **暦日で離れすぎた出口**（`max_calendar_days`）。
     """
+
+    @property
+    def forward_returns(self) -> tuple[tuple[int, float], ...]:
+        """``(保有営業日数, リターン)``。集計はこちらだけ見れば足りる。"""
+        return tuple((e.horizon, e.return_pct) for e in self.forward_exits)
+
+
+def _walk(
+    daily_bars: dict[str, tuple[Bar, ...]],
+) -> Iterator[tuple[str, tuple[Bar, ...], int]]:
+    """判定に足りる日足が揃った ``(銘柄, 時系列, 当日の位置)`` を返す。
+
+    **3日ぶんの日足が要る**（前々日終値・前日終値・当日の始値と終値）ので、
+    各銘柄の最初の2日は除外する。価格が0以下の日も除外する（0除算対策）。
+
+    `reversal_pairs` と `forward_exit_drops` が**同じ走査を二度書かない**ため
+    に切り出してある（規約「同じことをする関数を二つ作らない」）。
+    """
+    for symbol in sorted(daily_bars):
+        ordered = tuple(sorted(daily_bars[symbol], key=lambda b: b.timestamp))
+        for i in range(2, len(ordered)):
+            two_ago, prev, today = ordered[i - 2], ordered[i - 1], ordered[i]
+            if two_ago.close <= 0 or prev.close <= 0 or today.open <= 0:
+                continue
+            yield symbol, ordered, i
+
+
+def _forward_exits(
+    symbol: str, ordered: tuple[Bar, ...], i: int
+) -> tuple[tuple[ForwardExit, ...], tuple[DroppedExit, ...]]:
+    """``i`` 日目に建てたときの、保有期間ごとの出口と、採用しなかった出口。
+
+    **判定は1か所にまとめてある。** 採用条件を `reversal_pairs` と診断とで
+    別々に書くと、片方だけ直して食い違う。
+
+    Returns:
+        ``(採用した出口, 暦日で離れすぎて捨てた出口)``。
+    """
+    today = ordered[i]
+    day = today.timestamp.date()
+    exits: list[ForwardExit] = []
+    dropped: list[DroppedExit] = []
+    for horizon in HORIZONS:
+        exit_index = i + horizon - 1
+        if exit_index >= len(ordered):
+            continue
+        exit_bar = ordered[exit_index]
+        if exit_bar.close <= 0:
+            continue
+        exit_day = exit_bar.timestamp.date()
+        # **index ではなく暦日で見る。** 日足が欠けている銘柄では
+        # ordered[i + N - 1] が数か月先になりうる（意思決定ログ97）
+        if (exit_day - day).days > max_calendar_days(horizon):
+            dropped.append(
+                DroppedExit(symbol=symbol, day=day, horizon=horizon, exit_day=exit_day)
+            )
+            continue
+        exits.append(
+            ForwardExit(
+                horizon=horizon,
+                exit_day=exit_day,
+                exit_close=exit_bar.close,
+                return_pct=(exit_bar.close - today.open) / today.open,
+            )
+        )
+    return tuple(exits), tuple(dropped)
 
 
 def reversal_pairs(
@@ -149,41 +280,57 @@ def reversal_pairs(
 ) -> tuple[ReversalPair, ...]:
     """銘柄ごとの日足から、前日の値動きと当日の寄り付き後の値動きを組にする。
 
-    **3日ぶんの日足が要る**（前々日終値・前日終値・当日の始値と終値）ので、
-    各銘柄の最初の2日は除外する。価格が0以下の日も除外する（0除算対策）。
-
     **ルックアヘッドは構造的に防いでいる**（規約7）——`prior_move_pct` は
     当日のバーを一切参照しない。当日から使うのは始値と終値だけで、
     それは建てた後・手仕舞う時点の情報。
     """
     pairs: list[ReversalPair] = []
-    for symbol, series in daily_bars.items():
-        ordered = sorted(series, key=lambda b: b.timestamp)
-        for i in range(2, len(ordered)):
-            two_ago, prev, today = ordered[i - 2], ordered[i - 1], ordered[i]
-            if two_ago.close <= 0 or prev.close <= 0 or today.open <= 0:
-                continue
-            forward: list[tuple[int, float]] = []
-            for horizon in HORIZONS:
-                exit_index = i + horizon - 1
-                if exit_index >= len(ordered):
-                    continue
-                exit_close = ordered[exit_index].close
-                if exit_close <= 0:
-                    continue
-                forward.append((horizon, (exit_close - today.open) / today.open))
-            pairs.append(
-                ReversalPair(
-                    symbol=symbol,
-                    day=today.timestamp.date(),
-                    prior_move_pct=(prev.close - two_ago.close) / two_ago.close,
-                    intraday_return_pct=(today.close - today.open) / today.open,
-                    open_price=today.open,
-                    topix100=symbol in topix100_codes,
-                    forward_returns=tuple(forward),
-                )
+    for symbol, ordered, i in _walk(daily_bars):
+        two_ago, prev, today = ordered[i - 2], ordered[i - 1], ordered[i]
+        exits, _ = _forward_exits(symbol, ordered, i)
+        pairs.append(
+            ReversalPair(
+                symbol=symbol,
+                day=today.timestamp.date(),
+                prior_move_pct=(prev.close - two_ago.close) / two_ago.close,
+                intraday_return_pct=(today.close - today.open) / today.open,
+                open_price=today.open,
+                topix100=symbol in topix100_codes,
+                forward_exits=exits,
             )
+        )
     return tuple(pairs)
+
+
+def forward_exit_drops(
+    daily_bars: dict[str, tuple[Bar, ...]],
+) -> tuple[DroppedExit, ...]:
+    """暦日で離れすぎたため採用しなかった出口を全部集める。
+
+    **捨てた件数を報告するためだけの関数。** 判定そのものは `_forward_exits`
+    に一本化してあるので、ここと本編で条件がずれることはない。
+    """
+    drops: list[DroppedExit] = []
+    for symbol, ordered, i in _walk(daily_bars):
+        drops.extend(_forward_exits(symbol, ordered, i)[1])
+    return tuple(drops)
+
+
+def extreme_forward_returns(
+    pairs: tuple[ReversalPair, ...], limit: int = MAX_EXTREME_ROWS
+) -> tuple[ExtremeReturn, ...]:
+    """将来リターンの絶対値が大きい順に ``limit`` 件。
+
+    **原因を推測で片付けないための実物。** 平均が桁違いになったとき、
+    どの銘柄のどの日がそれを作っているかを名指しで出す。
+    """
+    rows = [
+        ExtremeReturn(symbol=p.symbol, day=p.day, exit=e, open_price=p.open_price)
+        for p in pairs
+        for e in p.forward_exits
+    ]
+    rows.sort(key=lambda r: abs(r.exit.return_pct), reverse=True)
+    return tuple(rows[:limit])
 
 
 def reversal_score(pair: ReversalPair) -> float:
@@ -449,6 +596,74 @@ def _report_rate_sensitivity(pairs: tuple[ReversalPair, ...]) -> None:
     print("  **どの想定でも判定が変わらないなら、金利を調べに行く必要はない。**")
 
 
+def _report_data_sanity(
+    daily_bars: dict[str, tuple[Bar, ...]],
+) -> dict[str, tuple[Bar, ...]]:
+    """日足そのものが壊れていないかを、集計より先に確かめる。
+
+    **実測でセクション4だけが桁違いになった**（2日保有 gross +6,502bps、
+    年利 +1.9e31%）。セクション1〜3は同じバーの中で完結する値しか使わない
+    ので無傷だった——**日をまたぐ値だけが壊れる**という形は、
+    価格水準の継ぎ目を強く示唆する（意思決定ログ97）。
+
+    Returns:
+        継ぎ目のあった銘柄を除いた日足。**除いた銘柄は数えて名指しで出す**
+        （規約「エラーを握り潰さない」）。
+    """
+    hr("0. データの健全性（集計より先に確かめる）")
+    print("  **実測でセクション4だけが桁違いになった**（2日保有 gross +6,502bps・")
+    print("  年利 +1.9e31%）。セクション1〜3は同じバーの中で完結する値しか")
+    print("  使わないので無傷だった——**日をまたぐ値だけが壊れる**という形は、")
+    print("  価格水準の継ぎ目を強く示唆する（意思決定ログ97）。")
+    print()
+    return drop_discontinuous_symbols(daily_bars)
+
+
+def _report_forward_integrity(
+    daily_bars: dict[str, tuple[Bar, ...]], pairs: tuple[ReversalPair, ...]
+) -> None:
+    """出口の取り方が保有期間として妥当かを確かめる。
+
+    **以前は index で N本先を取っていた**ので、日足が欠けている銘柄では
+    数か月先の終値が「N営業日保有」として混ざりえた（意思決定ログ97）。
+    暦日で弾くように直したので、**弾いた件数と、残った中での異常値**を出す。
+    """
+    print()
+    drops = forward_exit_drops(daily_bars)
+    if drops:
+        worst = max(drops, key=lambda d: d.elapsed_days)
+        by_horizon: dict[int, int] = {}
+        for d in drops:
+            by_horizon[d.horizon] = by_horizon.get(d.horizon, 0) + 1
+        detail = " / ".join(f"{h}日:{n}件" for h, n in sorted(by_horizon.items()))
+        print(f"  暦日で離れすぎて捨てた出口: {len(drops)}件（{detail}）")
+        print(
+            f"    最悪 {worst.symbol} {worst.day} の{worst.horizon}日保有が"
+            f"{worst.elapsed_days}暦日先（上限{max_calendar_days(worst.horizon)}日）"
+        )
+    else:
+        print("  暦日で離れすぎて捨てた出口: なし")
+
+    extremes = extreme_forward_returns(pairs)
+    if not extremes:
+        return
+    print()
+    print("  【将来リターンの絶対値が大きい順】**丸めない・切らない**")
+    print(
+        f"  {'銘柄':<8} {'建てた日':<12} {'保有':>4} {'始値':>9} "
+        f"{'出口日':<12} {'出口終値':>10} {'リターン':>10}"
+    )
+    print("  " + "-" * 70)
+    for r in extremes:
+        print(
+            f"  {r.symbol:<8} {r.day!s:<12} {r.exit.horizon:>3}日 "
+            f"{r.open_price:>9.1f} {r.exit.exit_day!s:<12} "
+            f"{r.exit.exit_close:>10.1f} {r.exit.return_pct * 100:>+9.1f}%"
+        )
+    print()
+    print("  **ここに桁外れの行が残っていたら、集計を読む前にその銘柄を見る。**")
+
+
 def load_symbols(*, topix100_only: bool, cheap: bool = False) -> tuple[Symbol, ...]:
     """銘柄一覧。`scripts/measure_gap_fade.py` と同じ読み込み方をする。
 
@@ -681,11 +896,19 @@ def main() -> int:
     daily = {c: b for c, b in daily.items() if b}
     print(f"  日足あり: {len(daily)}銘柄")
 
+    daily = _report_data_sanity(daily)
+    if not daily:
+        print("  健全な日足が残らなかった。日足を取り直す")
+        return 1
+
     pairs = reversal_pairs(daily, topix100_codes)
     if not pairs:
         print("  データがない。先に python scripts/fetch_bars.py を実行する")
         return 1
+    _report_forward_integrity(daily, pairs)
+
     days = {p.day for p in pairs}
+    print()
     print(f"  対象: {len(pairs)}件 / {len(days)}営業日（{min(days)}〜{max(days)}）")
 
     _report_buckets(pairs)

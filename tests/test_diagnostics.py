@@ -4,26 +4,32 @@
 `measure_gap_fade` / `measure_intraday_fill` / `measure_overnight_reversal`
 のすべてで t値が嘘になる。
 
-重点は2つ:
+重点は3つ:
 
 1. **件数を増やしても日数が同じなら t値が変わらないこと。**
    これが日クラスタを導入した理由そのもの（意思決定ログ72）
 2. **期間分割が日で切れること。** 同じ日の観測が前半と後半に
    またがってはいけない
+3. **価格水準の継ぎ目を、集計より先に見つけること。**
+   日をまたぐ値だけが壊れるので、平均を見てからでは気づけない
+   （意思決定ログ97）
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
 from autotrader.diagnostics import (
     clustered_stats,
+    drop_discontinuous_symbols,
     non_overlapping_days,
+    price_discontinuities,
     required_gross_bps,
     split_days,
 )
+from autotrader.types import Bar
 
 DAY1 = date(2026, 6, 1)
 DAY2 = date(2026, 6, 2)
@@ -257,3 +263,74 @@ class TestNonOverlappingDays:
         assert overlapping is not None and independent is not None
         assert independent.days < overlapping.days
         assert abs(independent.t_stat) < abs(overlapping.t_stat)
+
+
+def _bar(symbol: str, day: date, close: float) -> Bar:
+    return Bar(
+        symbol=symbol,
+        timestamp=datetime(day.year, day.month, day.day),
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        volume=1_000,
+    )
+
+
+def _series(closes: list[float], symbol: str = "A") -> dict[str, tuple[Bar, ...]]:
+    return {
+        symbol: tuple(
+            _bar(symbol, DAY1 + timedelta(days=i), c) for i, c in enumerate(closes)
+        )
+    }
+
+
+class TestPriceDiscontinuities:
+    """価格水準の継ぎ目（分割の調整不整合）を、集計より先に見つける。
+
+    制限値幅のある市場で終値が1.8倍・1/1.8倍になることは起こらない。
+    """
+
+    def test_通常の値動きは検出しない(self) -> None:
+        assert price_discontinuities(_series([1000, 1200, 900, 1100])) == ()
+
+    def test_分割相当の半減を検出する(self) -> None:
+        found = price_discontinuities(_series([1000, 1010, 505, 510]))
+        assert len(found) == 1
+        assert found[0].symbol == "A"
+        assert found[0].day == DAY1 + timedelta(days=2)
+        assert found[0].ratio == pytest.approx(0.5)
+
+    def test_逆方向の跳びも検出する(self) -> None:
+        found = price_discontinuities(_series([500, 505, 1010, 1000]))
+        assert len(found) == 1
+        assert found[0].ratio == pytest.approx(2.0)
+
+    def test_価格が0以下の日は無視する(self) -> None:
+        """0除算を避ける。既存の除外規律と同じ扱い。"""
+        assert price_discontinuities(_series([1000, 0.0, 1000])) == ()
+
+    def test_閾値を渡せる(self) -> None:
+        assert price_discontinuities(_series([1000, 1200]), max_ratio=1.1) != ()
+
+
+class TestDropDiscontinuousSymbols:
+    """**値を刈るのではなく銘柄ごと落とす。**
+
+    どちらの区間が正しく調整されているか判別できない以上、値をいじるのは
+    切り捨てバイアス（意思決定ログ59・71）を新しい場所で作り込むだけ。
+    """
+
+    def test_問題なければそのまま返す(self) -> None:
+        daily = _series([1000, 1010, 1020])
+        assert drop_discontinuous_symbols(daily) == daily
+
+    def test_該当銘柄だけを丸ごと落とす(self) -> None:
+        daily = {**_series([1000, 1010, 505], "A"), **_series([2000, 2010], "B")}
+        kept = drop_discontinuous_symbols(daily)
+        assert set(kept) == {"B"}
+
+    def test_落とすのは銘柄単位で値は変えない(self) -> None:
+        """残った銘柄のバーに手を入れない（丸めも切り詰めもしない）。"""
+        daily = {**_series([1000, 1010, 505], "A"), **_series([2000, 2010], "B")}
+        assert drop_discontinuous_symbols(daily)["B"] == daily["B"]

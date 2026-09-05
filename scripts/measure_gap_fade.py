@@ -44,7 +44,11 @@ from datetime import date
 from pathlib import Path
 
 from autotrader.data.store import BarStore
-from autotrader.diagnostics import ClusteredStats, split_days
+from autotrader.diagnostics import (
+    ClusteredStats,
+    drop_discontinuous_symbols,
+    split_days,
+)
 from autotrader.diagnostics import clustered_stats as clustered_from_samples
 from autotrader.provenance import banner
 from autotrader.tick import DEFAULT_SPREAD_TICKS, spread_yen
@@ -950,6 +954,14 @@ def main() -> int:
     daily = {s.code: store.read(s.code, "1d") for s in symbols}
     daily = {c: b for c, b in daily.items() if b}
     print(f"  日足あり: {len(daily)}銘柄")
+
+    # **gap_pct は日をまたぐ値**（前日終値 → 当日始値）なので、
+    # 価格水準の継ぎ目があるとそこだけ嘘になる（意思決定ログ97）
+    hr("0. データの健全性（集計より先に確かめる）")
+    daily = drop_discontinuous_symbols(daily)
+    if not daily:
+        print("  健全な日足が残らなかった。日足を取り直す")
+        return 1
 
     pairs = gap_fade_pairs(daily, topix100_codes)
     hr("結果")

@@ -33,16 +33,41 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
 
+from autotrader.types import Bar
+
 __all__ = [
     "ClusteredStats",
+    "PriceDiscontinuity",
     "clustered_stats",
+    "drop_discontinuous_symbols",
     "non_overlapping_days",
+    "price_discontinuities",
     "required_gross_bps",
     "split_days",
 ]
 
 TRADING_DAYS_PER_MONTH = 20
 MONTHS_PER_YEAR = 12
+
+MAX_DAILY_CLOSE_RATIO = 1.8
+"""隣接する日足の終値比の上限。**超えたら値動きではなくデータの継ぎ目を疑う。**
+
+東証には制限値幅があり、終値が前日終値の1.8倍（または 1/1.8）になることは
+**制度上ほぼ起こらない**。株価1,000円台なら制限値幅は±20〜30%、
+連続ストップ高で拡大しても±40%程度にとどまる。
+
+一方 `BarStore.write` は週次の取得をマージし、yfinance の ``auto_adjust=True`` は
+**その取得時点から見た調整**を返す。分割をまたいで別々の週に取得すると、
+古いバーは未調整・新しいバーは調整済みのまま**同じ系列に混ざる**。
+同じバーの中で完結する値（当日の始値→終値）は無事なのに、
+**日をまたぐ値だけが壊れる**（意思決定ログ97）。
+
+**日をまたぐ値を使う診断は、集計より先にこれを確かめること。**
+`gap_pct`（前日終値→当日始値）も `prior_move_pct`（前々日→前日）も該当する。
+"""
+
+MAX_DISCONTINUITY_ROWS = 10
+"""名指しで出す件数。**握り潰さず実物を見せる**（規約「エラーを握り潰さない」）。"""
 
 
 @dataclass(frozen=True)
@@ -206,3 +231,99 @@ def non_overlapping_days(
         raise ValueError("phase は 0 以上 horizon 未満")
     ordered = sorted(set(days))
     return frozenset(ordered[phase::horizon])
+
+
+@dataclass(frozen=True)
+class PriceDiscontinuity:
+    """隣接する日足のあいだで価格水準が跳んだ箇所。"""
+
+    symbol: str
+    day: date
+    prev_close: float
+    close: float
+
+    @property
+    def ratio(self) -> float:
+        return self.close / self.prev_close
+
+
+def price_discontinuities(
+    daily_bars: dict[str, tuple[Bar, ...]],
+    *,
+    max_ratio: float = MAX_DAILY_CLOSE_RATIO,
+) -> tuple[PriceDiscontinuity, ...]:
+    """隣接する日足のあいだで価格水準が跳んだ箇所を洗い出す。
+
+    制限値幅のある市場で終値が ``max_ratio`` 倍になることは起こらないので、
+    見つかったら**値動きではなく調整の継ぎ目**を疑う
+    （`MAX_DAILY_CLOSE_RATIO` の説明）。
+
+    **ここでは値を丸めない・切らない。** 外れ値を刈るのは、このプロジェクトが
+    2度踏んだ切り捨てバイアス（意思決定ログ59・71）そのもの。壊れた系列は
+    **銘柄ごと除外する**のが正しく、値をいじるのは誤り。
+    """
+    found: list[PriceDiscontinuity] = []
+    for symbol in sorted(daily_bars):
+        ordered = sorted(daily_bars[symbol], key=lambda b: b.timestamp)
+        for prev, today in zip(ordered, ordered[1:], strict=False):
+            if prev.close <= 0 or today.close <= 0:
+                continue
+            ratio = today.close / prev.close
+            if ratio > max_ratio or ratio < 1.0 / max_ratio:
+                found.append(
+                    PriceDiscontinuity(
+                        symbol=symbol,
+                        day=today.timestamp.date(),
+                        prev_close=prev.close,
+                        close=today.close,
+                    )
+                )
+    return tuple(found)
+
+
+def drop_discontinuous_symbols(
+    daily_bars: dict[str, tuple[Bar, ...]],
+    *,
+    max_ratio: float = MAX_DAILY_CLOSE_RATIO,
+) -> dict[str, tuple[Bar, ...]]:
+    """継ぎ目のあった銘柄を除いた日足を返し、**除いた分を名指しで印字する。**
+
+    どちらの区間が正しく調整されているか判別できない以上、値をいじるのでは
+    なく銘柄ごと落とす。**黙って落とさない**——件数・銘柄数・最悪ケースと、
+    直し方（parquet を消して取り直す）まで出す。
+    """
+    breaks = price_discontinuities(daily_bars, max_ratio=max_ratio)
+    if not breaks:
+        print(f"  価格水準の跳び（終値比 {max_ratio:.1f}倍超）: なし")
+        return daily_bars
+
+    affected = frozenset(b.symbol for b in breaks)
+    print(f"  **価格水準の跳びを {len(breaks)}件 / {len(affected)}銘柄で検出**")
+    print(f"  （終値比が {1.0 / max_ratio:.2f}〜{max_ratio:.1f}倍の外）")
+    print()
+    print("  制限値幅のある市場でこの跳びは起こらない。**値動きではなく")
+    print("  調整の継ぎ目**——`BarStore` は週次の取得をマージするが、yfinance の")
+    print("  auto_adjust はその取得時点から見た調整を返すので、分割をまたいで")
+    print("  別々の週に取得すると未調整と調整済みが同じ系列に混ざる。")
+    print()
+    print(f"  {'銘柄':<8} {'日付':<12} {'前日終値':>10} {'当日終値':>10} {'比':>8}")
+    print("  " + "-" * 52)
+    ranked = sorted(breaks, key=lambda x: abs(math.log(x.ratio)), reverse=True)
+    for b in ranked[:MAX_DISCONTINUITY_ROWS]:
+        print(
+            f"  {b.symbol:<8} {b.day!s:<12} {b.prev_close:>10.1f} "
+            f"{b.close:>10.1f} {b.ratio:>8.3f}"
+        )
+    if len(breaks) > MAX_DISCONTINUITY_ROWS:
+        print(f"  ほか{len(breaks) - MAX_DISCONTINUITY_ROWS}件")
+    print()
+    print(f"  **該当 {len(affected)}銘柄を丸ごと除外する。** 値の刈り込みは")
+    print("  意思決定ログ59・71で踏んだ切り捨てバイアスそのもの。")
+    print()
+    print("  **直すには日足を作り直す**: data/bars/1d/<銘柄>.parquet を消して")
+    print("  python scripts/fetch_bars.py を実行する（2年ぶんを取り直す）。")
+
+    kept = {c: b for c, b in daily_bars.items() if c not in affected}
+    print()
+    print(f"  残った銘柄: {len(kept)} / {len(daily_bars)}")
+    return kept
