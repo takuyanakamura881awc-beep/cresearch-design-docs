@@ -81,8 +81,16 @@ from autotrader.diagnostics import (
     required_gross_bps,
     split_days,
 )
+from autotrader.execution_model import (
+    DEFAULT_ENTRY,
+    DEFAULT_EXIT,
+    EntryStyle,
+    ExitStyle,
+    spread_multiple,
+)
+from autotrader.execution_model import round_trip_cost_bps as execution_cost_bps
 from autotrader.provenance import banner
-from autotrader.tick import DEFAULT_SPREAD_TICKS, spread_yen
+from autotrader.tick import DEFAULT_SPREAD_TICKS
 from autotrader.types import Bar, Symbol
 
 DATA_ROOT = Path("data")
@@ -346,15 +354,27 @@ def reversal_score(pair: ReversalPair) -> float:
 
 
 def round_trip_cost_bps(
-    pair: ReversalPair, n_ticks: float = DEFAULT_SPREAD_TICKS
+    pair: ReversalPair,
+    n_ticks: float = DEFAULT_SPREAD_TICKS,
+    *,
+    entry: EntryStyle = DEFAULT_ENTRY,
+    exit_: ExitStyle = DEFAULT_EXIT,
 ) -> float:
-    """往復コスト（bps）。``autotrader.tick`` をそのまま使う。
+    """往復コスト（bps）。``autotrader.execution_model`` をそのまま使う。
 
     **約定コストのモデルを診断ごとに作り直さない**
     （`docs/00` 意思決定ログ33以降で呼値ベースに統一済み）。
+
+    既定は成行→成行（スプレッド1本ぶん）で、**これまでの全実験と同じ**。
+    板寄せ（寄成）で建てる版は感度としてのみ出す（意思決定ログ103）。
     """
-    spread = spread_yen(pair.open_price, n_ticks, topix100=pair.topix100)
-    return float(spread) / pair.open_price * 10_000.0
+    return execution_cost_bps(
+        pair.open_price,
+        entry=entry,
+        exit_=exit_,
+        n_ticks=n_ticks,
+        topix100=pair.topix100,
+    )
 
 
 @dataclass(frozen=True)
@@ -384,8 +404,14 @@ def bucket_stats(
     pairs: tuple[ReversalPair, ...],
     threshold: float,
     n_ticks: float = DEFAULT_SPREAD_TICKS,
+    *,
+    entry: EntryStyle = DEFAULT_ENTRY,
+    exit_: ExitStyle = DEFAULT_EXIT,
 ) -> BucketStats | None:
     """``|prior_move_pct| >= threshold`` の日だけを集計する。
+
+    **gross は執行スタイルに依存しない。** 変わるのはコストだけなので、
+    感度を見るときも gross を測り直さなくてよい（意思決定ログ103）。
 
     Returns:
         該当が2件未満なら ``None``。
@@ -396,7 +422,9 @@ def bucket_stats(
     return BucketStats(
         n=len(bucket),
         gross_bps=statistics.fmean(reversal_score(p) * 10_000.0 for p in bucket),
-        cost_bps=statistics.fmean(round_trip_cost_bps(p, n_ticks) for p in bucket),
+        cost_bps=statistics.fmean(
+            round_trip_cost_bps(p, n_ticks, entry=entry, exit_=exit_) for p in bucket
+        ),
         clustered=clustered_stats((p.day, reversal_score(p) * 10_000.0) for p in bucket),
     )
 
@@ -855,6 +883,89 @@ def _report_verdict(pairs: tuple[ReversalPair, ...]) -> None:
         print("    基準を後から緩めない（意思決定ログ46・75と同じ規律）")
 
 
+EXECUTION_STYLES: tuple[tuple[str, EntryStyle, ExitStyle], ...] = (
+    ("成行 → 成行（これまでの全実験）", EntryStyle.MARKET, ExitStyle.MARKET),
+    ("寄成 → 成行（板寄せで建てる）", EntryStyle.AUCTION, ExitStyle.MARKET),
+    ("指値 → 成行（受け取れた場合の上限）", EntryStyle.PASSIVE, ExitStyle.MARKET),
+)
+"""感度として並べる執行スタイル。**既定は先頭から動かさない。**
+
+3つに固定してある。ここを増やすと多重比較の分母が増えるので、
+**新しいスタイルを足すときは事前登録する。**
+"""
+
+
+def _report_execution_sensitivity(pairs: tuple[ReversalPair, ...]) -> None:
+    """執行スタイルを変えると net がどう動くか。
+
+    **これは判定のやり直しではない。** セクション3の判定は既定
+    （成行→成行）で確定しており、ここで覆さない——**結果を見てから
+    コストの想定を変えるのは、基準を後から緩めるのと同じ**
+    （意思決定ログ46・75）。
+
+    出す理由は、`DEFAULT_SPREAD_TICKS` の感度表と同じ
+    （意思決定ログ60）——**想定が決定を左右するかどうかを見せる**ため。
+    """
+    hr("5. 執行スタイルに対する感度（払うのか受け取るのか）")
+    print("  **これまでの全実験は「成行で入り成行で出る」で測っている。**")
+    print("  だが短期リバーサルの利益は**流動性供給の対価**として説明される")
+    print("  のが標準で（Nagel 2012）、対価の原資はスプレッドそのもの。")
+    print("  **対価を狙いながら、こちら側が払っていた**（意思決定ログ102）。")
+    print()
+    print("  前日反転は**シグナルが前日大引けで確定する**ので、寄成で")
+    print("  板寄せに参加できる。**板寄せは単一価格なので気配を跨がない**——")
+    print("  測っている始値ちょうどで建つ。")
+    print()
+
+    baseline = bucket_stats(pairs, 0.0)
+    header = f"  {'|前日|下限':<10}"
+    for label, _, _ in EXECUTION_STYLES:
+        header += f" {label.split('（')[0]:>12}"
+    print(header)
+    print("  " + "-" * (10 + 13 * len(EXECUTION_STYLES)))
+    for threshold in PRIOR_MOVE_BUCKETS_PCT:
+        cells = []
+        for _, entry, exit_ in EXECUTION_STYLES:
+            stats = bucket_stats(pairs, threshold, entry=entry, exit_=exit_)
+            if stats is None or stats.clustered_net_bps is None:
+                cells.append(f"{'—':>12}")
+                continue
+            cells.append(f"{stats.clustered_net_bps:>+11.2f}b")
+        print(f"  {threshold:>8.1%} " + "".join(cells))
+    print()
+    print("  上段はすべて **net(日)**（日クラスタ・意思決定ログ72）。")
+    print("  **gross は執行スタイルに依存しない**ので、動いているのはコストだけ。")
+
+    if baseline is not None:
+        print()
+        print(f"  {'スタイル':<26} {'スプレッド':>10} {'コスト':>9} {'必要gross':>10}")
+        print("  " + "-" * 60)
+        for label, entry, exit_ in EXECUTION_STYLES:
+            stats = bucket_stats(pairs, 0.0, entry=entry, exit_=exit_)
+            if stats is None:
+                continue
+            need = required_gross_bps(ANNUAL_TARGET, cost_bps=stats.cost_bps)
+            mult = spread_multiple(entry, exit_)
+            print(
+                f"  {label:<26} {mult:>9.1f}本 {stats.cost_bps:>+8.2f}b "
+                f"{need:>9.1f}b"
+            )
+
+    print()
+    print("  **既定は成行のまま動かさない。** 板寄せが単一価格なのは市場の")
+    print("  仕組みだが、「だから始値で建てたのと同じ成績になる」は別の主張で、")
+    print("  まだ実測していない——**板寄せの価格は実勢からオーバーシュートする**")
+    print("  （始値から5分で約19bps戻る・意思決定ログ86）。規約「検証できない")
+    print("  ものは保守的な側に倒す」に従い、払う側を既定に置く。")
+    print()
+    print("  **指値の列は上限。** 逆選択（約定するのは自分が間違っているときに")
+    print("  偏る）も未約定による建玉率の低下も入っていない。正しく測るには")
+    print("  5分足の約定モデルが要る。")
+    print()
+    print("  **この表で判定をやり直さない。** セクション3の判定は既定で確定済み。")
+    print("  想定を変えて再判定するのは、結果を見てから基準を緩めるのと同じ。")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -916,6 +1027,7 @@ def main() -> int:
     _report_verdict(pairs)
     _report_horizons(pairs)
     _report_rate_sensitivity(pairs)
+    _report_execution_sensitivity(pairs)
 
     print()
     print("**シグナルは前日大引けで確定するので、寄成注文で板寄せの価格を取れる。**")

@@ -484,3 +484,48 @@ class TestExtremeForwardReturns:
         assert pair.forward_returns == tuple(
             (e.horizon, e.return_pct) for e in pair.forward_exits
         )
+
+
+class TestExecutionSensitivity:
+    """執行スタイルを変えるとコストだけが動く（意思決定ログ103）。
+
+    **gross は執行スタイルに依存しない。** ここが崩れると、感度表が
+    「優位が増えた」ように見えてしまう——実際には払う額が減っただけ。
+    """
+
+    def _daily(self) -> dict[str, tuple[Bar, ...]]:
+        base = date(2026, 6, 1)
+        closes = [1000.0, 1100.0, 1080.0, 1090.0, 1085.0, 1095.0]
+        return {
+            "A": tuple(
+                _bar("A", base + timedelta(days=i), open_=1000.0, close=c)
+                for i, c in enumerate(closes)
+            )
+        }
+
+    def test_板寄せで建てるとコストが半分になる(self, mor: ModuleType) -> None:
+        pairs = mor.reversal_pairs(self._daily())
+        market = mor.bucket_stats(pairs, 0.0)
+        auction = mor.bucket_stats(pairs, 0.0, entry=mor.EntryStyle.AUCTION)
+        assert auction.cost_bps == pytest.approx(market.cost_bps / 2.0)
+
+    def test_grossは執行スタイルで変わらない(self, mor: ModuleType) -> None:
+        """**動いているのはコストだけ**であることを構造で固定する。"""
+        pairs = mor.reversal_pairs(self._daily())
+        market = mor.bucket_stats(pairs, 0.0)
+        passive = mor.bucket_stats(pairs, 0.0, entry=mor.EntryStyle.PASSIVE)
+        assert passive.gross_bps == pytest.approx(market.gross_bps)
+        assert passive.cost_bps == pytest.approx(0.0)
+
+    def test_既定は成行のまま(self, mor: ModuleType) -> None:
+        """**結果を見てから既定を動かさない**（意思決定ログ46・75）。"""
+        assert mor.DEFAULT_ENTRY is mor.EntryStyle.MARKET
+        pairs = mor.reversal_pairs(self._daily())
+        assert mor.bucket_stats(pairs, 0.0).cost_bps == pytest.approx(
+            mor.bucket_stats(pairs, 0.0, entry=mor.EntryStyle.MARKET).cost_bps
+        )
+
+    def test_感度に並べるスタイルは3つに固定(self, mor: ModuleType) -> None:
+        """増やすと多重比較の分母が増える。**足すなら事前登録する。**"""
+        assert len(mor.EXECUTION_STYLES) == 3
+        assert mor.EXECUTION_STYLES[0][1] is mor.EntryStyle.MARKET
