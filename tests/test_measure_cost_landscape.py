@@ -112,7 +112,14 @@ class TestCheapestPrice:
 
 class TestTradable:
     def _row(
-        self, mcl: ModuleType, code: str, *, price: float, turnover: float
+        self,
+        mcl: ModuleType,
+        code: str,
+        *,
+        price: float,
+        turnover: float,
+        market: str | None = "プライム",
+        margin_type: str | None = "貸借",
     ) -> Any:
         return mcl.MarketRow(
             code=code,
@@ -121,6 +128,8 @@ class TestTradable:
             avg_turnover_yen=turnover,
             topix100=False,
             scale_category=None,
+            market=market,
+            margin_type=margin_type,
         )
 
     def test_株価上限を超える銘柄は外す(self, mcl: ModuleType) -> None:
@@ -163,11 +172,84 @@ class TestTradable:
         assert not self._row(mcl, "B", price=1_251.0, turnover=1e9).affordable(500_000)
 
 
+class TestStructuralGates:
+    """市場区分・信用区分のゲート。**ETF・REIT を入れない。**
+
+    実測で `1357`（日経平均ダブルインバースETF）などが287銘柄に紛れ込んで
+    いた（意思決定ログ99）。ETF は**市場全体への方向性の賭けそのもの**で、
+    意思決定ログ71 で「別の商品」として棄却した性質を持つ。
+
+    しかも**対象市場を変えるのは人間が判断すること**（`CLAUDE.md`）なので、
+    ゲートが無いこと自体が規約違反だった。
+    """
+
+    def _row(
+        self,
+        mcl: ModuleType,
+        code: str,
+        *,
+        market: str | None,
+        margin_type: str | None,
+    ) -> Any:
+        return mcl.MarketRow(
+            code=code,
+            name=code,
+            price=1_000.0,
+            avg_turnover_yen=1e9,
+            topix100=False,
+            scale_category=None,
+            market=market,
+            margin_type=margin_type,
+        )
+
+    def test_プライム以外は外す(self, mcl: ModuleType) -> None:
+        rows = (
+            self._row(mcl, "PRIME", market="プライム", margin_type="貸借"),
+            self._row(mcl, "STD", market="スタンダード", margin_type="貸借"),
+            self._row(mcl, "ETF", market="ETF・ETN", margin_type="-"),
+        )
+        assert [r.code for r in mcl.tradable(rows, 1_200_000)] == ["PRIME"]
+
+    def test_貸借以外は外す(self, mcl: ModuleType) -> None:
+        """安全装置#12（売建可否）。制度信用で売建できない銘柄は入れない。"""
+        rows = (
+            self._row(mcl, "LOAN", market="プライム", margin_type="貸借"),
+            self._row(mcl, "MARGIN", market="プライム", margin_type="信用"),
+        )
+        assert [r.code for r in mcl.tradable(rows, 1_200_000)] == ["LOAN"]
+
+    def test_市場区分が不明な銘柄は外す(self, mcl: ModuleType) -> None:
+        """**不明を通さない。** 検証できないものは保守的な側に倒す（規約5）。"""
+        rows = (self._row(mcl, "UNKNOWN", market=None, margin_type="貸借"),)
+        assert mcl.tradable(rows, 1_200_000) == ()
+
+    def test_緩めるときは引数に書く(self, mcl: ModuleType) -> None:
+        """**対象市場を広げたことがコードに残る形にする。**"""
+        rows = (self._row(mcl, "STD", market="スタンダード", margin_type="貸借"),)
+        widened = mcl.tradable(rows, 1_200_000, markets=("プライム", "スタンダード"))
+        assert [r.code for r in widened] == ["STD"]
+
+    def test_選定にもゲートが効く(self, mcl: ModuleType) -> None:
+        rows = (
+            self._row(mcl, "PRIME", market="プライム", margin_type="貸借"),
+            self._row(mcl, "ETF", market="ETF・ETN", margin_type="-"),
+        )
+        selected = mcl.select_universe(rows, max_cost_bps=20.0)
+        assert [r.code for r in selected] == ["PRIME"]
+
+
 class TestSelectUniverse:
     """**構造的な基準だけで切り出す。** 成績は一切見ない（意思決定ログ94・95）。"""
 
     def _row(
-        self, mcl: ModuleType, code: str, *, price: float, turnover: float
+        self,
+        mcl: ModuleType,
+        code: str,
+        *,
+        price: float,
+        turnover: float,
+        market: str | None = "プライム",
+        margin_type: str | None = "貸借",
     ) -> Any:
         return mcl.MarketRow(
             code=code,
@@ -176,6 +258,8 @@ class TestSelectUniverse:
             avg_turnover_yen=turnover,
             topix100=False,
             scale_category="TOPIX Mid400",
+            market=market,
+            margin_type=margin_type,
         )
 
     def test_コストの安い順に並ぶ(self, mcl: ModuleType) -> None:

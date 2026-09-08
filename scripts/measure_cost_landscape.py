@@ -58,8 +58,10 @@ from autotrader.data.jquants import FREE_PLAN_DELAY_DAYS, JQuantsDataSource
 from autotrader.provenance import banner
 from autotrader.tick import DEFAULT_SPREAD_TICKS, spread_yen
 from autotrader.universe.filters import (
+    DEFAULT_MARKETS,
     DEFAULT_MIN_AVG_TURNOVER_YEN,
     DEFAULT_TURNOVER_LOOKBACK_DAYS,
+    LOANABLE_MARGIN_TYPE,
 )
 
 DATA_ROOT = Path("data")
@@ -144,6 +146,16 @@ class MarketRow:
     """20営業日の平均売買代金。**流動性の下限判定に使う。**"""
     topix100: bool
     scale_category: str | None
+    market: str | None = None
+    """市場区分名（例: "プライム"）。**ETF・REIT はここが別区分になる。**
+
+    実測で `1357`（日経平均ダブルインバースETF）・`2559`・`2840` が
+    ユニバースに紛れ込んでいた（意思決定ログ99）。ETF は
+    **市場全体への方向性の賭けそのもの**で、意思決定ログ71 で
+    「別の商品」として棄却した性質を持つ。
+    """
+    margin_type: str | None = None
+    """信用区分名（"貸借" なら制度信用で売建できる）。安全装置#12 に効く。"""
 
     @property
     def cost_bps(self) -> float:
@@ -160,11 +172,22 @@ def tradable(
     *,
     min_turnover_yen: float = float(DEFAULT_MIN_AVG_TURNOVER_YEN),
     max_cost_bps: float = float("inf"),
+    markets: tuple[str, ...] = DEFAULT_MARKETS,
+    margin_type: str | None = LOANABLE_MARGIN_TYPE,
 ) -> tuple[MarketRow, ...]:
     """その資金・その流動性下限・そのコスト上限で扱える銘柄。
 
     **成績は一切見ない。** 構造的な基準だけで絞る——成績で選ぶのは
     資金曲線の最大値を後から選ぶのと同じ（意思決定ログ69）。
+
+    市場区分と信用区分の既定値は **Layer 1 と同じ定数をそのまま使う**
+    （`autotrader.universe.filters`）。ここで別の値を書くと
+    `docs/03-universe.md` のフィルタA・D と食い違ったユニバースが
+    **気づかれずに**できあがる——実測でETFが3銘柄紛れ込んでいた
+    （意思決定ログ99）。
+
+    **対象市場を変えるのは人間が判断すること**（`CLAUDE.md`）。
+    緩めるときは、緩めたと分かる形で引数に書く。
     """
     return tuple(
         r
@@ -172,6 +195,8 @@ def tradable(
         if r.affordable(capital_yen)
         and r.avg_turnover_yen >= min_turnover_yen
         and r.cost_bps <= max_cost_bps
+        and (not markets or r.market in markets)
+        and (margin_type is None or r.margin_type == margin_type)
     )
 
 
@@ -231,6 +256,8 @@ def _save_universe(rows: tuple[MarketRow, ...], as_of: str) -> None:
                         "code": r.code,
                         "name": r.name,
                         "scale_category": r.scale_category,
+                        "market": r.market,
+                        "margin_type": r.margin_type,
                         "price": r.price,
                         "cost_bps": r.cost_bps,
                     }
@@ -245,6 +272,40 @@ def _save_universe(rows: tuple[MarketRow, ...], as_of: str) -> None:
     print(f"  保存: {UNIVERSE_PATH}（{len(rows)}銘柄）")
 
 
+def _report_gates(rows: tuple[MarketRow, ...]) -> None:
+    """段階ごとの脱落数。**どのゲートが効いているかを見えるようにする。**
+
+    ゲートを足したのに何銘柄落ちたか分からないと、想定と食い違ったときに
+    原因を特定できない（`universe/filters.py` の `RejectReason` と同じ考え方）。
+
+    実測でETFが3銘柄混入していた（意思決定ログ99）。市場区分のゲートが
+    無かったからで、**気づいたのは日足の価格水準の跳びからだった**——
+    ユニバースの検査ではなくデータの健全性検査で見つかっている。
+    """
+    stages: list[tuple[str, tuple[MarketRow, ...]]] = [("全上場", rows)]
+    stages.append(
+        ("市場区分（Layer 1 と同じ）", tradable(rows, 10**12, min_turnover_yen=0.0))
+    )
+    stages.append(
+        (
+            "資金・流動性・コスト",
+            tradable(rows, SELECT_CAPITAL_YEN, max_cost_bps=SELECT_MAX_COST_BPS),
+        )
+    )
+    prev = len(rows)
+    for label, kept in stages:
+        drop = prev - len(kept)
+        suffix = "" if label == "全上場" else f"（-{drop}）"
+        print(f"    {label:<26} {len(kept):>5}銘柄 {suffix}")
+        prev = len(kept)
+    print()
+    print(f"    市場区分は {'・'.join(DEFAULT_MARKETS)} / 信用区分は {LOANABLE_MARGIN_TYPE}。")
+    print("    **ETF・REIT はここで落ちる。** 意思決定ログ71 で「別の商品」として")
+    print("    棄却した市場βそのものなので、混ざると検定の意味が変わる。")
+    print("    **対象市場を変えるのは人間が判断すること**（CLAUDE.md）。")
+    print()
+
+
 def _report_selection(rows: tuple[MarketRow, ...], as_of: str) -> None:
     """切り出したユニバースの中身。**保存して `fetch_bars.py` に渡す。**"""
     hr("4. 構造的な基準で切り出したユニバース")
@@ -254,6 +315,7 @@ def _report_selection(rows: tuple[MarketRow, ...], as_of: str) -> None:
     )
     print("  **成績は一切見ていない。** 順序はコストの安い順（同点なら売買代金順）。")
     print()
+    _report_gates(rows)
     selected = select_universe(rows)
     if not selected:
         print("  該当なし")
@@ -421,7 +483,7 @@ def _load_snapshot() -> tuple[MarketRow, ...] | None:
         return None
     payload = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
     print(f"  スナップショット: {SNAPSHOT_PATH}（基準日 {payload.get('as_of')}）")
-    return tuple(
+    rows = tuple(
         MarketRow(
             code=r["code"],
             name=r["name"],
@@ -429,9 +491,19 @@ def _load_snapshot() -> tuple[MarketRow, ...] | None:
             avg_turnover_yen=r["avg_turnover_yen"],
             topix100=r["topix100"],
             scale_category=r.get("scale_category"),
+            market=r.get("market"),
+            margin_type=r.get("margin_type"),
         )
         for r in payload["rows"]
     )
+    if rows and all(r.market is None for r in rows):
+        # **黙って全部落とさない。** 市場区分の無い古いスナップショットで
+        # `tradable` を回すと、フィルタが全銘柄を弾いて「該当なし」に見える
+        raise SystemExit(
+            f"  NG: {SNAPSHOT_PATH} に市場区分がない（意思決定ログ99 より前の版）。\n"
+            "      python scripts/measure_cost_landscape.py --refresh で取り直す"
+        )
+    return rows
 
 
 def _refresh_snapshot() -> tuple[MarketRow, ...] | None:
@@ -492,6 +564,8 @@ def _refresh_snapshot() -> tuple[MarketRow, ...] | None:
             avg_turnover_yen=sum(turnover[code]) / len(turnover[code]),
             topix100=meta[code].is_topix100 if code in meta else False,
             scale_category=meta[code].scale_category if code in meta else None,
+            market=meta[code].market if code in meta else None,
+            margin_type=meta[code].margin_type if code in meta else None,
         )
         for code, price in closes.items()
         if turnover.get(code)
@@ -515,6 +589,8 @@ def _save_snapshot(as_of: date, rows: tuple[MarketRow, ...]) -> None:
                         "avg_turnover_yen": r.avg_turnover_yen,
                         "topix100": r.topix100,
                         "scale_category": r.scale_category,
+                        "market": r.market,
+                        "margin_type": r.margin_type,
                     }
                     for r in rows
                 ],
