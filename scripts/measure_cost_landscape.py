@@ -442,7 +442,10 @@ def _report_inventory(rows: tuple[MarketRow, ...]) -> None:
     """コスト帯ごとに、実際に何銘柄あるか。**ここで初めてデータを使う。**"""
     hr("3. 資金 × コスト帯ごとの銘柄数（実測）")
     print(f"  流動性下限: 20日平均売買代金 {DEFAULT_MIN_AVG_TURNOVER_YEN:,}円")
-    print(f"  対象: {len(rows)}銘柄")
+    print(f"  市場区分: {'・'.join(DEFAULT_MARKETS)} / 信用区分: {LOANABLE_MARGIN_TYPE}")
+    gated = tradable(rows, 10**12, min_turnover_yen=0.0)
+    print(f"  対象: 全上場{len(rows)}銘柄 → 市場区分を満たす{len(gated)}銘柄")
+    print("  **下の表はすべて市場区分のゲートを通した後の数**（意思決定ログ99）")
     print()
     header = "  ".join(f"{b:>4.0f}bps以下" for b in COST_BUCKETS_BPS)
     print(f"  {'資金':>11} {'株価上限':>9}  {header}")
