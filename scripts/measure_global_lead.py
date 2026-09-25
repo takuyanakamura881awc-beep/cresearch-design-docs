@@ -97,6 +97,17 @@ RANK_BUCKETS: tuple[float, ...] = (0.50, 0.75, 0.90)
 MIN_BUCKET_DAYS = 30
 """バケットの判定に要る最低日数。**足りなければ「判定不能」と出す。**"""
 
+MIN_HALF_DAYS = 15
+"""期間分割した片側に要る最低日数。
+
+**上位バケットは定義上サンプルが小さい。** 495営業日の上位10%は約50日で、
+半分に割れば片側25日——`MIN_BUCKET_DAYS`(30) では**構造的に必ず判定不能**に
+なってしまう。半期は定義上まるごと半分なので、そこだけ閾値を下げる。
+
+**下げたぶん「判定不能」と「測って負け」を区別して出す**
+（「レート制限エラーをデータなしと混同しない」と同じ原則）。
+"""
+
 
 @dataclass(frozen=True)
 class MarketDay:
@@ -207,17 +218,36 @@ def priced_in(
     return PricedIn(days=len(pairs), slope=slope * 0.01, r_squared=r_squared)
 
 
-def residual_score(overnight_move: float, day: MarketDay) -> float:
-    """夜間の方向についていったときの、寄り付き後の取り分（bps）。
+CONTINUATION = 1
+"""夜間の方向についていく（上げたら買い）。"""
 
-    夜間が上げなら買い、下げなら売り。**継続を賭ける向き**にそろえる
-    ——反転を賭けたいなら符号を反転して読めばよいので、両方を別の変種として
-    数えない（多重比較の分母を増やさない）。
+REVERSAL = -1
+"""夜間の方向に逆らう（上げたら売り）。"""
+
+DIRECTIONS: tuple[tuple[str, int], ...] = (("継続", CONTINUATION), ("反転", REVERSAL))
+"""**2つで1つの検定。** gross は符号が反転するだけなので変種を増やしていない。
+
+**ただしコストは両方が払う**ので ``net(継続)`` と ``net(反転)`` が同時に
+正になることはない。「向きを選べば必ず勝てる」形にはならない。
+"""
+
+
+def residual_score(
+    overnight_move: float, day: MarketDay, sign: int = CONTINUATION
+) -> float:
+    """夜間の方向に ``sign`` を掛けて建てたときの、寄り付き後の取り分（bps）。
+
+    **2つの向きは別の変種ではない。** 同じ1つの量の符号違いなので、
+    多重比較の分母は増えない（この方針は結果を見る前に登録してある）。
+
+    **だが判定は向きごとに回す必要がある**——コストは両方が払うので、
+    ``net`` は単なる符号反転にならない（``+g-c`` と ``-g-c``）。
+    初版は継続方向しか判定していなかったので、両方を回すよう直した。
     """
     if overnight_move > 0:
-        return day.intraday_bps
+        return sign * day.intraday_bps
     if overnight_move < 0:
-        return -day.intraday_bps
+        return -sign * day.intraday_bps
     return 0.0
 
 
@@ -240,6 +270,9 @@ def bucket_stats(
     ranks: dict[date, float],
     days: tuple[MarketDay, ...],
     threshold: float,
+    sign: int = CONTINUATION,
+    *,
+    min_days: int = MIN_BUCKET_DAYS,
 ) -> BucketStats | None:
     """``|夜間の変動|`` の順位が ``threshold`` 以上の日だけを集計する。
 
@@ -248,11 +281,11 @@ def bucket_stats(
     """
     by_day = {d.day: d for d in days}
     samples = [
-        (day, residual_score(overnight[day], by_day[day]))
+        (day, residual_score(overnight[day], by_day[day], sign))
         for day, rank in ranks.items()
         if rank >= threshold and day in by_day and day in overnight
     ]
-    if len(samples) < MIN_BUCKET_DAYS:
+    if len(samples) < min_days:
         return None
     stats = clustered_stats(samples)
     if stats is None:
@@ -315,31 +348,53 @@ def _report_residual(
     overnight: dict[str, dict[date, float]],
     ranks: dict[str, dict[date, float]],
     days: tuple[MarketDay, ...],
-) -> dict[str, bool]:
+) -> dict[tuple[str, str], bool]:
     """セクション2: 寄り付き後に残っている部分。**ここだけが検定。**"""
     hr("2. 寄り付き後に残っているか（寄成で取りに行ける部分）")
-    print("  夜間が上げた日は買い、下げた日は売り、**始値で建てて大引けで手仕舞う**。")
+    print("  夜間の方向に**ついていく（継続）／逆らう（反転）**の両方を出す。")
+    print("  **同じ量の符号違いなので変種は増えていない**（結果を見る前に登録済み）。")
+    print("  **ただしコストは両方が払う**ので、net が同時に正になることはない。")
+    print()
     print("  シグナルは 05:00 JST に確定しているので、**寄成で板寄せに参加できる**")
     print("  ——ギャップ・フェードを殺した循環（意思決定ログ86）が起きない。")
     print()
     print(f"  順位は**直近{TRAILING_WINDOW}営業日の中での相対位置**。全期間の分位点を")
     print("  使うと事後診断になる（意思決定ログ47〜50 で回り道した）。")
 
-    verdicts: dict[str, bool] = {}
+    verdicts: dict[tuple[str, str], bool] = {}
     for spec in series:
         night = overnight.get(spec.key, {})
         rank = ranks.get(spec.key, {})
         print()
         print(f"  【{spec.key}】{spec.note}")
+        if spec.continuous:
+            print("  **24時間取引。日足の区切りが「東京から見た夜間」に対応しない**")
+            print("  ——東京の日中セッションを含む24時間を1本にまとめている。")
+            print("  **この系列の結果は「関係が無い」ではなく「測れていない」と読む。**")
         print(
-            f"  {'|変動|順位':<10} {'日数':>7} {'gross':>9} {'コスト':>9} "
-            f"{'net':>9} {'t値':>6}"
+            f"  {'|変動|順位':<10} {'日数':>7} {'gross(継続)':>12} {'コスト':>9} "
+            f"{'net(継続)':>11} {'net(反転)':>11} {'t値(継続)':>9}"
         )
-        print("  " + "-" * 56)
-        all_stats = [bucket_stats(night, rank, days, t) for t in RANK_BUCKETS]
-        for threshold, stats in zip(RANK_BUCKETS, all_stats, strict=True):
-            print(f"  {threshold:>8.0%}以上 {_format_bucket(stats)}")
-        verdicts[spec.key] = _verdict(night, rank, days, all_stats)
+        print("  " + "-" * 76)
+        for threshold in RANK_BUCKETS:
+            cont = bucket_stats(night, rank, days, threshold, CONTINUATION)
+            rev = bucket_stats(night, rank, days, threshold, REVERSAL)
+            if cont is None or rev is None:
+                print(f"  {threshold:>8.0%}以上 {'—（日数不足）':>20}")
+                continue
+            print(
+                f"  {threshold:>8.0%}以上 {cont.n:>7} {cont.gross_bps:>+11.2f}b "
+                f"{cont.cost_bps:>8.2f}b {cont.net_bps:>+10.2f}b "
+                f"{rev.net_bps:>+10.2f}b {cont.t_stat:>9.1f}"
+            )
+        for label, sign in DIRECTIONS:
+            print(f"    ［{label}］")
+            all_stats = [
+                bucket_stats(night, rank, days, t, sign) for t in RANK_BUCKETS
+            ]
+            verdicts[(spec.key, label)] = _verdict(
+                night, rank, days, all_stats, sign
+            )
     return verdicts
 
 
@@ -348,10 +403,15 @@ def _verdict(
     ranks: dict[date, float],
     days: tuple[MarketDay, ...],
     all_stats: list[BucketStats | None],
+    sign: int = CONTINUATION,
 ) -> bool:
-    """事前登録した3条件を機械的に判定する。
+    """事前登録した3条件を、**その向きについて**機械的に判定する。
 
     **結果を見てから基準を動かさないために、コードに埋め込む**（意思決定ログ87）。
+
+    **初版は継続方向しか回していなかった。** `residual_score` の docstring で
+    「反転は符号を反転して読めばよい」と事前登録していたのに、判定の実装が
+    片方しか見ていなかった——**基準の変更ではなく、実装の取りこぼしの修正**。
     """
     nets = [s.net_bps for s in all_stats if s is not None]
     monotone = len(nets) == len(RANK_BUCKETS) and all(
@@ -363,20 +423,23 @@ def _verdict(
 
     first_days, second_days = split_days(d.day for d in days)
     halves_positive = False
+    halves_measurable = False
     if second_days:
         top = RANK_BUCKETS[-1]
-        halves_positive = all(
-            (
-                s := bucket_stats(
-                    overnight,
-                    {d: r for d, r in ranks.items() if d in half},
-                    tuple(d for d in days if d.day in half),
-                    top,
-                )
+        halves = [
+            bucket_stats(
+                overnight,
+                {d: r for d, r in ranks.items() if d in half},
+                tuple(d for d in days if d.day in half),
+                top,
+                sign,
+                min_days=MIN_HALF_DAYS,
             )
-            is not None
-            and s.net_bps > 0
             for half in (first_days, second_days)
+        ]
+        halves_measurable = all(h is not None for h in halves)
+        halves_positive = halves_measurable and all(
+            h is not None and h.net_bps > 0 for h in halves
         )
 
     for label, passed in (
@@ -384,37 +447,45 @@ def _verdict(
         ("② どこかのバケットで t値 >= 2 かつ net > 0", strong),
         ("③ 前半・後半とも最大バケットで net > 0", halves_positive),
     ):
-        print(f"    {'○' if passed else '×'} {label}")
+        mark = "○" if passed else "×"
+        if label.startswith("③") and not halves_measurable:
+            # **「測れなかった」と「測って負け」を混同しない。**
+            # どちらも合格にはしないが、次に何をすべきかが変わる
+            mark = "?"
+            label += "（判定不能: 片側が" + f"{MIN_HALF_DAYS}日に届かない）"
+        print(f"    {mark} {label}")
     return monotone and strong and halves_positive
 
 
-def _report_conclusion(verdicts: dict[str, bool], days: tuple[MarketDay, ...]) -> None:
+def _report_conclusion(
+    verdicts: dict[tuple[str, str], bool], days: tuple[MarketDay, ...]
+) -> None:
     hr("3. 事前登録した結論")
-    survivors = [k for k, ok in verdicts.items() if ok]
+    survivors = [f"{key}（{label}）" for (key, label), ok in verdicts.items() if ok]
     cost = statistics.median(d.cost_bps for d in days) if days else 0.0
     need = required_gross_bps(ANNUAL_TARGET, cost_bps=cost)
     print(f"  合格ライン: 年利{ANNUAL_TARGET:.0%}・建玉率100%・コスト{cost:.1f}bps")
     print(f"  → 必要 gross **{need:.1f}bps**（基準ではなく算術）")
     print()
     if not survivors:
-        print("  → **どの系列も3条件を通らなかった。**")
+        print("  → **どの系列も、どちらの向きも3条件を通らなかった。**")
         print("     夜間の海外の値動きは寄り付きで織り込み済みで、方向性の線は閉じる。")
-        print("     残るのは (a) 銘柄ごとの織り込みの過不足（断面）、")
-        print("     (b) VIX による**リバーサルの効き方**の条件づけ（Nagel 2012）。")
-        print()
-        print("     (b) は次のコマンドで測る:")
-        print("       python scripts/measure_overnight_reversal.py --cheap --by-vix")
         return
 
-    print(f"  → **3条件を通った系列: {', '.join(survivors)}**")
+    print(f"  → **3条件を通った: {', '.join(survivors)}**")
     print()
-    print("  **だが自動では採用しない。** ここで測っているのは市場全体の方向で、")
-    print("  銘柄固有の優位ではない。意思決定ログ71 で、まさにこの性質を")
-    print("  「レバレッジ1倍・市場中立に近い設計を積んできた本システムとは")
-    print("  **別の商品**」として棄却している。")
+    print("  **だが自動では採用しない。理由は2つある。**")
     print()
-    print("  **対象を市場βに変えるかどうかは人間が判断すること**（CLAUDE.md）。")
-    print("  私からは材料を出すところまで。")
+    print("  1. **測っているのは市場全体の方向**であって銘柄固有の優位ではない。")
+    print("     意思決定ログ71 で、まさにこの性質を「レバレッジ1倍・市場中立に")
+    print("     近い設計を積んできた本システムとは**別の商品**」として棄却している。")
+    print("     **対象を市場βに変えるかどうかは人間が判断すること**（CLAUDE.md）。")
+    print()
+    print("  2. **S&P500 と NASDAQ は互いに強く相関している。** 両方が通っても")
+    print("     独立な2つの証拠ではなく、実質1つ。多重比較の分母として数えない。")
+    print()
+    print("  **out-of-sample の確認が要る。** 5分足が80営業日に届けば、")
+    print("  日中の約定モデルで測り直せる。")
 
 
 def load_symbols(*, cheap: bool) -> tuple[Symbol, ...]:

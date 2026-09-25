@@ -217,3 +217,94 @@ class TestPreRegistration:
 
     def test_最低日数を持つ(self, mgl: ModuleType) -> None:
         assert mgl.MIN_BUCKET_DAYS >= 30
+
+
+class TestDirections:
+    """**継続と反転は同じ量の符号違い**——変種を増やしていない。
+
+    だが**コストは両方が払う**ので net は単なる符号反転にならない。
+    初版は継続方向しか判定を回していなかった（実装の取りこぼし）。
+    """
+
+    def _day(self, mgl: ModuleType, intraday: float) -> Any:
+        return mgl.MarketDay(
+            day=date(2026, 6, 1),
+            gap_bps=0.0,
+            intraday_bps=intraday,
+            cost_bps=10.0,
+            symbols=10,
+        )
+
+    def test_向きを変えるとgrossの符号が反転する(self, mgl: ModuleType) -> None:
+        day = self._day(mgl, 50.0)
+        cont = mgl.residual_score(0.01, day, mgl.CONTINUATION)
+        rev = mgl.residual_score(0.01, day, mgl.REVERSAL)
+        assert rev == pytest.approx(-cont)
+
+    def test_夜間が下げた日も符号が反転する(self, mgl: ModuleType) -> None:
+        day = self._day(mgl, -50.0)
+        assert mgl.residual_score(-0.01, day, mgl.CONTINUATION) == pytest.approx(50.0)
+        assert mgl.residual_score(-0.01, day, mgl.REVERSAL) == pytest.approx(-50.0)
+
+    def test_両方の向きが同時に勝つことはない(self, mgl: ModuleType) -> None:
+        """**コストは両方が払う。** 「向きを選べば必ず勝てる」形にしない。"""
+        days = _weekdays(200)
+        night = {d: 0.01 * math.sin(i) for i, d in enumerate(days)}
+        ranks = {d: 1.0 for d in days}
+        bars, close = [], 2_000.0
+        for day in days:
+            open_ = close * 1.001
+            new_close = open_ * 1.003
+            bars.append(_bar("A", day, open_=open_, close=new_close))
+            close = new_close
+        market = mgl.market_days({"A": tuple(bars)})
+        cont = mgl.bucket_stats(night, ranks, market, 0.0, mgl.CONTINUATION)
+        rev = mgl.bucket_stats(night, ranks, market, 0.0, mgl.REVERSAL)
+        assert cont is not None and rev is not None
+        assert not (cont.net_bps > 0 and rev.net_bps > 0)
+
+    def test_コストは向きで変わらない(self, mgl: ModuleType) -> None:
+        days = _weekdays(200)
+        night = {d: 0.01 * math.sin(i) for i, d in enumerate(days)}
+        ranks = {d: 1.0 for d in days}
+        bars, close = [], 2_000.0
+        for day in days:
+            open_ = close * 1.001
+            new_close = open_ * 1.003
+            bars.append(_bar("A", day, open_=open_, close=new_close))
+            close = new_close
+        market = mgl.market_days({"A": tuple(bars)})
+        cont = mgl.bucket_stats(night, ranks, market, 0.0, mgl.CONTINUATION)
+        rev = mgl.bucket_stats(night, ranks, market, 0.0, mgl.REVERSAL)
+        assert cont is not None and rev is not None
+        assert cont.cost_bps == pytest.approx(rev.cost_bps)
+
+    def test_向きは2つに固定(self, mgl: ModuleType) -> None:
+        """**1つの検定を2通りに読むだけ。** 3つ目を足すなら事前登録する。"""
+        assert len(mgl.DIRECTIONS) == 2
+
+
+class TestHalvesMeasurability:
+    """**「測れなかった」と「測って負け」を混同しない。**
+
+    上位バケットは定義上サンプルが小さく、半期に割ると `MIN_BUCKET_DAYS` を
+    構造的に下回る。そこだけ閾値を下げ、届かないときは `?` を出す。
+    """
+
+    def test_半期の閾値は本体より緩い(self, mgl: ModuleType) -> None:
+        assert mgl.MIN_HALF_DAYS < mgl.MIN_BUCKET_DAYS
+
+    def test_最低日数を呼び出し側で上書きできる(self, mgl: ModuleType) -> None:
+        days = _weekdays(60)
+        night = {d: 0.01 * math.sin(i) for i, d in enumerate(days)}
+        ranks = {d: 1.0 for d in days}
+        bars, close = [], 2_000.0
+        for day in days:
+            open_ = close * 1.001
+            new_close = open_ * 1.002
+            bars.append(_bar("A", day, open_=open_, close=new_close))
+            close = new_close
+        market = mgl.market_days({"A": tuple(bars)})
+        subset = market[:20]
+        assert mgl.bucket_stats(night, ranks, subset, 0.0) is None
+        assert mgl.bucket_stats(night, ranks, subset, 0.0, min_days=15) is not None

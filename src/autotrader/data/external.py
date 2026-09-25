@@ -82,13 +82,32 @@ class ExternalSeries:
     ticker: str
     """Yahoo のティッカー。**``.T`` を付けない**（`yahoo.to_ticker` を通さない）。"""
     note: str
+    continuous: bool = False
+    """24時間取引か。**日足の区切りが「東京から見た夜間」に対応しない。**
+
+    取引所の指数（``^GSPC``）は 16:00 ET に引けるので、その日足1本が
+    ちょうど「東京の前日引け〜寄り付き」を含む夜間の入力になる。
+
+    **為替は24時間動いている。** ``JPY=X`` の日足は概ね UTC 0時区切りで、
+    **東京の日中セッションを含んだ24時間**を1本にまとめている。つまり
+    この系列の「前日終値からの変化」は**夜間の動きではない**——
+    測っている窓が違うので、東京の寄り付きを説明できなくて当然。
+
+    **「関係が無い」と「測れていない」を混同しない**（規約6のレート制限と
+    同じ原則）。該当する系列は結果に警告を付ける。
+    """
 
 
 DEFAULT_SERIES: tuple[ExternalSeries, ...] = (
     ExternalSeries("VIX", "^VIX", "恐怖指数。流動性供給の対価の代理（Nagel 2012）"),
     ExternalSeries("SP500", "^GSPC", "S&P500。夜間の米国株の方向"),
     ExternalSeries("NASDAQ", "^IXIC", "ナスダック総合。ハイテク寄りの夜間入力"),
-    ExternalSeries("USDJPY", "JPY=X", "ドル円。日本の輸出セクターに直結する"),
+    ExternalSeries(
+        "USDJPY",
+        "JPY=X",
+        "ドル円。日本の輸出セクターに直結する",
+        continuous=True,
+    ),
     ExternalSeries("US10Y", "^TNX", "米10年金利。グロース/バリューの綱引き"),
 )
 """既定で取る系列。**増やすと多重比較の分母が増える。**
