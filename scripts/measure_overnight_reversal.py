@@ -72,6 +72,11 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+from autotrader.data.external import (
+    TRAILING_WINDOW,
+    align_prior_session,
+    trailing_rank,
+)
 from autotrader.data.store import BarStore
 from autotrader.diagnostics import (
     ClusteredStats,
@@ -966,6 +971,118 @@ def _report_execution_sensitivity(pairs: tuple[ReversalPair, ...]) -> None:
     print("  想定を変えて再判定するのは、結果を見てから基準を緩めるのと同じ。")
 
 
+VIX_RANK_SPLIT = 0.5
+"""VIX の水準を高低に分ける順位。**中央値で二分するだけ。**
+
+閾値をチューニング対象にしない（`regime.py` で中央値二分にしたのと同じ理由）。
+"""
+
+MIN_VIX_GROUP_DAYS = 60
+"""片群の判定に要る最低営業日数。足りなければ「判定不能」と出す。"""
+
+
+def _vix_ranks(store: BarStore, days: Iterator[date] | tuple[date, ...]) -> dict[date, float]:
+    """日本の営業日ごとの、**前営業日までに確定した** VIX 水準の順位。
+
+    **水準であって変化率ではない。** Nagel (2012) の機構は「流動性供給の
+    対価が高い**状態**」なので、日々の変化ではなく水準が対応する。
+    変化率版も試すと検定するセルが倍になるので、**水準だけを事前登録する。**
+
+    順位は VIX 自身の時間軸で付ける——日本の営業日に写してから付けると
+    助走の250日が日本側の観測を食いつぶす。
+    """
+    bars = store.read("VIX", "1d")
+    if not bars:
+        return {}
+    levels = {b.timestamp.date(): b.close for b in bars if b.close > 0}
+    ranks = trailing_rank(levels)
+    # **VIX の終値は 05:00 JST 確定。東京の寄り付き前に読める。**
+    # それでも「外部日付 < 日本の営業日」を厳格に守る（先読み防止・規約7）
+    mapping = align_prior_session(levels, days)
+    return {jp: ranks[ext] for jp, ext in mapping.items() if ext in ranks}
+
+
+def _report_vix_conditioning(
+    pairs: tuple[ReversalPair, ...], vix: dict[date, float]
+) -> None:
+    """VIX の水準でリバーサルの効き方が変わるか。**本命の仮説。**
+
+    短期リバーサルの収益は**流動性供給の対価**として説明されるのが標準で
+    （Nagel 2012）、対価は流動性が枯渇するときに上がる。VIX はその代理変数。
+
+    **この仮説は、既に観測しながら説明できなかった2つの事実を同時に説明する:**
+
+    - VWAP乖離が wild 日 99.0% / calm 日 73.5%（意思決定ログ49）
+    - 日クラスタ gross が件数加重の3.3倍＝該当銘柄が少ない日ほど効く（意思決定ログ100）
+
+    **そして意思決定ログ50 の行き止まりを別の道具で開け直す。** あのときは
+    「今日の荒れ具合」を**前日の日本の実現レンジ**から予測しようとして
+    n=38 で有意にならず打ち止めた。VIX は実現値ではなく市場が織り込んだ
+    先行きで、しかも寄り付き前に確定している。
+    """
+    hr("6. VIX の水準で条件づける（Nagel 2012）")
+    if not vix:
+        print("  VIX が無い。先に python scripts/measure_global_lead.py --refresh")
+        return
+
+    low = tuple(p for p in pairs if vix.get(p.day, -1.0) >= 0 and vix[p.day] < VIX_RANK_SPLIT)
+    high = tuple(p for p in pairs if vix.get(p.day, -1.0) >= VIX_RANK_SPLIT)
+    low_days = {p.day for p in low}
+    high_days = {p.day for p in high}
+    covered = len(low_days) + len(high_days)
+    print(f"  VIX の順位で二分（直近{TRAILING_WINDOW}営業日の中での水準）")
+    print(f"    低位 {len(low_days)}営業日 / 高位 {len(high_days)}営業日"
+          f"（対象 {covered}日）")
+    if min(len(low_days), len(high_days)) < MIN_VIX_GROUP_DAYS:
+        print(f"  **判定不能。** 片群が{MIN_VIX_GROUP_DAYS}営業日に届かない")
+        return
+
+    print()
+    print(f"  {'|前日|下限':<10} {'低VIX net(日)':>15} {'t値':>7}   "
+          f"{'高VIX net(日)':>15} {'t値':>7}")
+    print("  " + "-" * 62)
+    for threshold in PRIOR_MOVE_BUCKETS_PCT:
+        cells: list[str] = []
+        for subset in (low, high):
+            stats = bucket_stats(subset, threshold)
+            if stats is None or stats.clustered is None:
+                cells.append(f"{'—':>15} {'—':>7}")
+                continue
+            cells.append(
+                f"{stats.clustered_net_bps:>+14.2f}b {stats.clustered.t_stat:>6.1f}"
+            )
+        print(f"  {threshold:>8.1%}  {cells[0]}   {cells[1]}")
+
+    print()
+    print("  **高VIX日だけ建てるなら、建玉率が下がるぶん必要 gross は上がる。**")
+    print("  選別は保有期間の延長と同じ罠を持つ（意思決定ログ89）——")
+    print("  日数を半分にすれば1回あたりに要る取り分は倍になる。")
+    print()
+    deployment = len(high_days) / covered if covered else 0.0
+    top = PRIOR_MOVE_BUCKETS_PCT[-1]
+    stats = bucket_stats(high, top)
+    if stats is not None and stats.clustered is not None:
+        need = required_gross_bps(
+            ANNUAL_TARGET, cost_bps=stats.cost_bps, deployment=deployment
+        )
+        print(f"  高VIX日のみ・|前日| >= {top:.1%} の場合")
+        print(f"    建玉率     {deployment:>6.1%}（高VIX日の割合）")
+        print(f"    実測 gross {stats.clustered.mean_bps:>+6.2f}bps")
+        print(f"    必要 gross {need:>6.1f}bps")
+        passed = stats.clustered.mean_bps >= need
+        print(f"    → {'○ 届いている' if passed else '× 届かない'}")
+
+    print()
+    print("  **事前登録した判定:**")
+    print("    ① 高VIX群の net(日) が低VIX群より明確に高い")
+    print("    ② 高VIX日のみで運用したとき、建玉率を織り込んだ必要 gross を超える")
+    print("    ③ 前半・後半とも同じ向き")
+    print("  **3つとも通って初めて、5分足での検証に進む。**")
+    print()
+    print("  **水準だけを登録してある。** 変化率（ΔVIX）版も試すと検定する")
+    print("  セルが倍になる。Nagel の機構は「対価が高い**状態**」なので水準が対応する。")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -980,6 +1097,14 @@ def main() -> int:
             "コストで切り出したユニバースで測る（意思決定ログ95）。"
             "**成績を一切見ずに**コスト10bps以下・流動性3億円以上で選んだ287銘柄。"
             "中型・小型の高株価帯が中心で、これまで飛ばしていた領域"
+        ),
+    )
+    parser.add_argument(
+        "--by-vix",
+        action="store_true",
+        help=(
+            "VIX の水準でリバーサルの効き方が変わるかを見る（Nagel 2012）。"
+            "先に python scripts/measure_global_lead.py --refresh で VIX を取る"
         ),
     )
     args = parser.parse_args()
@@ -1028,6 +1153,8 @@ def main() -> int:
     _report_horizons(pairs)
     _report_rate_sensitivity(pairs)
     _report_execution_sensitivity(pairs)
+    if args.by_vix:
+        _report_vix_conditioning(pairs, _vix_ranks(store, tuple(days)))
 
     print()
     print("**シグナルは前日大引けで確定するので、寄成注文で板寄せの価格を取れる。**")
