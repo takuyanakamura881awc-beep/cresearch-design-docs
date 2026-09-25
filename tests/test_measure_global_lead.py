@@ -308,3 +308,26 @@ class TestHalvesMeasurability:
         subset = market[:20]
         assert mgl.bucket_stats(night, ranks, subset, 0.0) is None
         assert mgl.bucket_stats(night, ranks, subset, 0.0, min_days=15) is not None
+
+
+class TestCapacityTranslation:
+    """**1回あたりの bps を年利に翻訳する。**
+
+    事前登録した3条件は「1回あたりの優位」しか見ておらず、
+    **建玉率を見ていなかった**。選別すると建てる日が減るので、
+    年利に効くのは `net × 建てられる日数`。
+
+    同じ罠を VIX のセクションでは織り込んでいたので、これは
+    **一貫性の欠如の修正**であって基準を後から厳しくしたのではない。
+    """
+
+    def test_建玉率が下がると必要grossが上がる(self, mgl: ModuleType) -> None:
+        """意思決定ログ89 の「保有期間を延ばすと比例して上がる」と同じ算術。"""
+        from autotrader.diagnostics import required_gross_bps
+
+        full = required_gross_bps(0.25, cost_bps=10.0, deployment=1.0)
+        tenth = required_gross_bps(0.25, cost_bps=10.0, deployment=0.1)
+        assert tenth > full * 4
+
+    def test_年間営業日数を持つ(self, mgl: ModuleType) -> None:
+        assert 240 <= mgl.TRADING_DAYS_PER_YEAR <= 250

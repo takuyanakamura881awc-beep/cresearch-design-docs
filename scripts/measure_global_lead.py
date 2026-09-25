@@ -457,10 +457,87 @@ def _verdict(
     return monotone and strong and halves_positive
 
 
+TRADING_DAYS_PER_YEAR = 245
+"""年利に翻訳するときの営業日数。"""
+
+
+def _report_capacity(
+    series: tuple[ExternalSeries, ...],
+    overnight: dict[str, dict[date, float]],
+    ranks: dict[str, dict[date, float]],
+    days: tuple[MarketDay, ...],
+) -> dict[tuple[str, str], float]:
+    """1回あたりの bps を**年利に翻訳する**。
+
+    【この節を後から足した理由——判定基準に穴があった】
+
+    事前登録した3条件は「**1回あたりの優位があるか**」しか見ていない。
+    だが年利に効くのは ``net × 建てられる日数`` であって net 単独ではない。
+
+    **選別すると建てる日が減る。** 上位10%のバケットで建てるということは、
+    **年の9割は現金で寝ている**ということ。1回あたりが良くても
+    回数が足りなければ年利は伸びない。
+
+    **同じ罠を VIX のセクションでは織り込んでいた**
+    （`measure_overnight_reversal.py` の `_report_vix_conditioning` は
+    建玉率つきの必要 gross を出している）。**こちらで抜けていたのは
+    一貫性の欠如で、基準を後から厳しくしたのではない。**
+
+    `diagnostics.required_gross_bps` は最初から `deployment` を受け取る。
+    使っていなかっただけ。
+
+    Returns:
+        ``{(系列, 向き): 年利%}``。
+    """
+    hr("3. 1回あたりの bps を年利に翻訳する")
+    print("  **3条件は「1回あたりの優位」しか見ていない。**")
+    print("  年利に効くのは `net × 建てられる日数`——**選別すると日数が減る。**")
+    print("  上位10%で建てるとは、**年の9割を現金で寝かせる**ということ。")
+    print()
+    total = len(days)
+    annuals: dict[tuple[str, str], float] = {}
+    for spec in series:
+        night = overnight.get(spec.key, {})
+        rank = ranks.get(spec.key, {})
+        print(f"  【{spec.key}】")
+        print(
+            f"  {'向き':<5} {'順位':>6} {'日数':>6} {'建玉率':>7} {'年間':>7} "
+            f"{'net':>9} {'年利':>8} {'必要gross':>10} {'実測':>9} {'判定':>4}"
+        )
+        print("  " + "-" * 78)
+        for label, sign in DIRECTIONS:
+            for threshold in RANK_BUCKETS:
+                stats = bucket_stats(night, rank, days, threshold, sign)
+                if stats is None:
+                    continue
+                deployment = stats.n / total if total else 0.0
+                per_year = deployment * TRADING_DAYS_PER_YEAR
+                annual = stats.net_bps * per_year / 10_000.0 * 100.0
+                need = required_gross_bps(
+                    ANNUAL_TARGET, cost_bps=stats.cost_bps, deployment=deployment
+                )
+                annuals[(spec.key, label)] = max(
+                    annuals.get((spec.key, label), -1e9), annual
+                )
+                ok = "○" if stats.gross_bps >= need else "×"
+                print(
+                    f"  {label:<5} {threshold:>5.0%} {stats.n:>6} {deployment:>6.1%} "
+                    f"{per_year:>6.1f}日 {stats.net_bps:>+8.2f}b {annual:>+7.2f}% "
+                    f"{need:>9.1f}b {stats.gross_bps:>+8.2f}b {ok:>4}"
+                )
+    print()
+    print("  **必要gross が跳ね上がるのは、建玉率が分母に入るから**")
+    print("  （意思決定ログ89 の「保有期間を延ばすと必要 gross が比例して上がる」")
+    print("  と同じ算術）。選別も延長も、回転を落とすという意味では同じ。")
+    return annuals
+
+
 def _report_conclusion(
-    verdicts: dict[tuple[str, str], bool], days: tuple[MarketDay, ...]
+    verdicts: dict[tuple[str, str], bool],
+    days: tuple[MarketDay, ...],
+    annuals: dict[tuple[str, str], float],
 ) -> None:
-    hr("3. 事前登録した結論")
+    hr("4. 事前登録した結論")
     survivors = [f"{key}（{label}）" for (key, label), ok in verdicts.items() if ok]
     cost = statistics.median(d.cost_bps for d in days) if days else 0.0
     need = required_gross_bps(ANNUAL_TARGET, cost_bps=cost)
@@ -474,7 +551,14 @@ def _report_conclusion(
 
     print(f"  → **3条件を通った: {', '.join(survivors)}**")
     print()
-    print("  **だが自動では採用しない。理由は2つある。**")
+    best = max(
+        (annuals.get(k, 0.0) for k, ok in verdicts.items() if ok), default=0.0
+    )
+    print(f"  **だが年利に翻訳すると最良で {best:+.2f}%。**")
+    print("  3条件は「1回あたりの優位」しか見ておらず、**建玉率を見ていなかった**")
+    print("  （セクション3）。選別で日数が減るぶん、年利は目標に遠く届かない。")
+    print()
+    print("  **採用しない理由はほかに2つある。**")
     print()
     print("  1. **測っているのは市場全体の方向**であって銘柄固有の優位ではない。")
     print("     意思決定ログ71 で、まさにこの性質を「レバレッジ1倍・市場中立に")
@@ -605,7 +689,8 @@ def main() -> int:
 
     _report_priced_in(available, overnight, days)
     verdicts = _report_residual(available, overnight, ranks, days)
-    _report_conclusion(verdicts, days)
+    annuals = _report_capacity(available, overnight, ranks, days)
+    _report_conclusion(verdicts, days, annuals)
 
     print()
     print("**この診断の価値は、通らなかった場合にもある。** 夜間の情報が寄り付きで")
